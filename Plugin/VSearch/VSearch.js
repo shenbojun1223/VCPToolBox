@@ -27,7 +27,6 @@ const TOKENS = parseInt(MAX_TOKENS, 10) || 50000;
 
 // --- 2. 辅助函数 ---
 const log = (message) => {
-    // 使用 console.error 以免干扰 stdout 的 JSON 输出
     console.error(`[VSearch] ${new Date().toISOString()}: ${message}`);
 };
 
@@ -62,8 +61,6 @@ const resolveRedirect = async (url) => {
         }
 
         const response = await axios.get(targetUrl, axiosConfig);
-
-        // 直接取最终 URL，这是 test.js 成功的关键
         const finalUrl = response.request?.res?.responseUrl || targetUrl;
         
         if (finalUrl !== targetUrl && !finalUrl.includes('grounding-api-redirect')) {
@@ -71,7 +68,6 @@ const resolveRedirect = async (url) => {
             return finalUrl;
         }
 
-        // 如果 responseUrl 没变，再尝试从 body 里捞一下（作为兜底）
         const body = typeof response.data === 'string' ? response.data : '';
         const metaMatch = body.match(/url=\s*([^"'\s>]+)/i);
         if (metaMatch?.[1]) {
@@ -83,7 +79,6 @@ const resolveRedirect = async (url) => {
 
         return targetUrl;
     } catch (error) {
-        // 报错时也尝试拿一下可能已经跳转的 URL
         const fallbackUrl = error.request?.res?.responseUrl;
         if (fallbackUrl && fallbackUrl !== targetUrl && !fallbackUrl.includes('grounding-api-redirect')) {
             return fallbackUrl;
@@ -94,8 +89,19 @@ const resolveRedirect = async (url) => {
     }
 };
 
+const getGeminiRelayUrl = () => {
+    const raw = (API_URL || '').trim();
+    if (!raw) {
+        throw new Error('VSearchUrl 未配置。');
+    }
+
+    const normalized = raw.replace(/\/+$/, '');
+    const relayBase = normalized.replace(/\/v1\/chat\/completions$/i, '');
+    return `${relayBase}/v1beta/models/${MODEL}:generateContent`;
+};
+
 /**
- * Grounding 模式 (Google Search)
+ * Grounding 模式 (New API Gemini Relay)
  */
 const callGroundingMode = async (topic, keyword, showURL = false) => {
     const now = new Date();
@@ -115,57 +121,66 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
         ? '- 包含 [核心发现]、[关键数据/事实] 和 [参考来源] 三部分。'
         : '- 包含 [核心发现] 和 [关键数据/事实] 两部分。';
 
-    const fullSystemPrompt = `${systemPrompt}\n\n输出要求：\n- 针对该关键词，提供一个结构化的总结。\n${outputRequirements}`;
-
-    const userMessage = `【检索目标主题】：${topic}\n【当前检索关键词】：${keyword}`;
+    const userMessage = `【检索目标主题】：${topic}\n【当前检索关键词】：${keyword}\n\n请调用搜索工具获取最新信息，并按要求结构化输出。`;
 
     const payload = {
-        model: MODEL,
-        messages: [
-            { role: 'system', content: fullSystemPrompt },
-            { role: 'user', content: userMessage }
-        ],
-        stream: false,
-        max_tokens: TOKENS,
-        tool_choice: "auto",
-        tools: [{
-            type: "function",
-            function: {
-                name: "googleSearch",
-                description: "从谷歌搜索引擎获取实时信息。",
-                parameters: { type: "object", properties: { query: { type: "string" } } }
+        systemInstruction: {
+            parts: [{ text: `${systemPrompt}\n\n输出要求：\n- 针对该关键词，提供一个结构化的总结。\n${outputRequirements}` }]
+        },
+        contents: [
+            {
+                role: 'user',
+                parts: [{ text: userMessage }]
             }
-        }]
+        ],
+        tools: [
+            {
+                google_search: {}
+            }
+        ],
+        generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: TOKENS
+        }
     };
 
     try {
+        const relayUrl = getGeminiRelayUrl();
         log(`[Grounding] 正在搜索关键词: "${keyword}"...`);
-        const response = await axios.post(API_URL, payload, {
-            headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
-            timeout: 180000, // 3分钟超时
-            proxy: false  // 禁用代理，代理仅用于 URL 重定向解析
+
+        const response = await axios.post(relayUrl, payload, {
+            headers: {
+                'Authorization': `Bearer ${API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 180000,
+            proxy: false
         });
-        let content = response.data.choices[0].message.content;
 
-        // 尝试解析并替换 Vertex 代理 URL
+        const candidate = response.data?.candidates?.[0];
+        const parts = candidate?.content?.parts || [];
+        let content = parts
+            .map(part => part.text)
+            .filter(Boolean)
+            .join('\n')
+            .trim();
+
+        if (!content) {
+            content = '[搜索完成，但未返回可解析的文本内容]';
+        }
+
         try {
-            const metadata = response.data.choices[0].message?.grounding_metadata || response.data.choices[0]?.grounding_metadata;
-
-            // 1. 提取正文中所有可能的 Vertex 重定向 URL (包括没有协议头的)
-            // 修复：[a-zA-Z0-9_=-] 中的 _=- 会被解释为无效范围，改为 [\w\-=]+
+            const groundingMetadata = candidate?.groundingMetadata || response.data?.groundingMetadata;
             const vertexUrlRegex = /(?:https?:\/\/)?vertexaisearch\.cloud\.google\.com\/grounding-api-redirect\/[\w\-=]+/g;
             const foundUrls = content.match(vertexUrlRegex) || [];
 
-            // 2. 提取 grounding_metadata 中的 URL
-            const metadataUrls = (metadata && metadata.grounding_chunks)
-                ? metadata.grounding_chunks.filter(chunk => chunk.web).map(chunk => chunk.web.uri)
-                : [];
+            const metadataUrls = (groundingMetadata?.groundingChunks || [])
+                .map(chunk => chunk?.web?.uri)
+                .filter(Boolean);
 
-            // 合并并去重
             const allVertexUrls = [...new Set([...foundUrls, ...metadataUrls])];
             const urlMap = new Map();
 
-            // 并发解析所有发现的 URL
             if (allVertexUrls.length > 0) {
                 await Promise.all(allVertexUrls.map(async (vUrl) => {
                     const realUrl = await resolveRedirect(vUrl);
@@ -174,46 +189,45 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
                     }
                 }));
 
-                // 3. 替换正文中的所有匹配项
                 for (const [original, resolved] of urlMap.entries()) {
                     content = content.split(original).join(resolved);
                 }
             }
 
-            // 4. 构建引证来源列表 (仅在要求 showURL 时使用 metadata)
-            if (showURL && metadata && metadata.grounding_chunks) {
-                const citations = metadata.grounding_chunks
+            if (showURL && groundingMetadata?.groundingChunks) {
+                const citations = groundingMetadata.groundingChunks
                     .map((chunk, index) => {
-                        if (chunk.web) {
+                        if (chunk?.web?.uri) {
                             const realUrl = urlMap.get(chunk.web.uri) || chunk.web.uri;
-                            return `[cite: ${index + 1}] ${chunk.web.title}: ${realUrl}`;
+                            const title = chunk.web.title || `Source ${index + 1}`;
+                            return `[cite: ${index + 1}] ${title}: ${realUrl}`;
                         }
                         return null;
                     })
-                    .filter(c => c !== null);
+                    .filter(Boolean);
 
                 if (citations.length > 0) {
                     content += `\n\n**API 自动引证来源 (已解析真实URL):**\n${citations.join('\n')}`;
                 }
             }
         } catch (metaError) {
-            log(`解析引证元数据/重定向URL时出错: ${metaError.message}`);
+            log(`解析 groundingMetadata/重定向URL时出错: ${metaError.message}`);
         }
 
         return content;
     } catch (error) {
-        log(`关键词 "${keyword}" 搜索失败: ${error.message}`);
-        return `[搜索失败] 关键词: ${keyword}。错误原因: ${error.message}`;
+        const status = error.response?.status;
+        const responseData = error.response?.data;
+        const detail = responseData
+            ? (typeof responseData === 'string' ? responseData : JSON.stringify(responseData))
+            : error.message;
+
+        log(`关键词 "${keyword}" 搜索失败: HTTP ${status || 'N/A'} | ${detail}`);
+        return `[搜索失败] 关键词: ${keyword}。错误原因: HTTP ${status || 'N/A'} | ${detail}`;
     }
 };
 
 // --- 3. 主逻辑 ---
-/**
- * Grok 模式 (内置搜索，需流式返回)
- */
-/**
- * Grok 模式 (内置搜索，单次请求处理所有关键词)
- */
 const callGrokMode = async (topic, keywordList) => {
     const systemPrompt = `你是一个具备实时联网搜索能力的顶级 AI 助手。
 你的任务是针对用户提供的【检索目标主题】和一系列【检索关键词】，利用你的内置搜索能力获取最新信息并进行深度总结。
@@ -241,7 +255,7 @@ ${keywordList.map((kw, i) => `${i + 1}. ${kw}`).join('\n')}
             headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
             responseType: 'stream',
             timeout: 300000,
-            proxy: false  // 禁用代理，代理仅用于 URL 重定向解析
+            proxy: false
         });
 
         return new Promise((resolve, reject) => {
@@ -274,9 +288,6 @@ ${keywordList.map((kw, i) => `${i + 1}. ${kw}`).join('\n')}
     }
 };
 
-/**
- * 从逗号分隔的 key 列表中随机选取一个
- */
 const pickRandomKey = (keyStr) => {
     if (!keyStr) return null;
     if (keyStr.includes(',')) {
@@ -286,9 +297,6 @@ const pickRandomKey = (keyStr) => {
     return keyStr.trim();
 };
 
-/**
- * 直接调用 Tavily SDK 执行单次搜索
- */
 const callTavilySearch = async (query, tavilyKeyStr) => {
     const apiKey = pickRandomKey(tavilyKeyStr);
     if (!apiKey) {
@@ -304,7 +312,6 @@ const callTavilySearch = async (query, tavilyKeyStr) => {
         include_images: false,
     });
 
-    // 转换为 Markdown 格式
     let markdown = '';
     if (response.results && response.results.length > 0) {
         response.results.forEach((item, index) => {
@@ -319,11 +326,7 @@ const callTavilySearch = async (query, tavilyKeyStr) => {
     return markdown;
 };
 
-/**
- * Tavily 模式 (直接调用 Tavily SDK 并发搜索 + 单次整体总结)
- */
 const callTavilyMode = async (topic, keywordList, tavilyKeyStr) => {
-    // === 阶段1: 并发搜索 ===
     let combinedResults = '';
     try {
         log(`[Tavily] 阶段1/2: 正在并发获取 ${keywordList.length} 个关键词的搜索结果 (直接调用 Tavily API)...`);
@@ -347,7 +350,6 @@ const callTavilyMode = async (topic, keywordList, tavilyKeyStr) => {
         return `[Tavily 搜索阶段失败] 错误原因: ${searchError.message}`;
     }
 
-    // === 阶段2: 模型总结 ===
     try {
         const summaryModel = TAVILY_MODEL || "claude-sonnet-4-6";
         log(`[Tavily] 阶段2/2: 正在使用 ${summaryModel} 通过 ${API_URL} 进行全量总结...`);
@@ -368,7 +370,7 @@ const callTavilyMode = async (topic, keywordList, tavilyKeyStr) => {
         const summaryAxiosConfig = {
             headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
             timeout: 180000,
-            proxy: false  // 显式禁用代理，避免环境变量残留干扰
+            proxy: false
         };
 
         const summaryResponse = await axios.post(API_URL, summaryPayload, summaryAxiosConfig);
@@ -379,8 +381,6 @@ const callTavilyMode = async (topic, keywordList, tavilyKeyStr) => {
         const statusCode = summaryError.response?.status || 'N/A';
         const errorDetail = summaryError.response?.data ? JSON.stringify(summaryError.response.data).substring(0, 500) : summaryError.message;
         log(`[Tavily] 阶段2 总结失败 (HTTP ${statusCode}): ${errorDetail}`);
-
-        // 总结失败时，回退返回原始搜索结果而不是完全失败
         return `[总结阶段失败 (HTTP ${statusCode}): ${summaryError.message}]\n\n**以下为原始搜索结果（未经整合）：**\n\n${combinedResults}`;
     }
 };
@@ -401,13 +401,11 @@ async function main(request) {
     log(`启动 VSearch [模式: ${SearchMode}]。主题: "${SearchTopic}"，关键词数量: ${keywordList.length}`);
 
     if (SearchMode === 'grok') {
-        // Grok 模式：单次请求处理所有关键词
         const result = await callGrokMode(SearchTopic, keywordList);
         return sendResponse({ status: "success", result: `## VSearch 检索报告 [模式: Grok]\n\n**研究主题**: ${SearchTopic}\n\n${result}` });
     }
 
     if (SearchMode === 'tavily') {
-        // Tavily 模式：直接调用 Tavily SDK 并发搜索 + 单次总结
         let tavilyKeyStr = '';
         try {
             const rootEnvContent = await fs.readFile(rootConfigPath, 'utf8');
@@ -423,7 +421,6 @@ async function main(request) {
         return sendResponse({ status: "success", result: `## VSearch 检索报告 [模式: Tavily]\n\n**研究主题**: ${SearchTopic}\n\n${result}` });
     }
 
-    // Grounding 模式：保持原有的并发分批逻辑
     let allResults = [];
     for (let i = 0; i < keywordList.length; i += CONCURRENCY) {
         const chunk = keywordList.slice(i, i + CONCURRENCY);
@@ -438,7 +435,6 @@ async function main(request) {
     sendResponse({ status: "success", result: finalOutput });
 }
 
-// 插件入口 (stdio)
 let inputData = '';
 process.stdin.on('data', chunk => { inputData += chunk; });
 process.stdin.on('end', () => {
