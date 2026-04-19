@@ -452,7 +452,6 @@ const callKimiSearch = async (query, apiKey, baseUrl, maxResults, includeContent
  * KimiSearch 模式 (并发搜索 + 可选 LLM 总结)
  */
 const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResults, includeContent) => {
-    // === 阶段1: 并发搜索 ===
     let combinedResults = '';
     try {
         log(`[KimiSearch] 阶段1/2: 正在并发获取 ${keywordList.length} 个关键词的搜索结果...`);
@@ -469,7 +468,6 @@ const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResult
         return `[KimiSearch 搜索阶段失败] 错误原因: ${searchError.message}`;
     }
 
-    // === 阶段2: 模型总结 (如果配置了 LLM API) ===
     const summaryKey = SUMMARY_KEY || API_KEY;
     const summaryUrl = SUMMARY_URL || API_URL;
     const summaryModel = SUMMARY_MODEL || MODEL || "claude-sonnet-4-6";
@@ -556,7 +554,6 @@ async function main(request) {
         return sendResponse({ status: "success", result: `## VSearch 检索报告 [模式: KimiSearch]\n\n**研究主题**: ${SearchTopic}\n\n${result}` });
     }
 
-    // Grounding 模式：保持原有的并发分批逻辑
     let allResults = [];
     for (let i = 0; i < keywordList.length; i += CONCURRENCY) {
         const chunk = keywordList.slice(i, i + CONCURRENCY);
