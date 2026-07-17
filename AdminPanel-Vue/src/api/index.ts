@@ -36,9 +36,18 @@ export type * from './news'
 export { pluginApi } from './plugin'
 export type * from './plugin'
 
+export { clawMailApi } from './clawMail'
+export type * from './clawMail'
+
+export { vcpTimelineApi } from './vcpTimeline'
+export type * from './vcpTimeline'
+
 // Agent 管理 API
 export { agentApi } from './agent'
 export type * from './agent'
+
+export { openHerPersonaApi } from './openHerPersona'
+export type * from './openHerPersona'
 
 export { adminConfigApi } from './admin-config'
 export type * from './admin-config'
@@ -64,6 +73,9 @@ export type * from './schedule'
 export { dreamApi } from './dream'
 export type * from './dream'
 
+export { emojisApi } from './emojis'
+export type * from './emojis'
+
 export { toolboxApi } from './toolbox'
 export type * from './toolbox'
 
@@ -73,6 +85,15 @@ export type * from './tvs'
 export { toolListApi } from './toolList'
 export type * from './toolList'
 
+export { toolCallRecordsApi } from './toolCallRecords'
+export type * from './toolCallRecords'
+
+export { dynamicToolsApi } from './dynamicTools'
+export type * from './dynamicTools'
+
+export { semanticRouterApi } from './semanticRouter'
+export type * from './semanticRouter'
+
 export { vcptavernApi } from './vcptavern'
 export type * from './vcptavern'
 
@@ -81,3 +102,10 @@ export type * from './forum'
 
 export { forumAssistantApi } from './forum-assistant'
 export type * from './forum-assistant'
+
+export { tarotDivinationApi } from './tarotDivination'
+export type * from './tarotDivination'
+
+// 插件商店 API
+export { pluginStoreApi } from './pluginStore'
+export type * from './pluginStore'

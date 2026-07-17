@@ -37,6 +37,32 @@ export interface IntrinsicResidualResult {
   computedCount: number
   skippedCount: number
   elapsedMs: number
+  algorithmVersion: string
+  artifactSig: string
+  effectiveConfig: string
+}
+/** 🌟 EPA Rust 基底重算结果 */
+export interface EpaBasisResult {
+  success: boolean
+  message: string
+  tagCount: number
+  clusterCount: number
+  basisCount: number
+  elapsedMs: number
+  algorithm: string
+  phaseSummary: string
+  anchorCount: number
+  representativeSampleCount: number
+  densityBucketCount: number
+  publishElapsedMs: number
+}
+/** 🌟 TagMemo V8.2: 成对语义距离预计算结果 */
+export interface PairwiseSimResult {
+  pairCount: number
+  computedCount: number
+  skippedCount: number
+  storedCount: number
+  elapsedMs: number
 }
 /** 统计信息 */
 export interface VexusStats {
@@ -44,6 +70,20 @@ export interface VexusStats {
   dimensions: number
   capacity: number
   memoryUsage: number
+}
+export interface WatcherConfig {
+  rootPath: string
+  ignoreFolders: Array<string>
+  ignorePrefixes: Array<string>
+  ignoreSuffixes: Array<string>
+  /** 可选扩展名白名单。为空时保持旧行为：仅监听 .md / .txt。 */
+  extensions?: Array<string>
+  /** 路径事件静默窗口。窗口内的新事件会使旧 generation 自动失效。 */
+  debounceMs?: number
+  /** 两次文件元数据采样之间的稳定确认间隔。 */
+  stabilityMs?: number
+  /** 同一 generation 内最多执行的稳定采样次数。 */
+  stabilityRetries?: number
 }
 /** 核心索引结构 (无状态，只存向量) */
 export declare class VexusIndex {
@@ -85,6 +125,41 @@ export declare class VexusIndex {
   computeHandshakes(query: Float32Array, flattenedTags: Float32Array, nTags: number): HandshakeResult
   /** 高性能 EPA 投影 */
   project(vector: Float32Array, flattenedBasis: Float32Array, meanVector: Float32Array, k: number): ProjectResult
+  /**
+   * 🌟 EPA: Rust 侧重算基底并暂存在 Rust 内存中。
+   *
+   * 计算阶段只读 SQLite，不持有 JS 写租约；调用方应在结果成功后短租约调用 publish_epa_basis_cache。
+   */
+  computeEpaBasis(dbPath: string, clusterCount: number, maxBasisDim: number): Promise<unknown>
+  /**
+   * 🌟 EPA: 发布最近一次 Rust 计算完成的 EPA cache。
+   *
+   * 该方法执行短 SQLite 写入，JS 调用方必须先获取 Rust 写租约。
+   */
+  publishEpaBasisCache(dbPath: string): EpaBasisResult
   /** 预计算任务：矩阵内生残差 (TagMemo V7) */
-  computeIntrinsicResiduals(dbPath: string, maxSvdRank?: number | undefined | null, minNeighbors?: number | undefined | null): Promise<unknown>
+  computeIntrinsicResiduals(dbPath: string, maxSvdRank?: number | undefined | null, minNeighbors?: number | undefined | null, modelSig?: string | undefined | null, effectiveConfigJson?: string | undefined | null): Promise<unknown>
+  /**
+   * 🌟 TagMemo V8.2: 预计算 Tag 对的语义距离（成对余弦相似度）
+   *
+   * - 仅对实际共现的 pair 进行计算（避免 N² 爆炸）
+   * - 单文件 Tag 数 > 100 的脏文件跳过（与 JS / V7 守恒一致）
+   * - 增量模式：已存在且 model_sig 一致的 pair 直接跳过
+   * - sim < min_similarity 的 pair 不写入（默认丢弃噪声）
+   * - 单模型缓存策略：full_rebuild 会清空整张 sim 表，避免旧模型签名残留
+   *
+   * # 参数
+   * - `db_path`: SQLite 路径
+   * - `model_sig`: embedding 模型签名 (含维度)，跨模型自动失效
+   * - `min_similarity`: 噪声阈值，默认 0.05
+   * - `full_rebuild`: 是否清空 sim 表后重算 (默认 false 增量)
+   */
+  computePairwiseSimilarities(dbPath: string, modelSig: string, minSimilarity?: number | undefined | null, fullRebuild?: boolean | undefined | null): Promise<unknown>
+}
+export declare class VexusWatcher {
+  constructor()
+  /** 启动高性能原生文件监听 */
+  startWatch(config: WatcherConfig, jsCallback: (err: Error | null, arg: string) => any): void
+  /** 停止监听 */
+  stopWatch(): void
 }

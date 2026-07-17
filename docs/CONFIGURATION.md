@@ -528,7 +528,7 @@ services:
 
 | 配置项 | 值 | 说明 |
 |--------|-----|------|
-| 基础镜像 | node:20-alpine | 轻量级 Node.js 环境 |
+| 基础镜像 | node:22-alpine | 轻量级 Node.js 环境 |
 | 工作目录 | /usr/src/app | 容器内应用路径 |
 | 暴露端口 | 6005 | VCP 服务端口 |
 | 运行用户 | root | ⚠️ 安全风险（见下文） |
@@ -610,7 +610,62 @@ VCP Agent 拥有**硬件底层级分布式系统根权限**：
 
 ---
 
-## 6. 常见配置问题
+## 6. DynamicToolBridge 配置
+
+动态插件工具列表通过 `ToolConfigs/dynamic_tool_bridge.config.json` 配置，运行时缓存写入同目录的 `dynamic_tool_catalog.json` 与 `dynamic_tool_categories.json`。
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `enabled` | `true` | 是否启用 `{{VCPDynamicTools}}` 动态注入；关闭后可切回 `{{VCPAllTools}}` |
+| `maxBriefListItems` | `120` | 轻量工具清单最多展示的插件数 |
+| `maxExpandedPlugins` | `4` | 普通语义命中时最多展开的完整工具说明数 |
+| `maxForcedCategoryPlugins` | `12` | agent 主动点名分类时最多展开的插件数 |
+| `maxInjectionChars` | `16000` | 单次动态工具注入最大字符数 |
+| `classificationDebounceMs` | `1000` | 插件热加载后分类队列去抖时间 |
+| `classifierTimeoutMs` | `30000` | 小模型分类超时时间 |
+| `manualOverrides.excludedOriginKeys` | `[]` | 手动排除的工具 originKey |
+| `manualOverrides.pinnedOriginKeys` | `[]` | 轻量清单中优先展示的工具 originKey |
+| `manualOverrides.descriptionOverrides` | `{}` | 按 `originKey` 覆盖 brief、完整说明、分类和关键词，形成类似 Toolbox 映射表的逐工具策展层 |
+| `smallModel.enabled` | `false` | 是否启用增量小模型分类；可由私有插件配置覆盖 |
+| `smallModel.useMainConfig` | `true` | 是否复用主 `config.env` 的 `API_URL` 和 `API_Key` |
+| `smallModel.model` | `""` | 小模型名称；复用主配置时只需要填写模型名 |
+| `smallModel.endpoint` | `""` | 独立 OpenAI 兼容端点；仅 `useMainConfig=false` 时使用，可填基础地址或完整 `/v1/chat/completions` |
+
+`ToolConfigs/dynamic_tool_bridge.config.json` 和 `Plugin/DynamicToolBridge/config.env` 会在运行时监听文件变更并热重载；管理 API 保存配置后也不需要重启服务。私有小模型 API key 仍只从 `Plugin/DynamicToolBridge/config.env` 或环境变量读取，不会写入 `ToolConfigs` 或管理 API 返回体。
+
+`manualOverrides.descriptionOverrides` 可让动态工具清单像自动化 Toolbox 映射表一样覆盖单个工具的轻量描述和完整说明：
+
+```json
+{
+  "manualOverrides": {
+    "descriptionOverrides": {
+      "local:SearchTool": {
+        "brief": "Curated search toolbox.",
+        "fullDescription": "[===vcp_fold:0.0 ::desc: quick start===]\n...",
+        "categories": ["search"],
+        "keywords": ["search", "curated"]
+      }
+    }
+  }
+}
+```
+
+当插件说明或覆盖后的 `fullDescription` 包含 `[===vcp_fold:...::desc:...===]` 标记或 JSON `vcp_dynamic_fold` 对象时，`{{VCPDynamicTools}}` 会复用 Toolbox 的 `toolbox_block_similarity` 颗粒度，只展开与当前上下文相关的块。
+
+小模型的独立私有配置位于 `Plugin/DynamicToolBridge/config.env`，模板见 `Plugin/DynamicToolBridge/config.env.example`。默认 `SmallModel_Use_Main_Config=true`，会自动使用主配置的 `API_URL` 与 `API_Key`，因此只需要填写 `SmallModel_Model`。如果需要独立分类端点，设置 `SmallModel_Use_Main_Config=false`，再填写 `SmallModel_Endpoint`、`SmallModel_Model`、`SmallModel_API_Key`。端点固定按 OpenAI 兼容 chat completions 调用；填写基础地址时会自动补全 `/v1/chat/completions`。私有 API Key 不会被写回 `ToolConfigs` 或管理 API 返回体。
+
+Agent prompt 使用 `{{VCPDynamicTools}}` 后，请求预处理阶段会注入轻量工具清单，并按当前语义展开相关工具完整说明。Agent 也可显式请求展开：
+
+```text
+[[VCPDynamicTools:category=search:all]]
+[[VCPDynamicTools:tool=VSearch]]
+```
+
+`Plugin/DynamicToolBridge/config.env` 与 `ToolConfigs/dynamic_tool_bridge.config.json` 改动会被动态工具 registry 监听并热重载。
+
+---
+
+## 7. 常见配置问题
 
 ### Q1: 启动后无法连接后端 API
 

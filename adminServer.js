@@ -2,6 +2,7 @@
 // 独立后台管理面板进程，监听 PORT+1
 // 目的：将 AdminPanel 与聊天主链解耦，避免主进程 SSE stall 时后台面板一起卡顿
 const express = require('express');
+require('./modules/dotenvPatch.js'); // 应用 dotenv.parse 补丁以支持特殊字符
 const dotenv = require('dotenv');
 dotenv.config({ path: 'config.env' });
 
@@ -172,11 +173,9 @@ const adminAuth = (req, res, next) => {
         if (isVerifyEndpoint || req.path.startsWith('/admin_api') ||
             (req.headers.accept && req.headers.accept.includes('application/json'))) {
             return res.status(401).json({ error: 'Unauthorized' });
-        } else if (req.path.startsWith('/AdminPanel') || req.path.startsWith('/AdminPanelLegacy')) {
-            return res.redirect('/AdminPanel/login.html');
         } else {
-            res.setHeader('WWW-Authenticate', 'Basic realm="Admin Panel"');
-            return res.status(401).send('<h1>401 Unauthorized</h1>');
+            // 所有未认证的页面请求（包括根路径 /）统一重定向到登录页
+            return res.redirect('/AdminPanel/login.html');
         }
     }
 
@@ -252,8 +251,11 @@ const localModules = [
     'schedules',       // 日程管理
     'newapiMonitor',   // NewAPI 监控（外部 HTTP）
     'cache',           // 多媒体/图像缓存管理
+    'emojis',          // 表情包列表与 image 目录画廊
     'dailyNotes',      // 日记知识库文件管理
     'agentAssistant',  // Agent 助手配置（纯文件 I/O）
+    'aiChat',          // 后台 AI 代理（本地转发主服务 /v1/chat/completions，避免前端暴露 Key）
+    'semanticRouter',  // 语义模型路由器配置（本地 JSON 读写 + 上游模型拉取）
 ];
 
 // 日志路径获取函数（本地计算，不依赖主进程 logger 实例）
@@ -294,7 +296,9 @@ const localOptions = {
     triggerRestart: (code = 1) => {
         console.log(`[AdminServer] Restarting admin process (exit code: ${code})...`);
         setTimeout(() => process.exit(code), 500);
-    }
+    },
+    apiUrl: process.env.API_URL,
+    apiKey: process.env.API_Key,
 };
 
 for (const moduleName of localModules) {
@@ -309,38 +313,214 @@ for (const moduleName of localModules) {
 }
 
 // ============================================================
+// 🧠 关键覆盖：记忆库内存剖面必须代理到主服务
+// 独立 adminServer 本地 system 模块没有 KnowledgeBaseManager / TDBKnowledge 运行态，
+// 若由本地 routes/admin/system.js 处理会只能返回空 profile；必须在 localAdminRouter 前转发。
+// ============================================================
+app.get('/admin_api/system-monitor/memory/profile', async (req, res) => {
+    if (DEBUG_MODE) console.log('[AdminServer] Memory profile request received — forwarding to main process...');
+
+    const profileReq = http.request(
+        `http://127.0.0.1:${MAIN_PORT}/admin_api/system-monitor/memory/profile`,
+        {
+            method: 'GET',
+            headers: {
+                'Authorization': req.headers.authorization || '',
+                'Cookie': req.headers.cookie || ''
+            },
+            timeout: 10000
+        },
+        (profileRes) => {
+            let body = '';
+
+            profileRes.on('data', chunk => {
+                body += chunk;
+            });
+
+            profileRes.on('end', () => {
+                if (res.headersSent) return;
+
+                const contentType = profileRes.headers['content-type'] || 'application/json';
+                res.status(profileRes.statusCode || 200);
+                res.setHeader('Content-Type', contentType);
+
+                try {
+                    res.json(body ? JSON.parse(body) : {
+                        success: false,
+                        error: '主服务返回了空的记忆库内存剖面响应。'
+                    });
+                } catch (e) {
+                    res.send(body || '');
+                }
+            });
+        }
+    );
+
+    profileReq.on('error', (err) => {
+        console.error(`[AdminServer] Failed to forward memory profile request to main process: ${err.code || err.message}`);
+        if (!res.headersSent) {
+            res.status(502).json({
+                success: false,
+                error: '无法将记忆库内存剖面请求转发给主服务。',
+                details: err.message
+            });
+        }
+    });
+
+    profileReq.on('timeout', () => {
+        profileReq.destroy();
+        if (!res.headersSent) {
+            res.status(504).json({
+                success: false,
+                error: '主服务记忆库内存剖面接口响应超时。'
+            });
+        }
+    });
+
+    profileReq.end();
+});
+
+// ============================================================
+// 🧠 关键覆盖：主动浪潮全量训练必须代理到主服务
+// 独立 adminServer 不持有 KnowledgeBaseManager 实例；本地 rag 模块会以 vectorDBManager=null 挂载。
+// 因此该运行态端点必须在 localAdminRouter 之前转发到主进程。
+// ============================================================
+app.post('/admin_api/rag-active-full-training', async (req, res) => {
+    console.log('[AdminServer] Active full training request received — forwarding to main process...');
+
+    const trainingReq = http.request(
+        `http://127.0.0.1:${MAIN_PORT}/admin_api/rag-active-full-training`,
+        {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': req.headers.authorization || '',
+                'Cookie': req.headers.cookie || ''
+            },
+            timeout: 10000
+        },
+        (trainingRes) => {
+            let body = '';
+
+            trainingRes.on('data', chunk => {
+                body += chunk;
+            });
+
+            trainingRes.on('end', () => {
+                if (res.headersSent) return;
+
+                const contentType = trainingRes.headers['content-type'] || 'application/json';
+                res.status(trainingRes.statusCode || 202);
+                res.setHeader('Content-Type', contentType);
+
+                try {
+                    res.json(body ? JSON.parse(body) : {
+                        success: true,
+                        message: '主服务已收到浪潮全量自学习请求。'
+                    });
+                } catch (e) {
+                    res.send(body || '主服务已收到浪潮全量自学习请求。');
+                }
+            });
+        }
+    );
+
+    trainingReq.on('error', (err) => {
+        console.error(`[AdminServer] Failed to forward active full training request to main process: ${err.code || err.message}`);
+        if (!res.headersSent) {
+            res.status(502).json({
+                success: false,
+                error: '无法将浪潮全量自学习请求转发给主服务。',
+                details: err.message
+            });
+        }
+    });
+
+    trainingReq.on('timeout', () => {
+        trainingReq.destroy();
+        if (!res.headersSent) {
+            res.status(504).json({
+                success: false,
+                error: '主服务浪潮全量自学习接口响应超时。'
+            });
+        }
+    });
+
+    trainingReq.write(JSON.stringify(req.body || {}));
+    trainingReq.end();
+});
+
+// ============================================================
 // 🔑 关键覆盖：重启主服务（必须在本地路由之前挂载）
 // 本地 routes/admin/server.js 的 /server/restart 会 process.exit(1) 杀死当前进程
 // 在独立后台进程里，这个行为需要被重定向为"通知主进程重启"
 // ============================================================
 app.post('/admin_api/server/restart', async (req, res) => {
     console.log('[AdminServer] Restart request received — forwarding to main process...');
-    res.json({ message: '正在通知主服务重启。管理面板将保持运行。' });
 
-    // 通过 HTTP 请求通知主进程自行重启
-    setTimeout(() => {
-        const restartReq = http.request(
-            `http://127.0.0.1:${MAIN_PORT}/admin_api/server/restart`,
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': req.headers.authorization || '',
-                    'Cookie': req.headers.cookie || ''
-                },
-                timeout: 5000
+    const restartReq = http.request(
+        `http://127.0.0.1:${MAIN_PORT}/admin_api/server/restart`,
+        {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': req.headers.authorization || '',
+                'Cookie': req.headers.cookie || ''
             },
-            (restartRes) => {
+            timeout: 10000
+        },
+        (restartRes) => {
+            let body = '';
+
+            restartRes.on('data', chunk => {
+                body += chunk;
+            });
+
+            restartRes.on('end', () => {
                 console.log(`[AdminServer] Main process restart response: ${restartRes.statusCode}`);
-            }
-        );
-        restartReq.on('error', (err) => {
-            // 预期会出错：主进程收到后会执行 process.exit(1)，连接会断
-            console.log(`[AdminServer] Main process restart signal sent (connection closed as expected: ${err.code || err.message})`);
-        });
-        restartReq.write('{}');
-        restartReq.end();
-    }, 300);
+
+                if (res.headersSent) return;
+
+                const contentType = restartRes.headers['content-type'] || 'application/json';
+                res.status(restartRes.statusCode || 202);
+                res.setHeader('Content-Type', contentType);
+
+                try {
+                    const parsed = body ? JSON.parse(body) : {
+                        status: 'accepted',
+                        message: '主服务已收到重启请求。'
+                    };
+                    res.json(parsed);
+                } catch (e) {
+                    res.send(body || '主服务已收到重启请求。');
+                }
+            });
+        }
+    );
+
+    restartReq.on('error', (err) => {
+        console.error(`[AdminServer] Failed to forward restart request to main process: ${err.code || err.message}`);
+        if (!res.headersSent) {
+            res.status(502).json({
+                status: 'error',
+                message: '无法将重启请求转发给主服务。',
+                details: err.message
+            });
+        }
+    });
+
+    restartReq.on('timeout', () => {
+        restartReq.destroy();
+        if (!res.headersSent) {
+            res.status(504).json({
+                status: 'error',
+                message: '主服务重启接口响应超时。'
+            });
+        }
+    });
+
+    restartReq.write('{}');
+    restartReq.end();
 });
 
 app.use('/admin_api', localAdminRouter);
@@ -372,9 +552,14 @@ app.use('/admin_api', (req, res, next) => {
         timeout: 30000,
     };
 
+    const incomingContentType = String(req.headers['content-type'] || '').toLowerCase();
+    const isMultipartBody = incomingContentType.includes('multipart/form-data');
+
     // 移除可能干扰的 headers
     delete proxyOptions.headers['host'];
-    delete proxyOptions.headers['content-length'];
+    if (!isMultipartBody) {
+        delete proxyOptions.headers['content-length'];
+    }
 
     const proxyReq = http.request(proxyUrl, proxyOptions, (proxyRes) => {
         res.status(proxyRes.statusCode);
@@ -410,8 +595,25 @@ app.use('/admin_api', (req, res, next) => {
 
     // 转发请求体
     if (req.method !== 'GET' && req.method !== 'HEAD') {
-        const bodyData = JSON.stringify(req.body);
-        proxyReq.setHeader('Content-Type', 'application/json');
+        // multipart/form-data 需要原样流式透传，否则会破坏 boundary 与文件体
+        if (isMultipartBody) {
+            req.pipe(proxyReq);
+            return;
+        }
+
+        let bodyData = '';
+
+        if (incomingContentType.includes('application/x-www-form-urlencoded')) {
+            bodyData = new URLSearchParams(req.body || {}).toString();
+            proxyReq.setHeader('Content-Type', 'application/x-www-form-urlencoded');
+        } else if (incomingContentType.includes('text/plain')) {
+            bodyData = typeof req.body === 'string' ? req.body : String(req.body || '');
+            proxyReq.setHeader('Content-Type', 'text/plain');
+        } else {
+            bodyData = JSON.stringify(req.body || {});
+            proxyReq.setHeader('Content-Type', 'application/json');
+        }
+
         proxyReq.setHeader('Content-Length', Buffer.byteLength(bodyData));
         proxyReq.write(bodyData);
     }

@@ -1,41 +1,183 @@
 {
   "ContextFoldingV2": {
-    "thresholdBase": 0.50,
-    "thresholdRange": [0.40, 0.60],
+    "thresholdBase": 0.5,
+    "thresholdRange": [
+      0.4,
+      0.6
+    ],
     "lWeight": 0.05,
-    "sWeight": 0.05
+    "sWeight": 0.05,
+    "fuzzyEmbedding": {
+      "threshold": 0.975,
+      "minLength": 80,
+      "maxScan": 200,
+      "maxLengthDiffRatio": 0.02,
+      "maxLengthDiffAbs": 80
+    }
   },
   "RAGDiaryPlugin": {
     "noise_penalty": 0.05,
-    "tagWeightRange": [0.05, 0.45],
+    "tagWeightRange": [
+      0.2,
+      0.65
+    ],
     "tagTruncationBase": 0.6,
-    "tagTruncationRange": [0.5, 0.9],
+    "tagTruncationRange": [
+      0.5,
+      0.9
+    ],
     "timeDecay": {
       "halfLifeDays": 30,
       "minScore": 0.5
     },
-    "mainSearchWeights": [0.7, 0.3],
-    "refreshWeights": [0.5, 0.35, 0.15],
-    "metaThinkingWeights": [0.8, 0.2]
+    "mainSearchWeights": [
+      0.7,
+      0.3
+    ],
+    "shotgunDecayFactor": 0.75,
+    "shotgunHistorySegmentLimit": 3,
+    "refreshWeights": [
+      0.5,
+      0.35,
+      0.15
+    ],
+    "metaThinkingWeights": [
+      0.8,
+      0.2
+    ]
   },
   "KnowledgeBaseManager": {
+    "tagMemoVersioning": {
+      "activeVersion": "v9",
+      "availableVersions": [
+        "v9"
+      ],
+      "singleTrack": true,
+      "strictExplicitVersion": true
+    },
+    "v9": {
+      "algorithmVersion": "v9.1",
+      "outboundMass": 0.95,
+      "evidenceCompression": 1,
+      "wormholeGain": 1.35,
+      "tensionThreshold": 1,
+      "associationReserveMass": 0.05,
+      "hubPenaltyExponent": 0.3,
+      "hubPenaltyFloor": 0.55,
+      "hubPenaltyCeiling": 1.8,
+      "hubSmoothingRatio": 0.1
+    },
+    "intrinsicResidual": {
+      "method": "anchored_gs",
+      "maxNeighbors": 48,
+      "maxBasis": 4,
+      "minNeighbors": 3,
+      "semanticEnabled": true,
+      "semanticPeak": 0.65,
+      "semanticSigma": 0.25,
+      "semanticFloor": 0.35,
+      "semanticHardFloor": -1,
+      "minGain": 0.015,
+      "positionDecay": 0.15,
+      "v9AnchorBase": 0.75,
+      "v9AnchorScale": 1.25,
+      "v9AnchorGamma": 1,
+      "v9AnchorMin": 0.5,
+      "v9AnchorMax": 2
+    },
     "geodesicRerank": {
-      "alpha": 0.5,
-      "minGeoSamples": 4
+      "alpha": 0.6,
+      "candidateKMultiplier": 2,
+      "minGeoSamples": 4,
+      "fallbackToKnnOnLowTrust": 1,
+      "minFieldTags": 4,
+      "minFieldEntropy": 0.12,
+      "maxFieldNodes": 48,
+      "fieldEnergyMassRatio": 0.95,
+      "fieldSimilarityThreshold": 0.5,
+      "weakContactThreshold": 0.04,
+      "strongContactThreshold": 0.14,
+      "maxFieldNeighbors": 4,
+      "fieldKernelExponent": 2,
+      "candidatePositionDecay": 0.035,
+      "publicHubFloor": 0.35,
+      "minClosureSimilarity": 0.2,
+      "geoRewardFloor": 0.015,
+      "geoRewardSaturation": 0.25,
+      "directBonusCap": 0.18,
+      "structuralBonusCap": 0.1,
+      "thematicBonusCap": 0.035,
+      "structuralContinuityMin": 0.08,
+      "thematicMinPotential": 0.08,
+      "thematicMaxIsolatedRatio": 0.65,
+      "directSemanticMinPotential": 0.16,
+      "directSemanticSaturation": 0.35,
+      "directSemanticMinContacts": 2,
+      "directConfidenceFloor": 0.35,
+      "geometryAuxiliary": {
+        "enabled": true,
+        "maxAuxBonus": 0.018,
+        "directFloorCap": 0.018,
+        "structuralFloorCap": 0.012,
+        "thematicFloorCap": 0.006,
+        "minFusedScore": 0.12,
+        "minClosureScore": 0.55,
+        "minClassEvidence": 0.1,
+        "floorExponent": 1.5,
+        "identityAnchor": {
+          "enabled": true,
+          "minPotential": 0.8,
+          "minSpecificity": 0.55,
+          "minTagChunkClosure": 0.35,
+          "minStrength": 0.55,
+          "floorCap": 0.018,
+          "floorExponent": 1.25
+        }
+      },
+      "minGeoCoverageRatio": 0.05,
+      "minMaxGeoScore": 0.01,
+      "minGeoScoreSpread": 0.03,
+      "minStrongEvidence": 1
     },
     "spikeRouting": {
       "maxSafeHops": 4,
-      "baseMomentum": 2.0,
-      "firingThreshold": 0.10,
+      "baseMomentum": 2,
+      "firingThreshold": 0.1,
       "baseDecay": 0.25,
-      "wormholeDecay": 0.70,
-      "tensionThreshold": 1.0,
+      "wormholeDecay": 0.7,
+      "tensionThreshold": 1,
       "maxEmergentNodes": 50,
-      "maxNeighborsPerNode": 20
+      "maxNeighborsPerNode": 20,
+      "v91ReturnFlowFactor": 0.15,
+      "v91FirGamma": 0.6,
+      "v91MaxPropagationStates": 2000
     },
-    "activationMultiplier": [0.5, 1.5],
-    "dynamicBoostRange": [0.3, 2.0],
-    "coreBoostRange": [1.20, 1.40],
+    "orderedCooccurrence": {
+      "forwardGain": 1,
+      "reverseGain": 0.35,
+      "minReverseGain": 0.25,
+      "maxReverseGain": 0.6,
+      "distanceDecay": 0.08,
+      "reverseAnchorBoost": 1,
+      "reverseAnchorMax": 1.35,
+      "semanticGainEnabled": 1,
+      "semanticGainPeak": 0.65,
+      "semanticGainSigma": 0.25,
+      "semanticGainLowSimFallback": 0.1,
+      "reverseInversionGuard": 0.9
+    },
+    "activationMultiplier": [
+      0.5,
+      1.5
+    ],
+    "dynamicBoostRange": [
+      0.3,
+      2
+    ],
+    "coreBoostRange": [
+      1.2,
+      1.4
+    ],
     "deduplicationThreshold": 0.88,
     "techTagThreshold": 0.08,
     "normalTagThreshold": 0.015,
