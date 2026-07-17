@@ -1,25 +1,21 @@
 @echo off
-echo Updating Cherry-Var-Reborn using Git...
-
-REM Navigate to the script's directory
+setlocal
 cd /d "%~dp0"
 
-REM Pull latest changes from Git
-echo Pulling latest changes...
-git pull
+REM Safe upstream synchronization. Pass any PowerShell options through, for example:
+REM   update.bat -DryRun
+REM   update.bat -Operation Continue
+REM   update.bat -Operation Abort
+call "%~dp0sync-upstream.cmd" %*
+set "SYNC_EXIT=%ERRORLEVEL%"
 
-REM Install/update Python dependencies
-echo Installing/updating Python dependencies for SciCalculator...
-cd Plugin\SciCalculator
-pip install -r requirements.txt
-cd ..\..
-echo Installing/updating Python dependencies for VideoGenerator...
-cd Plugin\VideoGenerator
-pip install -r requirements.txt
-cd ..\..
+if not "%SYNC_EXIT%"=="0" (
+    echo.
+    echo Upstream synchronization did not complete. Exit code: %SYNC_EXIT%
+    exit /b %SYNC_EXIT%
+)
 
-REM Install/update Node.js dependencies
-echo Installing/updating dependencies...
-npm install
-
-echo Git update complete.
+echo.
+echo Source synchronization complete.
+echo Dependency installation is intentionally separate; review changed manifests first.
+exit /b 0
