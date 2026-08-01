@@ -9,6 +9,8 @@ const chokidar = require('chokidar');
 const { getEmbeddingsBatch } = require('./EmbeddingUtils');
 const ResultDeduplicator = require('./ResultDeduplicator'); // ✅ Tagmemo v4 requirement
 const TagMemoEngine = require('./TagMemoEngine');
+const TagMemoV10Engine = require('./TagMemoV10Engine');
+const RiverMemoEngine = require('./RiverMemoEngine');
 const { decodeVectorBlob } = require('./modules/knowledgeBase/vectorCodec');
 const { queryByChunks } = require('./modules/knowledgeBase/sqliteQueryUtils');
 const {
@@ -31,6 +33,7 @@ const DatabaseCoordinator = require('./modules/knowledgeBase/databaseCoordinator
 const KnowledgeBaseFileWatcher = require('./modules/knowledgeBase/fileWatcher');
 const IngestionPipeline = require('./modules/knowledgeBase/ingestionPipeline');
 const SearchService = require('./modules/knowledgeBase/searchService');
+const TagConsistencyService = require('./modules/knowledgeBase/tagConsistencyService');
 
 // 尝试加载 Rust Vexus 引擎
 let VexusIndex = null;
@@ -56,8 +59,20 @@ class KnowledgeBaseManager {
             // ⚠️ 务必确认环境变量 VECTORDB_DIMENSION 与模型一致 (3-small通常为1536)
             dimension: parseInt(process.env.VECTORDB_DIMENSION) || 3072,
 
-            batchWindow: parseInt(process.env.KNOWLEDGEBASE_BATCH_WINDOW_MS, 10) || 2000,
+            batchWindow: parseInt(process.env.KNOWLEDGEBASE_BATCH_WINDOW_MS, 10) || 1000,
             maxBatchSize: parseInt(process.env.KNOWLEDGEBASE_MAX_BATCH_SIZE, 10) || 50,
+            sqliteBusyTimeoutMs: (() => {
+                const value = Number(process.env.KNOWLEDGEBASE_SQLITE_BUSY_TIMEOUT_MS);
+                return Number.isFinite(value) && value >= 0
+                    ? Math.floor(value)
+                    : 10000;
+            })(),
+            sqliteBusyRetryDelayMs: (() => {
+                const value = Number(process.env.KNOWLEDGEBASE_SQLITE_BUSY_RETRY_DELAY_MS);
+                return Number.isFinite(value) && value >= 0
+                    ? Math.floor(value)
+                    : 1000;
+            })(),
             indexSaveDelay: parseInt(process.env.KNOWLEDGEBASE_INDEX_SAVE_DELAY, 10) || 120000,
             tagIndexSaveDelay: parseInt(process.env.KNOWLEDGEBASE_TAG_INDEX_SAVE_DELAY, 10) || 300000,
             deleteBatchWindow: parseInt(process.env.KNOWLEDGEBASE_DELETE_BATCH_WINDOW_MS, 10) || 1000,
@@ -84,6 +99,10 @@ class KnowledgeBaseManager {
 
             tagBlacklist: new Set((process.env.TAG_BLACKLIST || '').split(',').map(t => t.trim()).filter(Boolean)),
             tagBlacklistSuper: (process.env.TAG_BLACKLIST_SUPER || '').split(',').map(t => t.trim()).filter(Boolean),
+            maxTagsPerFile: (() => {
+                const value = parseInt(process.env.KNOWLEDGEBASE_MAX_TAGS_PER_FILE, 10);
+                return Number.isFinite(value) && value > 0 ? value : 50;
+            })(),
             tagExpandMaxCount: parseInt(process.env.TAG_EXPAND_MAX_COUNT, 10) || 30,
             fullScanOnStartup: (process.env.KNOWLEDGEBASE_FULL_SCAN_ON_STARTUP || 'true').toLowerCase() === 'true',
             // 语言置信度补偿配置
@@ -129,6 +148,8 @@ class KnowledgeBaseManager {
         this.deleteBatchTimer = null;
         this.isProcessingDeletes = false;
         this.tagMemoEngine = null;
+        this.tagMemoV10Engine = null;
+        this.riverMemoEngine = null;
         this.resultDeduplicator = null; // ✅ Tagmemo v4
         this.ragParams = {}; // ✅ 新增：用于存储热调控参数
         this.ragParamsWatcher = null;
@@ -144,6 +165,10 @@ class KnowledgeBaseManager {
         this.externalMutationActive = false;
         this.externalMutationOwner = null;
         this.externalMutationQueueLength = 0;
+        // 索引收集窗口在长耗时外部变更期间到期时，只设置闩锁；
+        // 变更提交后立即补刷，避免复用 Rust 冷却时间或创建重复定时器。
+        this.externalMutationBatchDeferred = false;
+        this.externalMutationDeleteBatchDeferred = false;
         this._externalMutationTail = Promise.resolve();
 
         // 🛡️ 同一时刻只允许一个 Rust recoverFromSqlite 打开知识库。
@@ -153,7 +178,8 @@ class KnowledgeBaseManager {
         this._indexRecoveryTail = Promise.resolve();
 
         this.sqliteHealthManager = new SqliteHealthManager({
-            onConnectionRebound: db => this._rebindDatabaseConnection(db)
+            onConnectionRebound: db => this._rebindDatabaseConnection(db),
+            busyTimeoutMs: this.config.sqliteBusyTimeoutMs
         });
         this.migrationVectorCache = new MigrationVectorCache({
             getDb: () => this.db,
@@ -200,6 +226,9 @@ class KnowledgeBaseManager {
         });
         this.ingestionPipeline = new IngestionPipeline(this);
         this.searchService = new SearchService(this);
+        this.tagConsistencyService = new TagConsistencyService(this, {
+            VexusIndex
+        });
     }
 
     async initialize() {
@@ -251,16 +280,67 @@ class KnowledgeBaseManager {
         // 2. 预热日记本名称向量缓存（同步阻塞，确保 RAG 插件启动即可用）
         this._hydrateDiaryNameCacheSync();
 
-        // ✅ Tagmemo v4: 初始化结果去重器
+        // 🧹 初始化 KBM 通用结果去重器。
+        // 它是召回后的独立后处理层，不属于已经下沉 Rust 的 TagMemo 查询主链。
         this.resultDeduplicator = new ResultDeduplicator(this.db, {
             dimension: this.config.dimension
         });
 
         await this.loadRagParams();
 
-        // 初始化浪潮引擎
+        // 初始化生产 V9.2 浪潮引擎。
         this.tagMemoEngine = new TagMemoEngine(this.db, this.tagIndex, this.config, this.ragParams, this);
         await this.tagMemoEngine.initialize();
+
+        // V10/RiverMemo 仅保留轻量控制面；完整图、CSR 与 Provenance 归属
+        // VexusIndex.memoRuntime，不再从 V9 JavaScript Map 编译。
+        this.tagMemoV10Engine = new TagMemoV10Engine(
+            this.db,
+            this.tagIndex,
+            this.config,
+            this.ragParams,
+            { v9Engine: this.tagMemoEngine }
+        );
+        // 已停用旧 JS exact derived asset 启动审计。
+        // RiverMemo Topology V3 现由 Rust 从原始向量计算并按 artifact 签名持有
+        // 原生运行时缓存；v10_vector_metrics / v10_chunk_tag_geometry 仅供已退休的
+        // JS 路径使用。保留下方旧入口注释，便于兼容性回滚，不再在启动时重建。
+        // try {
+        //     this.tagMemoV10Engine.ensureExactDerivedAssets();
+        // } catch (error) {
+        //     console.error(
+        //         '[KnowledgeBase] ⚠️ Legacy V10 exact derived asset audit failed:',
+        //         error.message || error
+        //     );
+        // }
+
+        const riverMemoConfig =
+            this.ragParams?.KnowledgeBaseManager?.riverMemo || {};
+        this.riverMemoEngine = new RiverMemoEngine(
+            this.tagMemoV10Engine,
+            { config: riverMemoConfig }
+        );
+
+        // 冷启动只读取 SQLite 清单元数据，绝不在 JS 解压/恢复完整资产。
+        // 命中严格兼容清单后，首次查询由 Rust 懒加载并原子发布 Arc；
+        // 未命中则由 post-startup 原生 bootstrap 构建。
+        let nativeMemoRestored = false;
+        try {
+            const restored = this._restoreNativeMemoControlHandles();
+            nativeMemoRestored = !!restored;
+            if (!nativeMemoRestored) {
+                console.warn(
+                    '[KnowledgeBase] 🧊 No compatible native Memo artifact manifest; ' +
+                    'native bootstrap will be queued immediately after System Ready.'
+                );
+            }
+        } catch (error) {
+            console.error(
+                '[KnowledgeBase] ⚠️ Native Memo control-handle restore failed; ' +
+                'native bootstrap will be queued immediately after System Ready:',
+                error.message || error
+            );
+        }
         this._cleanupStalePairwiseSimilarityModels();
 
         this._startWatcher();
@@ -273,7 +353,13 @@ class KnowledgeBaseManager {
         console.log('[KnowledgeBase] ✅ System Ready');
 
         if (this.tagMemoEngine && typeof this.tagMemoEngine.schedulePostStartupDerivedRefresh === 'function') {
-            this.tagMemoEngine.schedulePostStartupDerivedRefresh(this.config.derivedStartupCooldownMs);
+            // 原生资产存在时，5 分钟窗口仅执行可选热自检；首次查询可由 Rust
+            // 从 SQLite payload 懒加载 MemoRuntime Arc。若清单缺失，则必需资产
+            // 必须立即进入 bootstrap 队列，不能让查询在冷却期内持续失败。
+            const derivedRefreshDelayMs = nativeMemoRestored
+                ? this.config.derivedStartupCooldownMs
+                : 0;
+            this.tagMemoEngine.schedulePostStartupDerivedRefresh(derivedRefreshDelayMs);
         }
     }
 
@@ -303,7 +389,18 @@ class KnowledgeBaseManager {
             // 覆盖仍在工作的最后健康配置。
             this.ragParams = parsed;
             console.log('[KnowledgeBase] ✅ RAG 热调控参数已加载');
+            if (this.resultDeduplicator) {
+                this.resultDeduplicator.updateConfig(
+                    parsed.KnowledgeBaseManager?.resultDeduplication || {}
+                );
+            }
             if (this.tagMemoEngine) this.tagMemoEngine.updateRagParams(parsed);
+            if (this.tagMemoV10Engine) this.tagMemoV10Engine.updateRagParams(parsed);
+            if (this.riverMemoEngine) {
+                this.riverMemoEngine.updateConfig(
+                    parsed.KnowledgeBaseManager?.riverMemo || {}
+                );
+            }
             return true;
         } catch (e) {
             console.error('[KnowledgeBase] ❌ 加载 rag_params.json 失败，继续使用最后健康配置:', e.message);
@@ -326,6 +423,139 @@ class KnowledgeBaseManager {
             console.log('[KnowledgeBase] 🔄 检测到 rag_params.json 变更，正在重新加载...');
             await this.loadRagParams();
         });
+    }
+
+    _buildNativeMemoEffectiveConfig() {
+        const kbConfig = JSON.parse(JSON.stringify(
+            this.ragParams?.KnowledgeBaseManager || {}
+        ));
+        const memoControlConfig =
+            this.tagMemoV10Engine?.getEffectiveConfig?.() || {};
+        return JSON.parse(JSON.stringify({
+            ...kbConfig,
+            ...memoControlConfig,
+            orderedCooccurrence: kbConfig.orderedCooccurrence || {},
+            v9: kbConfig.v9 || {},
+            spikeRouting: kbConfig.spikeRouting || {}
+        }));
+    }
+
+    _computeNativeMemoDatabaseGeneration() {
+        const facts = ['files', 'chunks', 'tags', 'file_tags'].map(table => {
+            const row = this.db.prepare(
+                `SELECT COUNT(*) AS count, COALESCE(MAX(rowid), 0) AS maxRowId FROM ${table}`
+            ).get();
+            return `${table}:${Number(row?.count) || 0}:${Number(row?.maxRowId) || 0}`;
+        });
+        return crypto.createHash('sha256')
+            .update(facts.join('|'))
+            .digest('hex')
+            .slice(0, 40);
+    }
+
+    _restoreNativeMemoControlHandles() {
+        if (!this.tagMemoEngine || !this.tagMemoV10Engine) return null;
+        const effectiveConfig = this._buildNativeMemoEffectiveConfig();
+        const configHash = crypto.createHash('sha256')
+            .update(JSON.stringify(effectiveConfig))
+            .digest('hex')
+            .slice(0, 32);
+        const databaseGeneration =
+            this._computeNativeMemoDatabaseGeneration();
+        const row = this.db.prepare(`
+            SELECT
+                artifact_sig,
+                algorithm_version,
+                source_v9_artifact_sig,
+                source_graph_generation,
+                model_sig,
+                config_hash,
+                database_generation,
+                provenance_generation,
+                node_count,
+                edge_count,
+                published_at
+            FROM rivermemo_artifacts
+            WHERE model_sig = ?
+              AND config_hash = ?
+              AND database_generation = ?
+              AND algorithm_version = 'memo.native-artifact-v1'
+              AND status = 'ready'
+              AND payload IS NOT NULL
+            ORDER BY published_at DESC, updated_at DESC
+            LIMIT 1
+        `).get(
+            this.tagMemoEngine.modelSig,
+            configHash,
+            databaseGeneration
+        );
+        if (!row) return null;
+
+        const nativeResult = {
+            success: true,
+            artifactSig: row.artifact_sig,
+            sourceArtifactSig: row.source_v9_artifact_sig,
+            graphGeneration: row.source_graph_generation,
+            sourceGraphGeneration: row.source_graph_generation,
+            databaseGeneration: row.database_generation,
+            provenanceGeneration: row.provenance_generation,
+            modelSig: row.model_sig,
+            configHash: row.config_hash,
+            algorithmVersion: row.algorithm_version,
+            generation: null,
+            nodeCount: Number(row.node_count) || 0,
+            edgeCount: Number(row.edge_count) || 0,
+            persisted: true,
+            resident: false
+        };
+        const v9Handle = this.tagMemoEngine.publishNativeArtifactHandle(
+            nativeResult,
+            effectiveConfig
+        );
+        const artifact = this.tagMemoV10Engine.publishNativeArtifactHandle(
+            nativeResult,
+            {
+                effectiveConfig,
+                publishedAt: Number(row.published_at) || Date.now()
+            }
+        );
+        console.log(
+            `[KnowledgeBase] ♻️ Native Memo manifest restored without JS payload decode: ` +
+            `artifact=${artifact.artifactSig}, sourceV9=${v9Handle.artifactSig}, ` +
+            `nodes=${artifact.nodeCount}, edges=${artifact.edgeCount}.`
+        );
+        return artifact;
+    }
+
+    /**
+     * Rust 已完成构建、持久化与 MemoRuntime Arc 发布后的控制面回调。
+     * 本方法只发布轻量句柄，禁止编译 JS CSR、解压 payload 或清空原生 runtime。
+     */
+    onNativeMemoArtifactPublished(nativeResult, v9Handle = null) {
+        if (!this.tagMemoV10Engine) return null;
+        const effectiveConfig = this._buildNativeMemoEffectiveConfig();
+        const artifact = this.tagMemoV10Engine.publishNativeArtifactHandle(
+            nativeResult,
+            { effectiveConfig }
+        );
+        console.log(
+            `[KnowledgeBase] 🌊 Native Memo generation ready: ` +
+            `artifact=${artifact.artifactSig}, sourceV9=` +
+            `${v9Handle?.artifactSig || artifact.sourceArtifactSig}, ` +
+            `nativeGeneration=${artifact.nativeGeneration ?? 'unknown'}.`
+        );
+        return artifact;
+    }
+
+    /**
+     * 退休兼容入口：旧 JS 图发布不得再触发生产伴生编译。
+     */
+    onTagMemoArtifactPublished(sourceBundle) {
+        console.warn(
+            `[KnowledgeBase] Ignored retired JS Memo artifact publication ` +
+            `${sourceBundle?.artifactSig || 'unknown'}; native rebuild is required.`
+        );
+        return null;
     }
 
     _initSchema() {
@@ -355,6 +585,18 @@ class KnowledgeBaseManager {
         return healthy;
     }
 
+    /**
+     * Rust/rusqlite 派生写完成后的专用屏障。
+     * 先淘汰长期存活的 better-sqlite3 连接及其 pager/WAL/SHM 视图，
+     * 再由新连接执行 checkpoint + quick_check；普通 JS 写不走此低频路径。
+     */
+    reopenAndAssertDatabaseHealthy(reason = 'rust-write-barrier') {
+        this.sqliteHealthManager.syncFromOwner(this);
+        const healthy = this.sqliteHealthManager.reopenAndAssertHealthy(reason);
+        this.sqliteHealthManager.syncToOwner(this);
+        return healthy;
+    }
+
     _rebindDatabaseConnection(db) {
         this.db = db;
 
@@ -363,11 +605,15 @@ class KnowledgeBaseManager {
             if (this.tagMemoEngine.epa) this.tagMemoEngine.epa.db = db;
             if (this.tagMemoEngine.residualPyramid) this.tagMemoEngine.residualPyramid.db = db;
         }
+        if (this.tagMemoV10Engine) {
+            this.tagMemoV10Engine.rebindDatabase(db);
+        }
+        if (this.riverMemoEngine) {
+            this.riverMemoEngine.rebindDatabase(db);
+        }
 
         if (this.resultDeduplicator) {
             this.resultDeduplicator.db = db;
-            if (this.resultDeduplicator.epa) this.resultDeduplicator.epa.db = db;
-            if (this.resultDeduplicator.residualCalculator) this.resultDeduplicator.residualCalculator.db = db;
         }
     }
 
@@ -380,6 +626,10 @@ class KnowledgeBaseManager {
 
     _isSqliteCorruptionError(error) {
         return this.sqliteHealthManager.isCorruptionError(error);
+    }
+
+    _isSqliteBusyError(error) {
+        return this.sqliteHealthManager.isBusyError(error);
     }
 
     _quarantineSqliteDatabase(dbPath, reason = 'corrupt') {
@@ -668,6 +918,113 @@ class KnowledgeBaseManager {
      * 公共接口：应用请求级固定的 V9.1 TagMemo 增强向量。
      * options.tagMemoVersion 仅接受 "v9"；显式旧版本会返回 TAGMEMO_VERSION_RETIRED。
      */
+    /**
+     * TagMemo 原生异步增强兼容门面。
+     *
+     * 返回旧 applyTagBoost 的主要字段形状，同时附带 preparedMemoObservation，
+     * 供后续 DTSC/Topology 读出复用同一次 Rust 感应，禁止重复构造河网。
+     */
+    async applyTagBoostAsync(
+        vector,
+        tagBoost,
+        coreTags = [],
+        coreBoostFactor = 1.33,
+        options = {}
+    ) {
+        const source = vector instanceof Float32Array
+            ? vector
+            : new Float32Array(vector || []);
+        const prepared = options.preparedMemoObservation
+            || await this.prepareUnifiedMemoObservation(
+                {
+                    text: String(options.queryText || ''),
+                    vector: source
+                },
+                {
+                    ...options,
+                    vector: source,
+                    coreTags,
+                    sourceObservationConfig: {
+                        ...(options.sourceObservationConfig || {}),
+                        baseTagBoost: Math.max(
+                            0,
+                            Number(tagBoost) || 0
+                        ),
+                        coreBoostFactor: Math.max(
+                            0,
+                            Number(coreBoostFactor) || 1.33
+                        )
+                    }
+                }
+            );
+        const observation = prepared.observation;
+        const sourceObservation = prepared.sourceObservationResult;
+        const energyField = new Map(
+            (Array.isArray(observation?.nodes)
+                ? observation.nodes
+                : []
+            ).map(node => [
+                Number(node.id),
+                Math.max(0, Number(node.energy) || 0)
+            ])
+        );
+        const energyFieldProvenance = new Map(
+            Array.isArray(sourceObservation?.fieldProvenance)
+                ? sourceObservation.fieldProvenance
+                : []
+        );
+        const v9Bundle =
+            this.tagMemoEngine?.getArtifactBundleSnapshot?.('v9')
+            || null;
+
+        return {
+            vector: prepared.enhancedVector,
+            energyField,
+            energyFieldProvenance,
+            artifactBundle: v9Bundle,
+            preparedMemoObservation: prepared,
+            info: {
+                coreTagsMatched:
+                    sourceObservation.coreTagsMatched || [],
+                matchedTags:
+                    sourceObservation.matchedTags || [],
+                boostFactor: Number.isFinite(
+                    Number(sourceObservation.effectiveTagBoost)
+                )
+                    ? Math.max(
+                        0,
+                        Number(sourceObservation.effectiveTagBoost)
+                    )
+                    : Math.max(0, Number(tagBoost) || 0),
+                requestedVersion: 'v9',
+                effectiveVersion: 'v9',
+                versionFallbackUsed: false,
+                versionFallbackReason: null,
+                artifactSig: v9Bundle?.artifactSig || null,
+                graphGeneration:
+                    v9Bundle?.graphGeneration || null,
+                artifactGeneration:
+                    v9Bundle?.generation || null,
+                nativeArtifactSig:
+                    prepared.artifact?.artifactSig || null,
+                nativeArtifactGeneration:
+                    prepared.artifact?.generation || null,
+                epa: sourceObservation.epa || {},
+                pyramid: sourceObservation.pyramid || {},
+                propagation:
+                    sourceObservation.propagation || {},
+                queryRiverGraph:
+                    sourceObservation.queryRiverGraph || null,
+                algorithmVersion:
+                    observation?.algorithmVersion
+                    || 'tagmemo.spike-v9.1-rust-shared',
+                runtimeOwnership: 'vexus-index-instance',
+                nativeFusion:
+                    sourceObservation.diagnostics?.nativeFusion || null
+            }
+        };
+    }
+
     applyTagBoost(vector, tagBoost, coreTags = [], coreBoostFactor = 1.33, options = {}) {
         if (!this.tagMemoEngine) {
             if (options.strictVersion === true) {
@@ -715,6 +1072,871 @@ class KnowledgeBaseManager {
             fallbackUsed: resolution.fallbackUsed,
             fallbackReason: resolution.fallbackReason
         };
+    }
+
+    getTagMemoV10ArtifactSnapshot(options = {}) {
+        if (!this.tagMemoV10Engine) return null;
+        const forceRebuild = options.forceRebuild === true;
+        const bundle = forceRebuild
+            ? this.tagMemoV10Engine.buildAndPublishArtifact(options)
+            : this.tagMemoV10Engine.getArtifactSnapshot(options);
+        return {
+            bundle,
+            requestedVersion: 'v10_alpha',
+            effectiveVersion: 'v10_alpha',
+            fallbackUsed: false,
+            fallbackReason: null
+        };
+    }
+
+    prepareTagMemoV10Query(query, agentContext = {}, options = {}) {
+        if (!this.tagMemoV10Engine) {
+            const error = new Error('TagMemo V10 Alpha engine is not available');
+            error.code = 'TAGMEMO_V10_ARTIFACT_UNAVAILABLE';
+            throw error;
+        }
+        return this.tagMemoV10Engine.prepareQuery(query, agentContext, options);
+    }
+
+    buildTagMemoV10CandidateSuperset(sourceCandidates, options = {}) {
+        if (!this.tagMemoV10Engine) {
+            throw new Error('TagMemo V10 Alpha engine is not available');
+        }
+        return this.tagMemoV10Engine.buildCandidateSuperset(sourceCandidates, options);
+    }
+
+    projectTagMemoV10CandidateCurves(candidates, options = {}) {
+        if (!this.tagMemoV10Engine) {
+            throw new Error('TagMemo V10 Alpha engine is not available');
+        }
+        return this.tagMemoV10Engine.projectCandidateCurves(candidates, options);
+    }
+
+    evaluateTagMemoV10CandidateCurves(curves, queryState, options = {}) {
+        if (!this.tagMemoV10Engine) {
+            throw new Error('TagMemo V10 Alpha engine is not available');
+        }
+        return this.tagMemoV10Engine.evaluateCandidateCurves(
+            curves,
+            queryState,
+            options
+        );
+    }
+
+    computeTagMemoV10Dstc(pathBatch, queryState, options = {}) {
+        if (!this.tagMemoV10Engine) {
+            throw new Error('TagMemo V10 Alpha engine is not available');
+        }
+        return this.tagMemoV10Engine.computeDstcObservables(
+            pathBatch,
+            queryState,
+            options
+        );
+    }
+
+    runTagMemoV10ExperimentArms(dstcBatch, options = {}) {
+        if (!this.tagMemoV10Engine) {
+            throw new Error('TagMemo V10 Alpha engine is not available');
+        }
+        return this.tagMemoV10Engine.runExperimentArms(dstcBatch, options);
+    }
+
+    scoreTagMemoV10ExperimentArm(dstcBatch, arm, options = {}) {
+        if (!this.tagMemoV10Engine) {
+            throw new Error('TagMemo V10 Alpha engine is not available');
+        }
+        return this.tagMemoV10Engine.scoreExperimentArm(
+            dstcBatch,
+            arm,
+            options
+        );
+    }
+
+    _resolveUnifiedMemoRuntime() {
+        if (!this.tagIndex || !this.tagMemoEngine || !this.tagMemoV10Engine) {
+            const error = new Error('Unified native Memo runtime is unavailable');
+            error.code = 'MEMO_RUNTIME_UNAVAILABLE';
+            throw error;
+        }
+        if (
+            typeof this.tagIndex.runMemoPipeline !== 'function'
+            || typeof this.tagIndex.rerankMemoDtsc !== 'function'
+            || typeof this.tagIndex.rerankRivermemoTopologyV3 !== 'function'
+        ) {
+            const error = new Error(
+                'Unified native Memo ABI is unavailable; rebuild rust-vexus-lite'
+            );
+            error.code = 'MEMO_NATIVE_ABI_UNAVAILABLE';
+            throw error;
+        }
+        if (!this.dbPath) {
+            const error = new Error('Unified native Memo runtime has no SQLite path');
+            error.code = 'MEMO_DB_PATH_UNAVAILABLE';
+            throw error;
+        }
+
+        const artifact = this.tagMemoV10Engine.getArtifactSnapshot({
+            buildIfMissing: false
+        });
+        if (!artifact?.artifactSig) {
+            const error = new Error('Unified native Memo artifact is unavailable');
+            error.code = 'MEMO_ARTIFACT_UNAVAILABLE';
+            throw error;
+        }
+        return { artifact, dbPath: this.dbPath };
+    }
+
+    /**
+     * 统一原生感应入口。
+     *
+     * JavaScript 只冻结并透传请求配置；EPA、Residual Pyramid、语言/Core/
+     * 层级门控、Spike 河网和向量融合由同一个 VexusIndex 后台任务一次完成。
+     * 返回对象继续兼容 V10 prepareQuery 与旧 BoostResult 消费契约。
+     */
+    async prepareUnifiedMemoObservation(query, options = {}) {
+        const { artifact, dbPath } = this._resolveUnifiedMemoRuntime();
+        const queryVectorRaw = query?.vector || options.vector;
+        const queryVector = queryVectorRaw instanceof Float32Array
+            ? queryVectorRaw
+            : new Float32Array(queryVectorRaw || []);
+        if (queryVector.length !== this.config.dimension) {
+            throw new RangeError(
+                `Unified Memo query vector must be ${this.config.dimension}, ` +
+                `got ${queryVector.length}`
+            );
+        }
+
+        const kbConfig = this.ragParams?.KnowledgeBaseManager || {};
+        const riverConfig = kbConfig.riverMemo || {};
+        const sourceObservationConfig = {
+            ...(riverConfig.sourceObservation || {}),
+            ...(artifact.effectiveConfig?.sourceObservation || {}),
+            ...(options.sourceObservation || {}),
+            ...(options.sourceObservationConfig || {})
+        };
+        const spike = {
+            ...(kbConfig.spikeRouting || {}),
+            ...(options.spikeRouting || {})
+        };
+        const nativeMemoConfig = artifact.effectiveConfig || {};
+        const localFieldConfig = {
+            ...(nativeMemoConfig.localField || {}),
+            ...(options.localField || {})
+        };
+        const transferFieldConfig = {
+            ...(nativeMemoConfig.transferField || {}),
+            ...(options.transferField || {})
+        };
+        const effectiveSupportConfig = {
+            ...(nativeMemoConfig.effectiveSupport || {}),
+            ...(options.effectiveSupport || {})
+        };
+        const language = kbConfig.languageCompensator || {};
+        const requestedCoreTags = Array.isArray(options.coreTags)
+            ? options.coreTags
+            : [];
+        const stringCoreTags = requestedCoreTags
+            .filter(tag => typeof tag === 'string' && tag.trim())
+            // JS SOTA 的 coreTagSet 以小写名称工作，后补 SQL 也消费该规范值。
+            .map(tag => tag.trim().toLowerCase());
+        // 旧 JS SOTA 接受 { name, vector, isCore } 幽灵节点。它们不是图传播
+        // 种子：脉冲传播结束后才参与 Core/Soft 权重融合。必须把向量和强弱语义
+        // 原样传给 Rust，不能再像早期统一管线一样静默过滤对象 Core。
+        const ghostTags = requestedCoreTags
+            .filter(tag =>
+                tag
+                && typeof tag === 'object'
+                && typeof tag.name === 'string'
+                && tag.name.trim()
+                && tag.vector
+                && typeof tag.vector.length === 'number'
+            )
+            .map(tag => ({
+                name: tag.name.trim(),
+                vector: Array.from(tag.vector, value => Number(value) || 0),
+                isCore: tag.isCore === true
+            }));
+
+        const nativePayload = await this.tagIndex.runMemoPipeline(
+            dbPath,
+            artifact.artifactSig,
+            JSON.stringify({
+                queryId: options.queryId || null,
+                queryText: String(query?.text || options.queryText || ''),
+                queryVector: Array.from(queryVector),
+                coreTags: stringCoreTags,
+                ghostTags,
+                config: {
+                    baseTagBoost: Math.max(
+                        0,
+                        Number(sourceObservationConfig.baseTagBoost ?? 0.6)
+                    ),
+                    coreBoostFactor: Math.max(
+                        0,
+                        Number(sourceObservationConfig.coreBoostFactor ?? 1.33)
+                    ),
+                    localAlpha: Number(localFieldConfig.alpha ?? 0.15),
+                    transferAlpha: Number(transferFieldConfig.alpha ?? 0.55),
+                    fieldMaxIterations: Math.max(
+                        1,
+                        Math.floor(Math.max(
+                            Number(localFieldConfig.maxIterations) || 80,
+                            Number(transferFieldConfig.maxIterations) || 80
+                        ))
+                    ),
+                    localTolerance: Math.max(
+                        1e-15,
+                        Number(localFieldConfig.tolerance) || 1e-9
+                    ),
+                    transferTolerance: Math.max(
+                        1e-15,
+                        Number(transferFieldConfig.tolerance) || 1e-9
+                    ),
+                    localMassRatio: Math.max(
+                        0.01,
+                        Math.min(
+                            1,
+                            Number(effectiveSupportConfig.localMassRatio ?? 0.8)
+                        )
+                    ),
+                    transferMassRatio: Math.max(
+                        0.01,
+                        Math.min(
+                            1,
+                            Number(effectiveSupportConfig.transferMassRatio ?? 0.9)
+                        )
+                    ),
+                    maxLevels: Math.max(
+                        1,
+                        Math.floor(Number(options.maxPyramidLevels) || 3)
+                    ),
+                    pyramidTopK: Math.max(
+                        1,
+                        Math.floor(Number(options.pyramidTopK) || 10)
+                    ),
+                    minEnergyRatio: Math.max(
+                        0,
+                        Math.min(
+                            1,
+                            Number(options.minPyramidEnergyRatio ?? 0.1)
+                        )
+                    ),
+                    layerDecay: Math.max(
+                        0,
+                        Math.min(1, Number(options.layerDecay ?? 0.7))
+                    ),
+                    activationMultiplier:
+                        kbConfig.activationMultiplier || [0.5, 1.5],
+                    dynamicBoostRange:
+                        kbConfig.dynamicBoostRange || [0.3, 2.0],
+                    coreBoostRange:
+                        kbConfig.coreBoostRange || [1.2, 1.4],
+                    langConfidenceEnabled:
+                        this.config.langConfidenceEnabled !== false,
+                    langPenaltyUnknown: Number(
+                        language.penaltyUnknown
+                        ?? this.config.langPenaltyUnknown
+                        ?? 0.05
+                    ),
+                    langPenaltyCrossDomain: Number(
+                        language.penaltyCrossDomain
+                        ?? this.config.langPenaltyCrossDomain
+                        ?? 0.1
+                    ),
+                    deduplicationThreshold: Number(
+                        kbConfig.deduplicationThreshold ?? 0.88
+                    ),
+                    maxFusionTags: Math.max(
+                        1,
+                        Math.floor(Number(options.maxFusionTags) || 128)
+                    ),
+                    maxEmergentNodes: Math.max(
+                        0,
+                        Math.floor(Number(
+                            options.maxEmergentNodes
+                            ?? spike.maxEmergentNodes
+                            ?? 50
+                        ))
+                    ),
+                    techTagThreshold: Number(
+                        kbConfig.techTagThreshold ?? 0.08
+                    ),
+                    normalTagThreshold: Number(
+                        kbConfig.normalTagThreshold ?? 0.015
+                    ),
+                    spikeRouting: {
+                        maxSafeHops: spike.maxSafeHops,
+                        baseMomentum: spike.baseMomentum,
+                        firingThreshold: spike.firingThreshold,
+                        baseDecay: spike.baseDecay,
+                        wormholeDecay: spike.wormholeDecay,
+                        tensionThreshold: spike.tensionThreshold,
+                        maxNeighborsPerNode: spike.maxNeighborsPerNode,
+                        returnFlowFactor: spike.v91ReturnFlowFactor,
+                        firGamma: spike.v91FirGamma,
+                        maxPropagationStates:
+                            spike.v91MaxPropagationStates,
+                        minimumInjectedCurrent:
+                            spike.minimumInjectedCurrent,
+                        // 0 表示不截断。旧 JS SOTA 的 query river graph 完整保留
+                        // reached nodes/edges；只在最终融合时截断 emergent 节点。
+                        maxOutputNodes:
+                            options.maxObservationNodes ?? 0,
+                        maxOutputEdges:
+                            options.maxObservationEdges ?? 0
+                    }
+                }
+            })
+        );
+        const pipeline = JSON.parse(nativePayload);
+        const observation = pipeline?.observation;
+        if (
+            pipeline?.artifactSig !== artifact.artifactSig
+            || observation?.artifactSig !== artifact.artifactSig
+            || !Array.isArray(observation?.nodes)
+            || !Array.isArray(observation?.edges)
+            || !Array.isArray(pipeline?.enhancedVector)
+            || pipeline.enhancedVector.length !== this.config.dimension
+            || !Array.isArray(pipeline?.localVector)
+            || pipeline.localVector.length !== this.config.dimension
+            || !Array.isArray(pipeline?.transferVector)
+            || pipeline.transferVector.length !== this.config.dimension
+            || !Array.isArray(pipeline?.localField)
+            || !Array.isArray(pipeline?.transferField)
+            || !Array.isArray(pipeline?.localDomainIds)
+            || !Array.isArray(pipeline?.transferDomainIds)
+        ) {
+            const error = new Error(
+                'Unified native Memo pipeline failed artifact/schema validation'
+            );
+            error.code = 'MEMO_PIPELINE_INVALID';
+            throw error;
+        }
+
+        const fieldProvenance = observation.nodes.map(node => Object.freeze([
+            Number(node.id),
+            Object.freeze({
+                sourceType: node.sourceType || 'unknown',
+                originType: node.originType || null,
+                hop: Number(node.hop) || 0,
+                seedId: Number.isFinite(Number(node.seedId))
+                    ? Number(node.seedId)
+                    : null
+            })
+        ]));
+        const sourceField = (Array.isArray(observation.sourceField)
+            ? observation.sourceField
+            : []
+        ).map(entry => Object.freeze([
+            Number(entry?.[0]),
+            Math.max(0, Number(entry?.[1]) || 0)
+        ]));
+        const pyramidRaw = pipeline.pyramid || {};
+        const pyramidFeatures = pyramidRaw.features || {};
+        const pyramid = Object.freeze({
+            coverage: Number(pyramidFeatures.coverage) || 0,
+            novelty: Number(pyramidFeatures.novelty) || 0,
+            coherence: Number(pyramidFeatures.coherence) || 0,
+            activation: Number(pyramidFeatures.activation) || 0,
+            depth: Number(pyramidFeatures.depth) || 0,
+            totalExplainedEnergy:
+                Number(pyramidRaw.totalExplainedEnergy) || 0,
+            levels: Object.freeze(
+                Array.isArray(pyramidRaw.levels)
+                    ? pyramidRaw.levels
+                    : []
+            )
+        });
+        const enhancedVector = Object.freeze(
+            pipeline.enhancedVector.map(value => Number(value) || 0)
+        );
+        const observationHandle = typeof pipeline.observationHandle === 'string'
+            && pipeline.observationHandle
+            ? pipeline.observationHandle
+            : null;
+        const nativeFusion = pipeline.diagnostics?.fusion || null;
+
+        const sourceObservationResult = Object.freeze({
+            schema: pipeline.schema,
+            sourceMode: 'rust_unified_memo_pipeline',
+            sourceField: Object.freeze(sourceField),
+            enhancedVector,
+            fieldProvenance: Object.freeze(fieldProvenance),
+            queryRiverGraph: Object.freeze({
+                schema: 'vexus-unified-memo-river-v1',
+                nodes: Object.freeze(observation.nodes),
+                edges: Object.freeze(observation.edges),
+                diagnostics: Object.freeze({
+                    reachedNodes:
+                        observation.diagnostics?.reachedNodes || 0,
+                    activeEdges:
+                        observation.diagnostics?.activeEdges || 0,
+                    maximumNodeEnergy:
+                        observation.diagnostics?.maximumNodeEnergy || 0,
+                    maximumEdgeFlow:
+                        observation.diagnostics?.maximumEdgeFlow || 0
+                })
+            }),
+            epa: Object.freeze({ ...(pipeline.epa || {}) }),
+            pyramid,
+            propagation: Object.freeze({
+                native: observation.diagnostics || null
+            }),
+            matchedTags: Object.freeze(
+                Array.isArray(pipeline.matchedTags)
+                    ? pipeline.matchedTags.slice()
+                    : []
+            ),
+            coreTagsMatched: Object.freeze(
+                Array.isArray(pipeline.coreTagsMatched)
+                    ? pipeline.coreTagsMatched.slice()
+                    : []
+            ),
+            v9ArtifactSig:
+                this.tagMemoEngine
+                    ?.getArtifactBundleSnapshot?.('v9')
+                    ?.artifactSig || null,
+            nativeArtifactSig: artifact.artifactSig,
+            observationHandle,
+            effectiveTagBoost:
+                Math.max(0, Number(pipeline.effectiveTagBoost) || 0),
+            diagnostics: Object.freeze({
+                completeObservation: sourceField.length > 0,
+                nativeSensing: observation.diagnostics || null,
+                nativeFusion: nativeFusion
+                    ? Object.freeze({ ...nativeFusion })
+                    : null,
+                nativePipeline: Object.freeze({
+                    ...(pipeline.diagnostics || {})
+                }),
+                runtimeOwnership: 'vexus-index-instance'
+            })
+        });
+
+        const normalizeNativeField = entries => Object.freeze(
+            entries.map(entry => Object.freeze([
+                Number(entry?.[0]),
+                Math.max(0, Number(entry?.[1]) || 0)
+            ])).filter(entry =>
+                Number.isFinite(entry[0]) && entry[0] > 0 && entry[1] > 0
+            )
+        );
+        const localField = normalizeNativeField(pipeline.localField);
+        const transferField = normalizeNativeField(pipeline.transferField);
+        const localDomainIds = Object.freeze(
+            pipeline.localDomainIds.map(Number).filter(Number.isFinite)
+        );
+        const transferDomainIds = Object.freeze(
+            pipeline.transferDomainIds.map(Number).filter(Number.isFinite)
+        );
+
+        return Object.freeze({
+            artifact,
+            observationHandle,
+            observation: Object.freeze(observation),
+            sourceObservationResult,
+            sourceField: Object.freeze(sourceField),
+            queryVector,
+            enhancedVector: new Float32Array(enhancedVector),
+            nativePreparedQuery: Object.freeze({
+                queryState: Object.freeze({
+                    queryId: observation.queryId || options.queryId || null,
+                    sourceField: Object.freeze(sourceField),
+                    localField,
+                    transferField,
+                    localDomain: Object.freeze({ ids: localDomainIds }),
+                    transferDomain: Object.freeze({ ids: transferDomainIds }),
+                    queryRiverGraph: sourceObservationResult.queryRiverGraph,
+                    sourceObservation: sourceObservationResult,
+                    fieldDiagnostics: Object.freeze({
+                        backend: 'rust-unified-memo-pipeline',
+                        ...(pipeline.diagnostics?.dualField || {})
+                    })
+                }),
+                denoisedVector: new Float32Array(enhancedVector),
+                localVector: new Float32Array(pipeline.localVector),
+                transferVector: new Float32Array(pipeline.transferVector),
+                fieldProjectionDiagnostics: Object.freeze({
+                    backend: 'rust-unified-memo-pipeline'
+                }),
+                preparationTimings: Object.freeze({
+                    nativePipelineTotalMs:
+                        Number(pipeline.diagnostics?.totalMs) || 0
+                })
+            })
+        });
+    }
+
+    /**
+     * 统一 Memo 双读出门面。readoutMode 只允许 dtsc / topology_v3；
+     * 二者共享同一次原生 QueryObservation 和同一个活动图代际。
+     */
+    async rerankWithMemo(
+        readoutMode,
+        query,
+        candidates,
+        agentContext = {},
+        options = {}
+    ) {
+        const mode = String(readoutMode || '').trim().toLowerCase();
+        if (mode !== 'dtsc' && mode !== 'topology_v3') {
+            const error = new Error(
+                `Unsupported Memo readout mode: ${readoutMode}`
+            );
+            error.code = 'MEMO_READOUT_MODE_UNSUPPORTED';
+            throw error;
+        }
+        const prepared = options.preparedMemoObservation
+            || await this.prepareUnifiedMemoObservation(query, options);
+        const { artifact, observation, sourceObservationResult } = prepared;
+
+        if (mode === 'topology_v3') {
+            if (!this.riverMemoEngine) {
+                const error = new Error('RiverMemo engine is unavailable');
+                error.code = 'RIVERMEMO_UNAVAILABLE';
+                throw error;
+            }
+            return await this.riverMemoEngine.rerank(
+                {
+                    text: String(query?.text || ''),
+                    vector: prepared.queryVector
+                },
+                Array.isArray(candidates) ? candidates : [],
+                agentContext,
+                {
+                    ...options,
+                    artifact,
+                    dbPath: this.dbPath,
+                    nativePreparedQuery: prepared.nativePreparedQuery,
+                    observationHandle: prepared.observationHandle,
+                    sourceObservationResult,
+                    sourceField: prepared.sourceField,
+                    sourceObservationConfig: {
+                        ...(artifact.effectiveConfig
+                            ?.sourceObservation || {}),
+                        ...(options.sourceObservationConfig || {})
+                    },
+                    includeTrace: options.includeTrace === true
+                }
+            );
+        }
+
+        const geoConfig = {
+            ...(artifact.effectiveConfig
+                ?.potentialFieldRerank || {}),
+            ...(artifact.effectiveConfig
+                ?.geodesicRerank || {}),
+            ...(this.ragParams?.KnowledgeBaseManager
+                ?.potentialFieldRerank || {}),
+            ...(this.ragParams?.KnowledgeBaseManager
+                ?.geodesicRerank || {}),
+            ...(options.config || {})
+        };
+        const resolvedMinGeoSamples = Math.max(
+            1,
+            Math.floor(Number(
+                options.minGeoSamples
+                ?? geoConfig.minGeoSamples
+                ?? 3
+            ))
+        );
+        const nativePayload = await this.tagIndex.rerankMemoDtsc(
+            this.dbPath,
+            artifact.artifactSig,
+            JSON.stringify({
+                dimension: this.config.dimension,
+                observationHandle: prepared.observationHandle,
+                queryGeometryState: {
+                    epa: sourceObservationResult.epa || {},
+                    pyramid: sourceObservationResult.pyramid || {}
+                },
+                topK: Math.max(
+                    1,
+                    Math.floor(
+                        Number(options.topK)
+                        || (Array.isArray(candidates)
+                            ? candidates.length
+                            : 1)
+                    )
+                ),
+                candidates: (Array.isArray(candidates)
+                    ? candidates
+                    : []
+                ).map(candidate => ({
+                    id: Number(
+                        candidate?.id
+                        ?? candidate?.chunkId
+                        ?? candidate?.label
+                    ),
+                    score: Number(candidate?.score) || 0
+                })).filter(candidate =>
+                    Number.isFinite(candidate.id)
+                    && candidate.id > 0
+                ),
+                ...(prepared.observationHandle
+                    ? {}
+                    : {
+                        observation,
+                        originalQueryVector:
+                            Array.from(prepared.queryVector),
+                        enhancedQueryVector:
+                            Array.from(prepared.enhancedVector)
+                    }),
+                config: {
+                    ...geoConfig,
+                    alpha:
+                        options.alpha
+                        ?? options.geoAlpha
+                        ?? geoConfig.alpha,
+                    minGeoSamples: resolvedMinGeoSamples,
+                    // JS SOTA 默认 minFieldTags 跟随 minGeoSamples，而不是固定常量。
+                    minFieldTags:
+                        geoConfig.minFieldTags
+                        ?? resolvedMinGeoSamples,
+                    fallbackToKnnOnLowTrust:
+                        geoConfig.fallbackToKnnOnLowTrust !== false
+                        && geoConfig.fallbackToKnnOnLowTrust !== 0,
+                    sparseAssociationEnabled:
+                        geoConfig.sparseAssociationEnabled !== false
+                        && geoConfig.sparseAssociationEnabled !== 0,
+                    geometryAuxiliary: {
+                        ...(geoConfig.geometryAuxiliary || {}),
+                        enabled:
+                            geoConfig.geometryAuxiliary?.enabled === true
+                            || geoConfig.geometryAuxiliary?.enabled === 1,
+                        identityAnchor: {
+                            ...(geoConfig.geometryAuxiliary
+                                ?.identityAnchor || {}),
+                            enabled:
+                                geoConfig.geometryAuxiliary
+                                    ?.identityAnchor?.enabled === true
+                                || geoConfig.geometryAuxiliary
+                                    ?.identityAnchor?.enabled === 1
+                        }
+                    }
+                }
+            })
+        );
+        const nativeResult = JSON.parse(nativePayload);
+        const originalById = new Map(
+            (Array.isArray(candidates) ? candidates : [])
+                .map(candidate => [
+                    Number(
+                        candidate?.id
+                        ?? candidate?.chunkId
+                        ?? candidate?.label
+                    ),
+                    candidate
+                ])
+                .filter(([id]) => Number.isFinite(id) && id > 0)
+        );
+        const results = (Array.isArray(nativeResult.results)
+            ? nativeResult.results
+            : []
+        ).map(item => Object.freeze({
+            ...(originalById.get(Number(item.id)) || {}),
+            ...item,
+            id: Number(item.id),
+            // 保持旧 TagMemo geodesicRerank 公共字段契约；Rust JSON 使用
+            // camelCase，兼容调用方仍读取历史 snake_case 字段。
+            original_knn_score:
+                Number(item.originalKnnScore) || 0,
+            geo_score:
+                Number(item.geoScore) || 0,
+            normalized_geo:
+                Number(item.normalizedGeo) || 0,
+            geo_bonus:
+                Number(item.geoBonus) || 0,
+            geo_base_bonus:
+                Number(item.geoBaseBonus) || 0,
+            geo_aux_bonus:
+                Number(item.geoAuxBonus) || 0,
+            geo_effect:
+                item.geoEffect || 'neutral',
+            geo_evidence_class:
+                item.geoEvidenceClass || 'neutral',
+            geo_reward_eligible:
+                item.geoRewardEligible === true,
+            geo_confidence:
+                Number(item.geoConfidence) || 0,
+            geo_exact_hits:
+                Number(item.geoExactHits) || 0,
+            geo_direct_exact_hits:
+                Number(item.geoDirectExactHits) || 0,
+            geo_emergent_exact_hits:
+                Number(item.geoEmergentExactHits) || 0,
+            geo_direct_semantic_hits:
+                Number(item.geoDirectSemanticHits) || 0,
+            geo_direct_semantic_strength:
+                Number(item.geoDirectSemanticStrength) || 0,
+            geo_strong_hits:
+                Number(item.geoStrongHits) || 0,
+            geo_hit_count:
+                Number(item.geoHitCount) || 0,
+            geo_weighted_coverage:
+                Number(item.geoWeightedCoverage) || 0,
+            geo_mean_potential:
+                Number(item.geoMeanPotential) || 0,
+            geo_max_potential:
+                Number(item.geoMaxPotential) || 0,
+            geo_continuity:
+                Number(item.geoContinuity) || 0,
+            geo_isolated_ratio:
+                Number(item.geoIsolatedRatio) || 0,
+            geo_raw_isolated_ratio:
+                Number(item.geoRawIsolatedRatio) || 0,
+            geo_sparse_association_confidence:
+                Number(item.geoSparseAssociationConfidence) || 0,
+            geo_sparse_association_pairs:
+                Number(item.geoSparseAssociationPairs) || 0,
+            geo_action_quality:
+                Number(item.geoActionQuality) || 0,
+            geo_closure_quality:
+                Number(item.geoClosureQuality) || 0,
+            geo_direction_consistency:
+                Number(item.geoDirectionConsistency) || 0,
+            geo_vector_lift:
+                Number(item.geoVectorLift) || 0,
+            geo_direct_score:
+                Number(item.geoDirectScore) || 0,
+            geo_structural_score:
+                Number(item.geoStructuralScore) || 0,
+            geo_thematic_score:
+                Number(item.geoThematicScore) || 0,
+            geo_closure_score:
+                Number(item.geoClosureScore) || 0,
+            geo_fused_shadow_score:
+                Number(item.geoFusedShadowScore) || 0
+        }));
+
+        return Object.freeze({
+            schema: nativeResult.schema,
+            version: 'tagmemo_v9_dtsc_native',
+            algorithmVersion: nativeResult.algorithmVersion,
+            artifactSig: artifact.artifactSig,
+            artifactGeneration: artifact.generation,
+            readoutMode: 'dtsc',
+            queryTags: Object.freeze({
+                matchedTags:
+                    sourceObservationResult.matchedTags,
+                coreTagsMatched:
+                    sourceObservationResult.coreTagsMatched,
+                sourceMode:
+                    sourceObservationResult.sourceMode
+            }),
+            results: Object.freeze(results),
+            diagnostics: Object.freeze({
+                ...(nativeResult.diagnostics || {}),
+                sensing:
+                    sourceObservationResult.diagnostics
+                        ?.nativeSensing || null,
+                runtimeOwnership: 'vexus-index-instance',
+                memoRuntime:
+                    typeof this.tagIndex.memoRuntimeStats === 'function'
+                        ? this.tagIndex.memoRuntimeStats()
+                        : null
+            })
+        });
+    }
+
+    /**
+     * RiverMemo 生产接口：固定执行 Topology V3 与其绑定的 Ω 河网测量器。
+     * 调用方只提供查询、候选 Chunk 和权限作用域，不得选择实验臂。
+     */
+    rerankWithRiverMemo(query, candidates, agentContext = {}, options = {}) {
+        return this.rerankWithMemo(
+            'topology_v3',
+            query,
+            candidates,
+            agentContext,
+            options
+        );
+    }
+
+    /**
+     * RiverMemo 生产异步门面。
+     *
+     * 不再启动 Node Worker 或在 Worker 中复制 V10/Artifact/SQLite 运行时。
+     * 查询观测与双场准备完成后，通过唯一 N-API 边界直接进入 Rust Topology V3；
+     * 候选投影和排序并发由 Rust/Rayon 自行管理。
+     */
+    async rerankWithRiverMemoAsync(query, candidates, agentContext = {}, options = {}) {
+        return await this.rerankWithMemo(
+            'topology_v3',
+            query,
+            candidates,
+            agentContext,
+            options
+        );
+    }
+
+    /**
+     * TagMemo DTSC 原生异步兼容入口。旧同步 geodesicRerank 保留给尚未
+     * 异步化的插件；新调用应使用本接口以共享原生感应和 MemoRuntime。
+     */
+    async rerankWithTagMemoAsync(query, candidates, agentContext = {}, options = {}) {
+        return await this.rerankWithMemo(
+            'dtsc',
+            query,
+            candidates,
+            agentContext,
+            options
+        );
+    }
+
+    /**
+     * 对已求解的 RiverMemo/V10 Query State 计算只读 Ω 观测。
+     */
+    measureRiverMemoOmega(queryState, options = {}) {
+        if (!this.riverMemoEngine) {
+            const error = new Error('RiverMemo engine is not available');
+            error.code = 'RIVERMEMO_UNAVAILABLE';
+            throw error;
+        }
+        return this.riverMemoEngine.measureOmega(queryState, options);
+    }
+
+    getRiverMemoArtifactSnapshot(options = {}) {
+        if (!this.riverMemoEngine) return null;
+        const bundle = this.riverMemoEngine.getArtifactSnapshot(options);
+        return {
+            bundle,
+            requestedVersion: 'rivermemo_v1',
+            effectiveVersion: 'rivermemo_v1',
+            fallbackUsed: false,
+            fallbackReason: null
+        };
+    }
+
+    /**
+     * 启动只读 Tag 一致性扫描任务并立即返回任务状态。
+     * 扫描归属主服务进程，管理页面关闭或请求断开不会中止任务。
+     */
+    startTagConsistencyPreview() {
+        return this.tagConsistencyService.startPreviewTask();
+    }
+
+    /**
+     * 查询最近一次 Tag 一致性扫描任务，可用于页面重开后的状态恢复。
+     */
+    getTagConsistencyPreviewStatus() {
+        return this.tagConsistencyService.getPreviewTaskStatus();
+    }
+
+    /**
+     * 同步兼容入口：等待当前规则的一致性快照生成完成。
+     * 新管理面板应使用 startTagConsistencyPreview + getTagConsistencyPreviewStatus。
+     */
+    async previewTagConsistency() {
+        return await this.tagConsistencyService.createPreview();
+    }
+
+    /**
+     * 确认并应用先前的 Tag 一致性快照。
+     * 执行前会在排他维护窗口内重算摘要；快照过期或真相变化时拒绝执行。
+     */
+    async applyTagConsistencyPreview(token) {
+        return await this.tagConsistencyService.applyPreview(token);
     }
 
     /**
@@ -779,14 +2001,39 @@ class KnowledgeBaseManager {
     }
 
     /**
-     * 🌟 Tagmemo V4: 对结果集进行智能去重 (SVD + Residual)
+     * 对召回结果执行统一去重。
+     * 先做稳定身份/正文硬去重，再按 options.semantic 决定是否抑制语义近重复。
+     * 任意内部异常都回退到硬去重结果，不允许去重故障拖垮整次 RAG。
+     *
      * @param {Array} candidates - 候选结果数组
-     * @param {Float32Array|Array} queryVector - 查询向量
-     * @returns {Promise<Array>} 去重后的结果
+     * @param {Float32Array|Array|null} queryVector - 查询向量
+     * @param {object} options - { semantic, semanticThreshold, maxResults, stage }
+     * @returns {Promise<Array>}
      */
-    async deduplicateResults(candidates, queryVector) {
+    async deduplicateResults(candidates, queryVector = null, options = {}) {
+        if (!Array.isArray(candidates) || candidates.length === 0) return [];
         if (!this.resultDeduplicator) return candidates;
-        return await this.resultDeduplicator.deduplicate(candidates, queryVector);
+
+        try {
+            return await this.resultDeduplicator.deduplicate(
+                candidates,
+                queryVector,
+                options
+            );
+        } catch (error) {
+            console.warn(
+                `[KnowledgeBase] Result deduplication failed at stage=${options.stage || 'unknown'}; ` +
+                `falling back to exact deduplication: ${error.message}`
+            );
+            try {
+                return this.resultDeduplicator.hardDeduplicate(candidates);
+            } catch (fallbackError) {
+                console.warn(
+                    `[KnowledgeBase] Exact deduplication fallback also failed: ${fallbackError.message}`
+                );
+                return candidates;
+            }
+        }
     }
 
     // =========================================================================
@@ -972,7 +2219,9 @@ class KnowledgeBaseManager {
     }
 
     _extractTags(content) {
-        return extractTags(content, this.config);
+        return extractTags(content, this.config, {
+            maxTags: this.config.maxTagsPerFile
+        });
     }
 
     /**
@@ -1045,6 +2294,21 @@ class KnowledgeBaseManager {
 
     async shutdown() {
         console.log('[KnowledgeBase] shutting down...');
+
+        // 统一 MemoRuntime 归属全局 Tag VexusIndex；关闭前显式释放活动图快照。
+        // 若仍有原生查询持有 Arc，实际内存会在最后一个查询结束后安全回收。
+        if (typeof this.tagIndex?.clearMemoRuntime === 'function') {
+            try {
+                this.tagIndex.clearMemoRuntime();
+            } catch (error) {
+                console.warn(
+                    '[KnowledgeBase] Failed to clear unified Memo runtime during shutdown:',
+                    error.message || error
+                );
+            }
+        }
+        this.riverMemoEngine = null;
+        this.tagMemoV10Engine = null;
 
         // 先停止 TagMemo 新任务/计时器，并等待正在运行的派生任务释放 Rust 写租约；
         // 数据库连接必须在它结束后才能关闭。

@@ -140,6 +140,118 @@
               </div>
             </div>
 
+            <div class="rag-console__section rag-console__section--consistency">
+              <span class="rag-console__label">Tag 一致性维护</span>
+              <div class="tag-consistency-card">
+                <div class="tag-consistency-card__copy">
+                  <strong>按当前规则核对旧 Tag 库</strong>
+                  <p>预检只读取文件与数据库，不请求向量、不写入数据。确认后只向量化差分 Tag。</p>
+                </div>
+
+                <div
+                  v-if="isTagConsistencyScanning"
+                  class="tag-consistency-scanning"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <span class="material-symbols-outlined" aria-hidden="true">progress_activity</span>
+                  <div>
+                    <strong>正在后台扫描 Tag 一致性</strong>
+                    <p>可离开本页；重新打开后会自动恢复扫描状态与结果。</p>
+                  </div>
+                </div>
+
+                <UiButton
+                  variant="secondary"
+                  :disabled="isTagConsistencyScanning || isTagConsistencyApplying"
+                  block
+                  @click="previewTagConsistency"
+                >
+                  {{ isTagConsistencyScanning ? "扫描任务运行中" : "扫描 Tag 一致性" }}
+                </UiButton>
+
+                <template v-if="tagConsistencyPreview">
+                  <div class="tag-consistency-stats">
+                    <article class="tag-consistency-stat tag-consistency-stat--add">
+                      <span>待新增 / 补向量</span>
+                      <strong>{{ tagConsistencyPreview.summary.vectorsToCreate }}</strong>
+                    </article>
+                    <article class="tag-consistency-stat tag-consistency-stat--remove">
+                      <span>待移除向量</span>
+                      <strong>{{ tagConsistencyPreview.summary.vectorsToRemove }}</strong>
+                    </article>
+                    <article>
+                      <span>新增关系</span>
+                      <strong>{{ tagConsistencyPreview.summary.relationsToAdd }}</strong>
+                    </article>
+                    <article>
+                      <span>移除关系</span>
+                      <strong>{{ tagConsistencyPreview.summary.relationsToRemove }}</strong>
+                    </article>
+                    <article>
+                      <span>序位修正</span>
+                      <strong>{{ tagConsistencyPreview.summary.positionsToUpdate }}</strong>
+                    </article>
+                    <article>
+                      <span>受影响文件</span>
+                      <strong>{{ tagConsistencyPreview.summary.affectedFiles }}</strong>
+                    </article>
+                  </div>
+
+                  <details
+                    v-if="tagConsistencyPreview.additions.length > 0"
+                    class="tag-consistency-details"
+                  >
+                    <summary>查看待向量化 Tag（{{ tagConsistencyPreview.summary.vectorsToCreate }}）</summary>
+                    <div class="tag-consistency-tags tag-consistency-tags--add">
+                      <code v-for="tag in tagConsistencyPreview.additions" :key="`add-${tag}`">
+                        {{ tag }}
+                      </code>
+                    </div>
+                  </details>
+
+                  <details
+                    v-if="tagConsistencyPreview.removals.length > 0"
+                    class="tag-consistency-details"
+                  >
+                    <summary>查看待移除 Tag（{{ tagConsistencyPreview.summary.orphanTagsToRemove }}）</summary>
+                    <div class="tag-consistency-tags tag-consistency-tags--remove">
+                      <code v-for="tag in tagConsistencyPreview.removals" :key="`remove-${tag}`">
+                        {{ tag }}
+                      </code>
+                    </div>
+                  </details>
+
+                  <p v-if="tagConsistencyPreview.detailTruncated" class="tag-consistency-note">
+                    名单较长，面板仅展示前 200 项；上方统计是完整精确数量。
+                  </p>
+                  <p class="tag-consistency-note">
+                    快照有效至 {{ formatConsistencyExpiry(tagConsistencyPreview.expiresAt) }}。
+                  </p>
+
+                  <UiButton
+                    v-if="tagConsistencyPreview.requiresConfirmation"
+                    :disabled="isTagConsistencyApplying || isTagConsistencyScanning"
+                    block
+                    @click="applyTagConsistency"
+                  >
+                    {{ isTagConsistencyApplying ? "正在向量化并修复…" : "确认向量化并应用差分" }}
+                  </UiButton>
+                  <UiBadge v-else variant="success">
+                    当前 Tag 库与最新规则一致，无需修复
+                  </UiBadge>
+                </template>
+
+                <div v-if="tagMemoAssetsStale" class="tag-consistency-warning" role="alert">
+                  <span class="material-symbols-outlined">warning</span>
+                  <p>
+                    Tag 真相层已更新。Pairwise、内生残差、传播核与浪潮矩阵仍是旧资产，
+                    请在下方执行“重建 V9.1 资产”。
+                  </p>
+                </div>
+              </div>
+            </div>
+
             <div class="rag-console__section rag-console__section--training">
               <span class="rag-console__label">主动自学习</span>
               <div class="active-training-card">
@@ -176,6 +288,7 @@
             <div class="rag-console__section">
               <span class="rag-console__label">风险提示</span>
               <ul class="rag-console__tips">
+                <li><strong>RiverMemo / V10 已联合校准，除启用开关外不建议调参。</strong></li>
                 <li>高风险参数建议单独修改并观察效果。</li>
                 <li>虫洞路由参数耦合较强，不建议一次联动改太多项。</li>
                 <li>
@@ -212,9 +325,137 @@
           </div>
         </header>
 
+        <section v-if="resultDeduplicationParams" class="dedup-console">
+          <header class="dedup-console__header">
+            <div class="dedup-console__identity">
+              <span class="material-symbols-outlined">filter_alt</span>
+              <div>
+                <span class="dedup-console__eyebrow">Result Deduplication</span>
+                <h3>查询结果去重控制台</h3>
+                <p>
+                  在多路召回结果合并后执行语义去重，并按来源优先级决定相似候选的保留顺序。
+                  阈值越高，只有越相似的结果才会被判定为重复。
+                </p>
+              </div>
+            </div>
+            <div class="dedup-console__status">
+              <UiBadge variant="info">召回后处理</UiBadge>
+              <UiBadge variant="warning">影响最终结果集</UiBadge>
+            </div>
+          </header>
+
+          <div class="dedup-console__grid">
+            <article class="dedup-card dedup-card--thresholds">
+              <header class="dedup-card__header">
+                <div>
+                  <span class="dedup-console__eyebrow">Semantic Gates</span>
+                  <h4>语义判重门槛</h4>
+                </div>
+                <UiBadge variant="warning">敏感参数</UiBadge>
+              </header>
+
+              <div class="dedup-field-grid">
+                <label class="dedup-field">
+                  <span>初次语义去重阈值</span>
+                  <code>semanticThreshold</code>
+                  <small>主结果合并阶段的相似度门槛。降低会更积极地合并近似结果。</small>
+                  <UiInput
+                    :model-value="dedupNumber('semanticThreshold', 0.92)"
+                    type="number"
+                    :min="-1"
+                    :max="1"
+                    :step="0.01"
+                    @update:model-value="updateDedupNumber('semanticThreshold', $event)"
+                  />
+                </label>
+
+                <label class="dedup-field">
+                  <span>最终语义去重阈值</span>
+                  <code>finalSemanticThreshold</code>
+                  <small>输出前二次去重门槛，通常应不低于初次阈值以避免过度裁剪。</small>
+                  <UiInput
+                    :model-value="dedupNumber('finalSemanticThreshold', 0.97)"
+                    type="number"
+                    :min="-1"
+                    :max="1"
+                    :step="0.01"
+                    @update:model-value="updateDedupNumber('finalSemanticThreshold', $event)"
+                  />
+                </label>
+
+                <label class="dedup-field">
+                  <span>最大结果处理数</span>
+                  <code>maxResults</code>
+                  <small>允许进入去重流程的结果上限，过高会增加语义比较成本。</small>
+                  <UiInput
+                    :model-value="dedupNumber('maxResults', 1000)"
+                    type="number"
+                    :min="1"
+                    :step="1"
+                    @update:model-value="updateDedupInteger('maxResults', $event, 1)"
+                  />
+                </label>
+
+                <label class="dedup-field">
+                  <span>最少语义候选数</span>
+                  <code>minSemanticCandidates</code>
+                  <small>达到该候选数量后才启用语义判重，避免对极小结果集做无效计算。</small>
+                  <UiInput
+                    :model-value="dedupNumber('minSemanticCandidates', 2)"
+                    type="number"
+                    :min="0"
+                    :step="1"
+                    @update:model-value="updateDedupInteger('minSemanticCandidates', $event, 0)"
+                  />
+                </label>
+              </div>
+            </article>
+
+            <article class="dedup-card dedup-card--priority">
+              <header class="dedup-card__header">
+                <div>
+                  <span class="dedup-console__eyebrow">Source Arbitration</span>
+                  <h4>重复候选来源优先级</h4>
+                </div>
+                <UiBadge variant="info">数值越高越优先</UiBadge>
+              </header>
+
+              <p class="dedup-card__description">
+                两条结果被判定为重复时，优先保留分值更高的来源。该设置只决定同类候选的保留权，
+                不直接改变原始相似度分数。
+              </p>
+
+              <div class="dedup-priority-grid">
+                <label
+                  v-for="source in DEDUP_SOURCE_OPTIONS"
+                  :key="source.key"
+                  class="dedup-priority-field"
+                >
+                  <span class="material-symbols-outlined">{{ source.icon }}</span>
+                  <span>
+                    <strong>{{ source.label }}</strong>
+                    <code>{{ source.key }}</code>
+                  </span>
+                  <UiInput
+                    :model-value="dedupSourcePriority(source.key, source.fallback)"
+                    type="number"
+                    :step="1"
+                    @update:model-value="updateDedupSourcePriority(source.key, $event)"
+                  />
+                </label>
+              </div>
+            </article>
+          </div>
+        </section>
+
         <TagMemoV9ControlPanel
           v-if="knowledgeBaseParams"
           v-model="knowledgeBaseParams"
+        />
+
+        <RiverMemoV3ControlPanel
+          v-if="riverMemoParams"
+          v-model="riverMemoParams"
         />
 
         <article
@@ -762,6 +1003,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import {
   ragApi,
   type ParamGroup,
+  type TagConsistencyPreview,
+  type TagConsistencyPreviewTask,
   type ParamValue,
   type RagParamTheme,
   type RagParams,
@@ -774,6 +1017,7 @@ import UiInput from "@/components/ui/UiInput.vue";
 import UiPageActions from "@/components/ui/UiPageActions.vue";
 import UiSelect from "@/components/ui/UiSelect.vue";
 import OrderedCooccurrenceModal from "@/features/rag-tuning/OrderedCooccurrenceModal.vue";
+import RiverMemoV3ControlPanel from "@/features/rag-tuning/RiverMemoV3ControlPanel.vue";
 import TagMemoV9ControlPanel from "@/features/rag-tuning/TagMemoV9ControlPanel.vue";
 import WormholeRoutingModal from "@/features/rag-tuning/WormholeRoutingModal.vue";
 import {
@@ -797,6 +1041,7 @@ import {
 import { showMessage } from "@/utils";
 
 type NumericRecord = Record<string, number>;
+type DedupSourceKey = "rag" | "time" | "bm25_body" | "bm25_tag" | "continuity" | "associate" | "unknown";
 type ParamEntryKind = "number" | "tuple" | "nested";
 type StatusType = "info" | "success" | "error";
 type BadgeVariant = "default" | "secondary" | "success" | "warning" | "danger" | "info" | "outline";
@@ -839,11 +1084,27 @@ interface GroupSection {
 
 const WORMHOLE_GROUP_NAME = "KnowledgeBaseManager";
 const V9_KERNEL_PARAM_KEY = "v9";
-const TAGMEMO_V9_DEDICATED_KEYS = new Set([
+const TAGMEMO_DEDICATED_KEYS = new Set([
+  "resultDeduplication",
   "tagMemoVersioning",
   "v9",
   "intrinsicResidual",
+  "riverMemo",
 ]);
+const DEDUP_SOURCE_OPTIONS: ReadonlyArray<{
+  key: DedupSourceKey;
+  label: string;
+  icon: string;
+  fallback: number;
+}> = [
+  { key: "rag", label: "语义 RAG", icon: "neurology", fallback: 50 },
+  { key: "time", label: "时间召回", icon: "schedule", fallback: 45 },
+  { key: "bm25_body", label: "正文 BM25", icon: "description", fallback: 40 },
+  { key: "bm25_tag", label: "标签 BM25", icon: "sell", fallback: 40 },
+  { key: "continuity", label: "上下文连续性", icon: "timeline", fallback: 35 },
+  { key: "associate", label: "关联发现", icon: "hub", fallback: 10 },
+  { key: "unknown", label: "未知来源", icon: "help", fallback: 0 },
+];
 const WORMHOLE_PARAM_KEY = "spikeRouting";
 const GEODESIC_GROUP_NAME = "KnowledgeBaseManager";
 const GEODESIC_PARAM_KEY = "geodesicRerank";
@@ -852,6 +1113,7 @@ const ORDERED_COOCCURRENCE_PARAM_KEY = "orderedCooccurrence";
 const formId = "rag-tuning-form";
 const CONTENT_CONTAINER_ID = "config-details-container";
 const GROUP_SCROLL_OFFSET = 16;
+const TAG_CONSISTENCY_POLL_INTERVAL_MS = 2_000;
 const semanticSimulationUrl = `${import.meta.env.BASE_URL}tagmemo-simulation.html`;
 
 const appStore = useAppStore();
@@ -873,6 +1135,12 @@ const newThemeName = ref("");
 const isThemeLoading = ref(false);
 const isThemeSaving = ref(false);
 const isActiveTraining = ref(false);
+const isTagConsistencyScanning = ref(false);
+const isTagConsistencyApplying = ref(false);
+const tagConsistencyPreview = ref<TagConsistencyPreview | null>(null);
+const tagMemoAssetsStale = ref(false);
+let tagConsistencyPollTimer: number | null = null;
+let tagConsistencyStatusRequestPending = false;
 
 function cloneParams(source: RagParams): RagParams {
   return JSON.parse(JSON.stringify(source));
@@ -1024,7 +1292,7 @@ const groupSections = computed<GroupSection[]>(() =>
     .map(([groupName, groupParams]) => {
       const entries = Object.entries(groupParams)
         .filter(([paramKey]) =>
-          groupName !== "KnowledgeBaseManager" || !TAGMEMO_V9_DEDICATED_KEYS.has(paramKey)
+          groupName !== "KnowledgeBaseManager" || !TAGMEMO_DEDICATED_KEYS.has(paramKey)
         )
         .map(([paramKey, value]) =>
           buildEntry(groupName, paramKey, value, originalParams.value[groupName]?.[paramKey])
@@ -1043,6 +1311,64 @@ const groupSections = computed<GroupSection[]>(() =>
     })
 );
 
+const resultDeduplicationParams = computed<Record<string, ParamValue> | null>(() => {
+  const value = params.value.KnowledgeBaseManager?.resultDeduplication;
+  return isParamRecord(value) ? value : null;
+});
+
+function dedupNumber(key: string, fallback: number): number {
+  const value = resultDeduplicationParams.value?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function dedupSourcePriority(key: DedupSourceKey, fallback: number): number {
+  const sourcePriority = resultDeduplicationParams.value?.sourcePriority;
+  if (!isParamRecord(sourcePriority)) return fallback;
+  const value = sourcePriority[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function updateDedupNumber(key: string, rawValue: string | number): void {
+  const value = Number(rawValue);
+  const current = resultDeduplicationParams.value;
+  if (!Number.isFinite(value) || !current || !params.value.KnowledgeBaseManager) return;
+
+  params.value.KnowledgeBaseManager.resultDeduplication = {
+    ...current,
+    [key]: value,
+  };
+}
+
+function updateDedupInteger(
+  key: string,
+  rawValue: string | number,
+  minimum: number
+): void {
+  const value = Number(rawValue);
+  if (!Number.isFinite(value)) return;
+  updateDedupNumber(key, Math.max(minimum, Math.round(value)));
+}
+
+function updateDedupSourcePriority(
+  key: DedupSourceKey,
+  rawValue: string | number
+): void {
+  const value = Number(rawValue);
+  const current = resultDeduplicationParams.value;
+  if (!Number.isFinite(value) || !current || !params.value.KnowledgeBaseManager) return;
+
+  const sourcePriority = isParamRecord(current.sourcePriority)
+    ? current.sourcePriority
+    : {};
+  params.value.KnowledgeBaseManager.resultDeduplication = {
+    ...current,
+    sourcePriority: {
+      ...sourcePriority,
+      [key]: Math.round(value),
+    },
+  };
+}
+
 const knowledgeBaseParams = computed<ParamGroup>({
   get: () => params.value.KnowledgeBaseManager || {},
   set: (value) => {
@@ -1050,9 +1376,22 @@ const knowledgeBaseParams = computed<ParamGroup>({
   },
 });
 
+const riverMemoParams = computed<ParamGroup>({
+  get: () => {
+    const value = params.value.KnowledgeBaseManager?.riverMemo;
+    return isParamRecord(value) ? value : {};
+  },
+  set: (value) => {
+    params.value.KnowledgeBaseManager = {
+      ...(params.value.KnowledgeBaseManager || {}),
+      riverMemo: value,
+    };
+  },
+});
+
 const dedicatedLeafCount = computed(() => {
   const current = params.value.KnowledgeBaseManager || {};
-  return [...TAGMEMO_V9_DEDICATED_KEYS].reduce((total, key) => {
+  return [...TAGMEMO_DEDICATED_KEYS].reduce((total, key) => {
     const value = current[key];
     return total + (value === undefined ? 0 : countLeafValues(value));
   }, 0);
@@ -1061,7 +1400,7 @@ const dedicatedLeafCount = computed(() => {
 const dedicatedChangedLeafCount = computed(() => {
   const current = params.value.KnowledgeBaseManager || {};
   const original = originalParams.value.KnowledgeBaseManager || {};
-  return [...TAGMEMO_V9_DEDICATED_KEYS].reduce((total, key) => {
+  return [...TAGMEMO_DEDICATED_KEYS].reduce((total, key) => {
     const value = current[key];
     if (value === undefined) return total;
     return total + countChangedLeaves(value, original[key]);
@@ -1608,6 +1947,157 @@ async function applySelectedTheme(): Promise<void> {
   }
 }
 
+function formatConsistencyExpiry(timestamp: number): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(timestamp));
+}
+
+function clearTagConsistencyPolling(): void {
+  if (tagConsistencyPollTimer !== null) {
+    window.clearTimeout(tagConsistencyPollTimer);
+    tagConsistencyPollTimer = null;
+  }
+}
+
+function scheduleTagConsistencyPolling(): void {
+  clearTagConsistencyPolling();
+  tagConsistencyPollTimer = window.setTimeout(() => {
+    tagConsistencyPollTimer = null;
+    void refreshTagConsistencyTask();
+  }, TAG_CONSISTENCY_POLL_INTERVAL_MS);
+}
+
+function acceptTagConsistencyTask(task: TagConsistencyPreviewTask): void {
+  if (task.status === "running") {
+    isTagConsistencyScanning.value = true;
+    scheduleTagConsistencyPolling();
+    return;
+  }
+
+  clearTagConsistencyPolling();
+  isTagConsistencyScanning.value = false;
+
+  if (task.status === "completed" && task.preview) {
+    tagConsistencyPreview.value = task.preview;
+    const summary = task.preview.summary;
+    statusMessage.value = task.preview.requiresConfirmation
+      ? `Tag 预检完成：需新增或补齐 ${summary.vectorsToCreate} 个向量，移除 ${summary.vectorsToRemove} 个向量。请核对后确认执行。`
+      : "Tag 预检完成：当前数据库与最新清洗、屏蔽规则一致。";
+    statusType.value = task.preview.requiresConfirmation ? "info" : "success";
+    return;
+  }
+
+  if (task.status === "failed") {
+    tagConsistencyPreview.value = null;
+    statusMessage.value = `Tag 一致性预检失败：${task.error?.message || "未知错误"}`;
+    statusType.value = "error";
+    showMessage(statusMessage.value, "error");
+    return;
+  }
+
+  if (task.status === "expired") {
+    tagConsistencyPreview.value = null;
+    statusMessage.value = "上次 Tag 一致性预检快照已过期，请重新扫描。";
+    statusType.value = "info";
+  }
+}
+
+async function refreshTagConsistencyTask(): Promise<void> {
+  if (tagConsistencyStatusRequestPending) {
+    return;
+  }
+
+  tagConsistencyStatusRequestPending = true;
+  try {
+    const response = await ragApi.getTagConsistencyPreviewStatus({
+      showLoader: false,
+      loadingKey: "rag-tuning.tag-consistency.status",
+      suppressErrorMessage: true,
+    });
+    if (response.task) {
+      acceptTagConsistencyTask(response.task);
+    }
+  } catch (error: unknown) {
+    if (isTagConsistencyScanning.value) {
+      scheduleTagConsistencyPolling();
+    }
+    console.warn("Failed to restore Tag consistency preview task:", error);
+  } finally {
+    tagConsistencyStatusRequestPending = false;
+  }
+}
+
+async function previewTagConsistency(): Promise<void> {
+  if (isTagConsistencyScanning.value || isTagConsistencyApplying.value) {
+    return;
+  }
+
+  clearTagConsistencyPolling();
+  isTagConsistencyScanning.value = true;
+  tagConsistencyPreview.value = null;
+
+  try {
+    const response = await ragApi.previewTagConsistency({
+      showLoader: false,
+      loadingKey: "rag-tuning.tag-consistency.preview",
+    });
+    if (!response.task) {
+      throw new Error(response.error || "主服务未返回一致性扫描任务");
+    }
+
+    acceptTagConsistencyTask(response.task);
+  } catch (error: unknown) {
+    isTagConsistencyScanning.value = false;
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    statusMessage.value = `Tag 一致性预检启动失败：${errorMessage}`;
+    statusType.value = "error";
+    showMessage(statusMessage.value, "error");
+  }
+}
+
+async function applyTagConsistency(): Promise<void> {
+  const preview = tagConsistencyPreview.value;
+  if (
+    !preview
+    || !preview.requiresConfirmation
+    || isTagConsistencyApplying.value
+    || isTagConsistencyScanning.value
+  ) {
+    return;
+  }
+
+  isTagConsistencyApplying.value = true;
+
+  try {
+    const response = await ragApi.applyTagConsistency(preview.token, {
+      loadingKey: "rag-tuning.tag-consistency.apply",
+    });
+    if (!response.result?.applied) {
+      throw new Error(response.error || "主服务未确认 Tag 差分修复成功");
+    }
+
+    const summary = response.result.summary;
+    tagMemoAssetsStale.value = response.result.waveAssetsStale;
+    tagConsistencyPreview.value = null;
+    statusMessage.value =
+      `Tag 修复完成：新增或补齐 ${summary.vectorsToCreate} 个向量，移除 ${summary.vectorsToRemove} 个向量；`
+      + "全局 Tag 内存索引已重建，请继续重建 V9.1 浪潮资产。";
+    statusType.value = "success";
+    showMessage(statusMessage.value, "success");
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    tagConsistencyPreview.value = null;
+    statusMessage.value = `Tag 差分修复失败：${errorMessage}。请重新扫描后再确认。`;
+    statusType.value = "error";
+    showMessage(statusMessage.value, "error");
+  } finally {
+    isTagConsistencyApplying.value = false;
+  }
+}
+
 async function triggerActiveFullTraining(): Promise<void> {
   if (isActiveTraining.value) {
     return;
@@ -1627,6 +2117,7 @@ async function triggerActiveFullTraining(): Promise<void> {
       ? `已排队 V9.1 全量重建与退休资产清理任务，已重置 ${resetCount}/${threshold} 个阈值计数。`
       : `已排队 V9.1 全量重建与退休资产清理任务，已重置 ${resetCount} 个阈值计数。`;
     statusType.value = "success";
+    tagMemoAssetsStale.value = false;
     showMessage(statusMessage.value, "success");
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1717,10 +2208,12 @@ onMounted(() => {
   window.addEventListener("message", handleSemanticSimulationMessage);
   void loadParams();
   void loadThemes();
+  void refreshTagConsistencyTask();
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("message", handleSemanticSimulationMessage);
+  clearTagConsistencyPolling();
 });
 </script>
 
@@ -1830,6 +2323,170 @@ onBeforeUnmount(() => {
 .rag-lab__main {
   display: grid;
   gap: var(--space-5);
+}
+
+.dedup-console {
+  display: grid;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  border: 1px solid color-mix(in srgb, var(--highlight-text) 26%, var(--border-color));
+  border-radius: var(--radius-xl);
+  background:
+    radial-gradient(circle at 8% 0%, color-mix(in srgb, var(--highlight-text) 8%, transparent), transparent 34%),
+    color-mix(in srgb, var(--primary-text) 1.5%, transparent);
+}
+
+.dedup-console__header,
+.dedup-card__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.dedup-console__identity {
+  display: flex;
+  gap: var(--space-3);
+}
+
+.dedup-console__identity > .material-symbols-outlined {
+  display: grid;
+  place-items: center;
+  flex: 0 0 44px;
+  height: 44px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--highlight-text) 13%, transparent);
+  color: var(--highlight-text);
+  font-size: 25px;
+}
+
+.dedup-console h3,
+.dedup-console h4,
+.dedup-console p {
+  margin: 0;
+}
+
+.dedup-console h3 {
+  margin-top: 4px;
+  font-size: var(--font-size-section-title-strong);
+}
+
+.dedup-console__identity p {
+  max-width: 76ch;
+  margin-top: 8px;
+  color: var(--secondary-text);
+  line-height: 1.6;
+}
+
+.dedup-console__eyebrow {
+  color: var(--highlight-text);
+  font-size: var(--font-size-caption);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.dedup-console__status {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.dedup-console__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: var(--space-4);
+}
+
+.dedup-card {
+  display: grid;
+  align-content: start;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--primary-bg) 44%, transparent);
+}
+
+.dedup-card__header h4 {
+  margin-top: 4px;
+  font-size: var(--font-size-title);
+}
+
+.dedup-card__description {
+  color: var(--secondary-text);
+  font-size: var(--font-size-helper);
+  line-height: 1.55;
+}
+
+.dedup-field-grid,
+.dedup-priority-grid {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.dedup-field-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.dedup-field {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  padding: var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--border-color) 68%, transparent);
+  border-radius: var(--radius-md);
+}
+
+.dedup-field > span,
+.dedup-priority-field strong {
+  font-weight: 600;
+}
+
+.dedup-field code,
+.dedup-priority-field code {
+  color: var(--secondary-text);
+  font-size: var(--font-size-caption);
+}
+
+.dedup-field small {
+  min-height: 3em;
+  color: var(--secondary-text);
+  font-size: var(--font-size-helper);
+  line-height: 1.45;
+}
+
+.dedup-field :deep(.ui-input),
+.dedup-priority-field :deep(.ui-input) {
+  width: 100%;
+  font-family: "Consolas", "Monaco", monospace;
+}
+
+.dedup-priority-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.dedup-priority-field {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 86px;
+  gap: var(--space-2);
+  align-items: center;
+  min-width: 0;
+  padding: 10px var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--border-color) 68%, transparent);
+  border-radius: var(--radius-md);
+}
+
+.dedup-priority-field > .material-symbols-outlined {
+  color: var(--highlight-text);
+  font-size: 20px;
+}
+
+.dedup-priority-field > span:nth-child(2) {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
 }
 
 .group-panel {
@@ -2945,6 +3602,164 @@ onBeforeUnmount(() => {
   padding-left: var(--space-4);
 }
 
+.tag-consistency-card {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--highlight-text) 25%, var(--border-color));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--highlight-text) 3%, transparent);
+}
+
+.tag-consistency-card__copy {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.tag-consistency-card__copy p,
+.tag-consistency-note,
+.tag-consistency-warning p {
+  margin: 0;
+  color: var(--secondary-text);
+  font-size: var(--font-size-helper);
+  line-height: 1.55;
+}
+
+.tag-consistency-card :deep(.ui-button) {
+  justify-content: center;
+  width: 100%;
+}
+
+.tag-consistency-scanning {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  padding: var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--highlight-text) 32%, var(--border-color));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--highlight-text) 7%, transparent);
+}
+
+.tag-consistency-scanning > .material-symbols-outlined {
+  flex: 0 0 auto;
+  color: var(--highlight-text);
+  font-size: 24px;
+  animation: tag-consistency-spin 1.1s linear infinite;
+}
+
+.tag-consistency-scanning > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.tag-consistency-scanning strong {
+  font-size: var(--font-size-helper);
+}
+
+.tag-consistency-scanning p {
+  margin: 0;
+  color: var(--secondary-text);
+  font-size: var(--font-size-caption);
+  line-height: 1.45;
+}
+
+@keyframes tag-consistency-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tag-consistency-scanning > .material-symbols-outlined {
+    animation: none;
+  }
+}
+
+.tag-consistency-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+
+.tag-consistency-stats article {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: var(--space-2);
+  border: 1px solid color-mix(in srgb, var(--border-color) 72%, transparent);
+  border-radius: var(--radius-sm);
+}
+
+.tag-consistency-stats span {
+  color: var(--secondary-text);
+  font-size: var(--font-size-caption);
+}
+
+.tag-consistency-stats strong {
+  font-family: "Consolas", "Monaco", monospace;
+  font-size: var(--font-size-title);
+}
+
+.tag-consistency-stat--add strong {
+  color: var(--success-color);
+}
+
+.tag-consistency-stat--remove strong {
+  color: var(--danger-color);
+}
+
+.tag-consistency-details {
+  min-width: 0;
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 65%, transparent);
+  padding-top: var(--space-2);
+}
+
+.tag-consistency-details summary {
+  color: var(--highlight-text);
+  cursor: pointer;
+  font-size: var(--font-size-helper);
+}
+
+.tag-consistency-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  max-height: 150px;
+  margin-top: var(--space-2);
+  overflow: auto;
+}
+
+.tag-consistency-tags code {
+  max-width: 100%;
+  padding: 3px 6px;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--highlight-text) 8%, transparent);
+  font-size: var(--font-size-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-consistency-tags--remove code {
+  background: color-mix(in srgb, var(--danger-bg) 72%, transparent);
+}
+
+.tag-consistency-warning {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--warning-border);
+  border-radius: var(--radius-sm);
+  background: var(--warning-bg);
+}
+
+.tag-consistency-warning .material-symbols-outlined {
+  flex: 0 0 auto;
+  color: var(--warning-color);
+  font-size: 20px;
+}
+
 .active-training-card {
   position: relative;
   overflow: hidden;
@@ -3116,6 +3931,10 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 1180px) {
+  .dedup-console__grid {
+    grid-template-columns: 1fr;
+  }
+
   .rag-lab__summary {
     grid-template-columns: 1fr;
   }
@@ -3134,6 +3953,11 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 960px) {
+  .dedup-field-grid,
+  .dedup-priority-grid {
+    grid-template-columns: 1fr;
+  }
+
   .geodesic-workbench__hero,
   .geodesic-stage__header {
     grid-template-columns: 1fr;
@@ -3182,6 +4006,23 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 640px) {
+  .dedup-console {
+    padding: var(--space-4);
+  }
+
+  .dedup-console__header,
+  .dedup-card__header {
+    flex-direction: column;
+  }
+
+  .dedup-console__status {
+    justify-content: flex-start;
+  }
+
+  .dedup-priority-field {
+    grid-template-columns: auto minmax(0, 1fr) 76px;
+  }
+
   .geodesic-story {
     grid-template-columns: 1fr;
   }

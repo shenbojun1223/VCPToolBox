@@ -10,13 +10,17 @@ let wssInstance;
 let pluginManager = null; // 为 PluginManager 实例占位
 let attachedHttpServer = null;
 let upgradeHandler = null;
+let heartbeatInterval = null;
 let isDraining = false;
 let shutdownPromise = null;
+
+const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 60 * 1000;
 
 let serverConfig = {
     debugMode: false,
     vcpKey: null,
-    distributedMusicPlaylistSyncEnabled: false
+    distributedMusicPlaylistSyncEnabled: false,
+    heartbeatEnabled: false
 };
 
 // 用于存储不同类型的客户端
@@ -144,6 +148,12 @@ function initialize(httpServer, config) {
         console.error('[WebSocketServer] Cannot initialize without an HTTP server instance.');
         return;
     }
+
+    if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+    }
+
     serverConfig = { ...serverConfig, ...config };
     attachedHttpServer = httpServer;
     isDraining = false;
@@ -256,6 +266,7 @@ function initialize(httpServer, config) {
                     distributedServers.set(serverId, {
                         ws,
                         tools: [],
+                        capabilities: {},
                         ips: {},
                         connectedAt: formatDateTimeForConfiguredTimezone(),
                         lastSeenAt: formatDateTimeForConfiguredTimezone()
@@ -497,6 +508,7 @@ function initialize(httpServer, config) {
                 if (pluginManager) {
                     pluginManager.unregisterAllDistributedTools(ws.serverId);
                 }
+                rejectPendingToolRequestsForServer(ws.serverId);
                 distributedServers.delete(ws.serverId);
                 distributedServerIPs.delete(ws.serverId); // 新增：移除IP信息
                 writeLog(`Distributed Server ${ws.serverId} disconnected. Its tools and IP info have been unregistered.`);
@@ -536,6 +548,31 @@ function initialize(httpServer, config) {
             if(ws.clientId) clients.delete(ws.clientId);
         });
     });
+
+    if (serverConfig.heartbeatEnabled) {
+        heartbeatInterval = setInterval(() => {
+            if (!wssInstance || isDraining) return;
+
+            let pingedClientCount = 0;
+            wssInstance.clients.forEach(client => {
+                if (client.readyState !== WebSocket.OPEN) return;
+
+                try {
+                    client.ping();
+                    pingedClientCount++;
+                } catch (error) {
+                    console.warn(`[WebSocketServer] Heartbeat ping failed for client ${client.clientId || 'unknown'}: ${error.message}`);
+                }
+            });
+
+            if (serverConfig.debugMode && pingedClientCount > 0) {
+                console.log(`[WebSocketServer] Sent heartbeat ping to ${pingedClientCount} connected client(s).`);
+            }
+        }, WEBSOCKET_HEARTBEAT_INTERVAL_MS);
+        heartbeatInterval.unref();
+
+        console.log(`[WebSocketServer] Protocol heartbeat enabled (interval: ${WEBSOCKET_HEARTBEAT_INTERVAL_MS / 1000}s).`);
+    }
 
     if (serverConfig.debugMode) {
         console.log(`[WebSocketServer] Initialized. Waiting for HTTP server upgrades.`);
@@ -621,6 +658,12 @@ async function beginDrain() {
     }
 
     isDraining = true;
+
+    if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+    }
+
     writeLog('WebSocketServer entered draining mode.');
 
     if (attachedHttpServer && upgradeHandler) {
@@ -695,6 +738,9 @@ async function handleDistributedServerMessage(serverId, message) {
                 if (message.data.serverName) {
                     serverEntry.serverName = message.data.serverName;
                 }
+                serverEntry.capabilities = message.data.capabilities && typeof message.data.capabilities === 'object'
+                    ? { ...message.data.capabilities }
+                    : {};
                 serverEntry.lastSeenAt = formatDateTimeForConfiguredTimezone();
                 distributedServers.set(serverId, serverEntry);
                 writeLog(`Registered ${externalTools.length} external tools from server ${serverId}${serverEntry.serverName ? ` (${serverEntry.serverName})` : ''}.`);
@@ -802,23 +848,62 @@ async function handleDistributedServerMessage(serverId, message) {
                 console.error(`[WebSocketServer] Failed to sync distributed music playlist from ${serverId}:`, error);
             }
             break;
-        case 'tool_result':
+        case 'tool_result': {
             const pending = pendingToolRequests.get(message.data.requestId);
-            if (pending) {
-                clearTimeout(pending.timeout);
-                if (message.data.status === 'success') {
-                    pending.resolve(message.data.result);
-                } else {
-                    pending.reject(new Error(message.data.error || 'Distributed tool execution failed.'));
-                }
-                pendingToolRequests.delete(message.data.requestId);
+            if (!pending) break;
+
+            // requestId 虽然随机生成，仍不能作为跨节点信任边界；只接受目标
+            // serverId 返回的结果，其他节点的同 ID 消息不得完成该 Promise。
+            if (pending.serverId !== serverId) {
+                console.warn(`[WebSocketServer] Ignoring tool_result for ${message.data.requestId} from non-target server ${serverId}; expected ${pending.serverId}.`);
+                break;
             }
+
+            clearTimeout(pending.timeout);
+            if (message.data.status === 'success') {
+                pending.resolve(message.data.result);
+            } else {
+                pending.reject(new Error(message.data.error || 'Distributed tool execution failed.'));
+            }
+            pendingToolRequests.delete(message.data.requestId);
             break;
+        }
         case 'plugin_callback_forward':
             await handleDistributedPluginCallback(serverId, message);
             break;
         default:
             writeLog(`Unknown message type '${message.type}' from server ${serverId}.`);
+    }
+}
+
+function sendCancelToolIfSupported(pending) {
+    const ws = pending.server?.ws;
+    const supportsCancelTool = pending.server?.capabilities?.cancelTool === true;
+    if (!supportsCancelTool || !ws || ws.readyState !== WebSocket.OPEN || pending.cancelSent) {
+        return false;
+    }
+
+    try {
+        ws.send(JSON.stringify({
+            type: 'cancel_tool',
+            data: { requestId: pending.requestId }
+        }));
+        pending.cancelSent = true;
+        writeLog(`Sent cancel_tool for timed-out request ${pending.requestId} to server ${pending.serverId}.`);
+        return true;
+    } catch (error) {
+        console.warn(`[WebSocketServer] Failed to send cancel_tool for ${pending.requestId}:`, error.message);
+        return false;
+    }
+}
+
+function rejectPendingToolRequestsForServer(serverId) {
+    for (const [requestId, pending] of pendingToolRequests.entries()) {
+        if (pending.serverId !== serverId) continue;
+
+        clearTimeout(pending.timeout);
+        pendingToolRequests.delete(requestId);
+        pending.reject(new Error(`Distributed server ${serverId} disconnected while executing request ${requestId}.`));
     }
 }
 
@@ -828,12 +913,14 @@ async function executeDistributedTool(serverIdOrName, toolName, toolArgs, timeou
     const defaultTimeout = plugin?.communication?.timeout || 60000;
     const effectiveTimeout = timeout ?? defaultTimeout;
 
+    let targetServerId = serverIdOrName;
     let server = distributedServers.get(serverIdOrName); // 优先尝试通过 ID 查找
 
     // 如果通过 ID 找不到，则遍历并尝试通过 name 查找
     if (!server) {
-        for (const srv of distributedServers.values()) {
+        for (const [candidateServerId, srv] of distributedServers.entries()) {
             if (srv.serverName === serverIdOrName) {
+                targetServerId = candidateServerId;
                 server = srv;
                 break;
             }
@@ -855,15 +942,31 @@ async function executeDistributedTool(serverIdOrName, toolName, toolArgs, timeou
     };
 
     return new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
+        const pending = {
+            requestId,
+            serverId: targetServerId,
+            server,
+            resolve,
+            reject,
+            timeout: null,
+            cancelSent: false
+        };
+        pending.timeout = setTimeout(() => {
             pendingToolRequests.delete(requestId);
+            sendCancelToolIfSupported(pending);
             reject(new Error(`Request to distributed tool ${toolName} on server ${serverIdOrName} timed out after ${effectiveTimeout / 1000}s.`));
         }, effectiveTimeout);
 
-        pendingToolRequests.set(requestId, { resolve, reject, timeout: timeoutId });
+        pendingToolRequests.set(requestId, pending);
 
-        server.ws.send(JSON.stringify(payload));
-        writeLog(`Sent tool execution request ${requestId} for ${toolName} to server ${serverIdOrName}.`);
+        try {
+            server.ws.send(JSON.stringify(payload));
+            writeLog(`Sent tool execution request ${requestId} for ${toolName} to server ${serverIdOrName}.`);
+        } catch (error) {
+            clearTimeout(pending.timeout);
+            pendingToolRequests.delete(requestId);
+            reject(error);
+        }
     });
 }
 
@@ -890,6 +993,7 @@ function getDistributedServerSnapshot() {
             localIPs,
             publicIP: ipInfo.publicIP ?? serverInfo.ips?.publicIP ?? null,
             tools: Array.isArray(serverInfo.tools) ? [...serverInfo.tools] : [],
+            capabilities: { ...(serverInfo.capabilities || {}) },
             connected: serverInfo.ws?.readyState === WebSocket.OPEN,
             connectedAt: serverInfo.connectedAt || null,
             lastSeenAt: serverInfo.lastSeenAt || null
@@ -964,5 +1068,12 @@ module.exports = {
     shutdown,
     // 暴露给 PluginManager,在审核响应到达时清除对应缓存
     cancelVcpLogApprovalCache: (requestId) => vcpLogReplayManager.cancelApprovalCache(requestId),
-    getVcpLogReplayStats: () => vcpLogReplayManager.getStats()
+    getVcpLogReplayStats: () => vcpLogReplayManager.getStats(),
+    // Narrow test hooks for deterministic lifecycle tests; not used by production callers.
+    __testing: {
+        distributedServers,
+        pendingToolRequests,
+        sendCancelToolIfSupported,
+        rejectPendingToolRequestsForServer
+    }
 };

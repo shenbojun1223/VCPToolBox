@@ -76,6 +76,98 @@ function profileTagMemo(tagMemoEngine) {
     };
 }
 
+function profileRiverMemo(state) {
+    const controlRuntime = state.tagMemoV10Engine;
+    if (!controlRuntime) {
+        return { available: false, estimatedBytes: 0 };
+    }
+
+    const artifact = controlRuntime.getArtifactSnapshot?.({
+        buildIfMissing: false
+    }) || null;
+    let nativeRuntime = null;
+    try {
+        nativeRuntime = typeof state.tagIndex?.memoRuntimeStats === 'function'
+            ? state.tagIndex.memoRuntimeStats()
+            : null;
+    } catch (error) {
+        nativeRuntime = { available: false, error: error.message || String(error) };
+    }
+
+    const residentArtifactSig =
+        nativeRuntime?.activeArtifactSig
+        ?? nativeRuntime?.artifactSig
+        ?? null;
+    const nativeNodeCount = Math.max(
+        0,
+        Number(nativeRuntime?.nodeCount) || 0
+    );
+    const nativeEdgeCount = Math.max(
+        0,
+        Number(nativeRuntime?.edgeCount) || 0
+    );
+    const resident = Boolean(
+        residentArtifactSig
+        && residentArtifactSig === artifact?.artifactSig
+    );
+    // 仅提供 Rust CSR 数组下界，不把它计入 JS estimatedBytes。
+    // HashMap、HashSet、Provenance Vec 与 allocator 开销仍只能由进程 RSS 观察。
+    const nativeCsrLowerBoundBytes = resident
+        ? nativeNodeCount * 8
+            + (nativeNodeCount + 1) * 8
+            + nativeEdgeCount * 16
+        : 0;
+    const conditionedOperator =
+        controlRuntime.getConditionedOperatorCacheDiagnostics?.() || null;
+    const conditionedEstimatedBytes = Math.max(
+        0,
+        Number(conditionedOperator?.estimatedBytes) || 0
+    );
+
+    return {
+        available: true,
+        artifactSig: artifact?.artifactSig || null,
+        sourceV9ArtifactSig: artifact?.sourceArtifactSig || null,
+        generation: artifact?.generation || null,
+        nativeGeneration:
+            Number(nativeRuntime?.generation)
+            || artifact?.nativeGeneration
+            || null,
+        storageMode: artifact?.storageMode || null,
+        resident,
+        residentAtControlPublication:
+            artifact?.residentAtPublication === true,
+        transport: {
+            nodeCount: nativeNodeCount || Number(artifact?.nodeCount) || 0,
+            edgeCount: nativeEdgeCount || Number(artifact?.edgeCount) || 0,
+            estimatedBytes: 0,
+            storageMode: 'rust-arc'
+        },
+        jsGraphAssets: {
+            csrResident: false,
+            provenanceResident: false,
+            pairwiseResident: false,
+            estimatedBytes: 0
+        },
+        conditionedOperator,
+        nativeRuntime: {
+            available: nativeRuntime !== null
+                && nativeRuntime?.available !== false,
+            resident,
+            activeArtifactSig: residentArtifactSig,
+            generation: Number(nativeRuntime?.generation) || 0,
+            nodeCount: nativeNodeCount,
+            edgeCount: nativeEdgeCount,
+            csrLowerBoundBytes: nativeCsrLowerBoundBytes,
+            error: nativeRuntime?.error || null,
+            note:
+                'Rust 资产由 VexusIndex MemoRuntime 的 Arc 持有；下界不含 HashMap/Provenance/allocator 开销。'
+        },
+        // JS 可归因内存只剩控制面与可能存在的退休兼容算子缓存。
+        estimatedBytes: conditionedEstimatedBytes
+    };
+}
+
 function buildMemoryProfile(state) {
     const startedAt = Date.now();
     const dimension = state.config.dimension;
@@ -107,6 +199,7 @@ function buildMemoryProfile(state) {
         dimension
     );
     const tagMemo = profileTagMemo(state.tagMemoEngine);
+    const riverMemo = profileRiverMemo(state);
     const diaryNameVectorEstimatedBytes =
         state.diaryNameVectorCache.size * dimension * 8;
     const diaryDateIndexEstimatedBytes =
@@ -121,6 +214,7 @@ function buildMemoryProfile(state) {
     const estimatedBytes = tagIndexEstimatedBytes
         + loadedDiaryEstimatedBytes
         + tagMemo.estimatedBytes
+        + riverMemo.estimatedBytes
         + diaryNameVectorEstimatedBytes
         + diaryDateIndexEstimatedBytes;
 
@@ -164,6 +258,7 @@ function buildMemoryProfile(state) {
             diaryDateIndexEstimatedBytes
         },
         tagMemo,
+        riverMemo,
         estimatedBytes,
         generatedAt: new Date().toISOString(),
         elapsedMs: Date.now() - startedAt
