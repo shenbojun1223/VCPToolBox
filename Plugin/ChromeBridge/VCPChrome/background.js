@@ -2,6 +2,7 @@ console.log('[VCP Background] 🚀 VCPChrome background.js loaded.');
 let ws = null;
 let isConnected = false;
 let isMonitoringEnabled = false; // 页面监控开关
+let redactSensitiveDom = true; // 浏览器内隐私开关：默认开启，用户可在 Popup 显式关闭
 let heartbeatIntervalId = null;
 let latestPageInfo = null;
 let currentActiveTabId = null;
@@ -11,11 +12,25 @@ const HEARTBEAT_INTERVAL = 30 * 1000;
 const defaultServerUrl = 'ws://localhost:8088';
 const defaultVcpKey = 'your_secret_key';
 let runtimeIdentity = {
+    protocolVersion: 3,
     clientKind: 'user',
     managedRuntime: false,
     managedToken: null,
+    managedTokenCreatedAt: 0,
+    stageGeneration: null,
+    sourceManifestHash: null,
+    stagedManifestHash: null,
+    runtimeConfigGeneratedAt: null,
     maxTabs: 8,
-    capabilities: ['pageInfo', 'tabs', 'script', 'cdp', 'storage', 'networkBody', 'snapshotHandles', 'structuredErrors', 'screenshot']
+    snapshotBackends: ['content-script'],
+    actionBackends: ['content-script', 'cdp-input', 'main-world'],
+    capabilities: [
+        'pageInfo', 'tabs', 'script', 'cdp', 'storage', 'networkBody', 'snapshotHandles',
+        'structuredErrors', 'screenshot', 'stableSnapshotHash', 'actionVerification',
+        'sensitiveDomRedaction', 'cdpInput', 'occlusionCheck', 'sendKeys', 'setValue',
+        'selectOption', 'hover', 'check', 'waitFor', 'unifiedPageGraph',
+        'groundedMarkdown', 'interactionTree', 'scrollContext', 'snapshotDiff'
+    ]
 };
 
 let runtimeConnectionConfig = {
@@ -33,6 +48,11 @@ function applyRuntimeConfig(config, source = 'unknown') {
         clientKind: 'managed',
         managedRuntime: true,
         managedToken: String(config.managedToken),
+        managedTokenCreatedAt: Number(config.tokenCreatedAt) || 0,
+        stageGeneration: config.stageGeneration || null,
+        sourceManifestHash: config.sourceManifestHash || null,
+        stagedManifestHash: config.stagedManifestHash || null,
+        runtimeConfigGeneratedAt: config.generatedAt || null,
         maxTabs: Math.max(1, Number.parseInt(config.maxTabs, 10) || runtimeIdentity.maxTabs)
     };
 
@@ -48,6 +68,11 @@ function applyRuntimeConfig(config, source = 'unknown') {
         clientKind: 'managed',
         managedRuntime: true,
         managedToken: runtimeIdentity.managedToken,
+        managedTokenCreatedAt: runtimeIdentity.managedTokenCreatedAt,
+        stageGeneration: runtimeIdentity.stageGeneration,
+        sourceManifestHash: runtimeIdentity.sourceManifestHash,
+        stagedManifestHash: runtimeIdentity.stagedManifestHash,
+        runtimeConfigGeneratedAt: runtimeIdentity.runtimeConfigGeneratedAt,
         maxTabs: runtimeIdentity.maxTabs,
         connectionEnabled: true
     });
@@ -63,7 +88,11 @@ function applyRuntimeConfig(config, source = 'unknown') {
 
 function getStorageRuntimeConfig() {
     return new Promise(resolve => {
-        chrome.storage.local.get(['serverUrl', 'vcpKey', 'clientKind', 'managedRuntime', 'managedToken', 'maxTabs'], (result) => {
+        chrome.storage.local.get([
+            'serverUrl', 'vcpKey', 'clientKind', 'managedRuntime', 'managedToken',
+            'managedTokenCreatedAt', 'stageGeneration', 'sourceManifestHash',
+            'stagedManifestHash', 'runtimeConfigGeneratedAt', 'maxTabs'
+        ], (result) => {
             if (result && result.managedRuntime === true && result.managedToken) {
                 resolve({
                     serverUrl: result.serverUrl,
@@ -71,6 +100,11 @@ function getStorageRuntimeConfig() {
                     clientKind: result.clientKind,
                     managedRuntime: result.managedRuntime,
                     managedToken: result.managedToken,
+                    tokenCreatedAt: result.managedTokenCreatedAt,
+                    stageGeneration: result.stageGeneration,
+                    sourceManifestHash: result.sourceManifestHash,
+                    stagedManifestHash: result.stagedManifestHash,
+                    generatedAt: result.runtimeConfigGeneratedAt,
                     maxTabs: result.maxTabs
                 });
                 return;
@@ -107,11 +141,22 @@ function sendClientHello() {
     const hello = {
         type: 'clientHello',
         data: {
+            protocolVersion: runtimeIdentity.protocolVersion,
             clientKind: runtimeIdentity.clientKind,
             extensionVersion: chrome.runtime.getManifest()?.version || 'unknown',
             capabilities: runtimeIdentity.capabilities,
+            snapshotBackends: runtimeIdentity.snapshotBackends,
+            actionBackends: runtimeIdentity.actionBackends,
+            featureSettings: {
+                redactSensitiveDom
+            },
             managedRuntime: runtimeIdentity.managedRuntime,
             managedToken: runtimeIdentity.managedToken,
+            managedTokenCreatedAt: runtimeIdentity.managedTokenCreatedAt,
+            stageGeneration: runtimeIdentity.stageGeneration,
+            sourceManifestHash: runtimeIdentity.sourceManifestHash,
+            stagedManifestHash: runtimeIdentity.stagedManifestHash,
+            runtimeConfigGeneratedAt: runtimeIdentity.runtimeConfigGeneratedAt,
             maxTabs: runtimeIdentity.maxTabs,
             userAgent: navigator.userAgent,
             platform: navigator.platform,
@@ -160,12 +205,15 @@ function connect(options = {}) {
         return;
     }
 
-    // 从storage获取URL和Key
+    // 从 storage 获取连接参数。发布文件已经确立 managed 身份后，storage 中的旧
+    // agent/user 字段不得反向覆盖本次启动代次的 Token 与身份。
     chrome.storage.local.get(['serverUrl', 'vcpKey', 'clientKind', 'managedRuntime', 'managedToken', 'maxTabs', 'connectionEnabled'], (result) => {
         if (result.connectionEnabled !== undefined) connectionEnabled = result.connectionEnabled === true;
-        if (result.clientKind) runtimeIdentity.clientKind = result.clientKind;
-        if (result.managedRuntime === true) runtimeIdentity.managedRuntime = true;
-        if (result.managedToken) runtimeIdentity.managedToken = result.managedToken;
+        if (!runtimeIdentity.managedRuntime) {
+            if (result.clientKind) runtimeIdentity.clientKind = result.clientKind;
+            if (result.managedRuntime === true) runtimeIdentity.managedRuntime = true;
+            if (result.managedToken) runtimeIdentity.managedToken = result.managedToken;
+        }
         if (result.maxTabs) runtimeIdentity.maxTabs = Math.max(1, Number.parseInt(result.maxTabs, 10) || runtimeIdentity.maxTabs);
 
         if (!options.force && !connectionEnabled && !shouldAutoReconnect()) {
@@ -417,6 +465,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({
             isConnected: isConnected,
             isMonitoringEnabled: isMonitoringEnabled,
+            protocolVersion: runtimeIdentity.protocolVersion,
+            redactSensitiveDom,
             clientKind: runtimeIdentity.clientKind,
             agentMode: runtimeIdentity.clientKind === 'agent',
             managedRuntime: runtimeIdentity.managedRuntime,
@@ -462,6 +512,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     } else if (request.type === 'SET_CLIENT_MODE') {
         sendResponse(applyClientMode(request.mode));
         return true;
+    } else if (request.type === 'PRIVACY_SETTINGS_CHANGED') {
+        redactSensitiveDom = request.redactSensitiveDom !== false;
+        chrome.storage.local.set({ redactSensitiveDom });
+        broadcastPrivacySettingsToTabs();
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            sendClientHello();
+        }
+        sendResponse({ redactSensitiveDom });
+        return true;
     } else if (request.type === 'TOGGLE_CONNECTION') {
         if (isConnected) {
             disconnect({ manual: true });
@@ -491,70 +550,84 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         
         console.log(`[VCP Background] ✅ 接受活动标签页 [ID:${senderTabId}] 的${isForcedUpdate ? '强制' : '自动'}更新`);
         
-        // 发送到VCP服务器（如果已连接）
+        const groundedMarkdown = request.data.agentView?.markdown ||
+            request.data.pageContentMarkdown ||
+            request.data.markdown ||
+            '';
+        const outboundPageInfo = {
+            protocolVersion: request.data.protocolVersion || runtimeIdentity.protocolVersion,
+            markdown: groundedMarkdown,
+            pageContentMarkdown: request.data.pageContentMarkdown || groundedMarkdown,
+            interactionTree: request.data.interactionTree || '',
+            scrollContext: request.data.scrollContext || null,
+            snapshotDiff: request.data.snapshotDiff || null,
+            pageGraph: request.data.pageGraph || null,
+            agentView: request.data.agentView || {
+                format: 'grounded-markdown-v1',
+                mode: 'auto',
+                markdown: groundedMarkdown
+            },
+            snapshotId: request.data.snapshotId,
+            generatedAt: request.data.generatedAt,
+            url: request.data.url,
+            title: request.data.title,
+            elementCount: request.data.elementCount,
+            elements: request.data.elements,
+            contentHash: request.data.contentHash,
+            structureHash: request.data.structureHash,
+            snapshotBackend: request.data.snapshotBackend || 'content-script',
+            redaction: request.data.redaction,
+            performance: request.data.performance,
+            force: isForcedUpdate,
+            error: request.data.error
+        };
+
+        // 服务端未连接时仍更新 Popup/内存观测状态；WebSocket 只负责额外转发。
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
                 type: 'pageInfoUpdate',
-                data: {
-                    markdown: request.data.markdown,
-                    snapshotId: request.data.snapshotId,
-                    generatedAt: request.data.generatedAt,
-                    url: request.data.url,
-                    title: request.data.title,
-                    elementCount: request.data.elementCount,
-                    elements: request.data.elements,
-                    error: request.data.error
-                }
+                data: outboundPageInfo
             }));
-            
-            // 新增：解析markdown获取标题和URL，并广播给popup
-            const lines = request.data.markdown.split('\n');
-            let title = '';
-            let url = '';
-            
-            // 从markdown中提取标题和URL
-            if (lines.length > 0) {
-                // 第一行通常是 # 标题
-                title = lines[0].replace(/^#\s*/, '').trim();
-            }
-            if (lines.length > 1) {
-                // 第二行通常是 URL: xxx
-                const urlMatch = lines[1].match(/^URL:\s*(.+)/);
-                if (urlMatch) {
-                    url = urlMatch[1].trim();
-                }
-            }
-            
-            const pageInfo = {
-                title: request.data.title || title || '未知页面',
-                url: request.data.url || url || '未知URL',
-                snapshotId: request.data.snapshotId,
-                elementCount: request.data.elementCount,
-                generatedAt: request.data.generatedAt,
-                timestamp: Date.now()
-            };
-
-            console.log('[VCP Background] 📄 解析到页面信息:', pageInfo);
-
-            // 关键修复：无论popup是否打开，都立即存储最新信息
-            latestPageInfo = pageInfo; // 缓存到内存
-            console.log('[VCP Background] 💾 已存储到内存');
-            
-            chrome.storage.local.set({ lastPageInfo: pageInfo }, () => {
-                console.log('[VCP Background] 💾 已存储到storage');
-            });
-
-            // 广播页面信息给popup（如果它打开了）
-            chrome.runtime.sendMessage({
-                type: 'PAGE_INFO_BROADCAST',
-                data: pageInfo
-            }).catch(error => {
-                // popup未打开时会出错，这是正常的
-                if (!error.message.includes("Could not establish connection")) {
-                    console.error("[VCP Background] ❌ 广播失败:", error);
-                }
-            });
         }
+
+        const lines = groundedMarkdown.split('\n');
+        const parsedTitle = (lines[0] || '').replace(/^#\s*/, '').trim();
+        const urlLine = lines.find(line => /^URL:\s*/i.test(line));
+        const parsedUrl = urlLine ? urlLine.replace(/^URL:\s*/i, '').trim() : '';
+        const pageInfoSummary = {
+            title: request.data.title || parsedTitle || '未知页面',
+            url: request.data.url || parsedUrl || '未知URL',
+            snapshotId: request.data.snapshotId,
+            elementCount: request.data.elementCount,
+            generatedAt: request.data.generatedAt,
+            agentViewFormat: outboundPageInfo.agentView.format,
+            groundedMarkdownLength: groundedMarkdown.length,
+            timestamp: Date.now()
+        };
+
+        latestPageInfo = {
+            ...pageInfoSummary,
+            markdown: groundedMarkdown,
+            pageContentMarkdown: outboundPageInfo.pageContentMarkdown,
+            interactionTree: outboundPageInfo.interactionTree,
+            scrollContext: outboundPageInfo.scrollContext,
+            snapshotDiff: outboundPageInfo.snapshotDiff,
+            agentView: outboundPageInfo.agentView
+        };
+        console.log('[VCP Background] 📄 已缓存 Grounded 页面信息:', pageInfoSummary);
+
+        chrome.storage.local.set({ lastPageInfo: pageInfoSummary }, () => {
+            console.log('[VCP Background] 💾 已存储页面摘要到 storage');
+        });
+
+        chrome.runtime.sendMessage({
+            type: 'PAGE_INFO_BROADCAST',
+            data: pageInfoSummary
+        }).catch(error => {
+            if (!error.message.includes("Could not establish connection")) {
+                console.error("[VCP Background] ❌ 广播失败:", error);
+            }
+        });
     } else if (request.type === 'MANUAL_REFRESH') {
         // 手动刷新不受监控开关限制
         console.log('[VCP Background] 🔄 收到手动刷新请求');
@@ -687,12 +760,505 @@ function isExpectedNavigationChannelClose(error) {
 }
 
 function shouldTreatChannelCloseAsNavigation(commandData, error) {
-    const navigationProneCommands = new Set(['click']);
+    const navigationProneCommands = new Set(['click', 'check']);
     return navigationProneCommands.has(commandData?.command) && isExpectedNavigationChannelClose(error);
+}
+
+function isSafeContentScriptRetryCommand(command) {
+    return new Set([
+        'wait_for',
+        'get_page_info',
+        'query_html',
+        'query_js',
+        'page_code_search'
+    ]).has(String(command || ''));
+}
+
+function sendCommandToContentScript(tabId, commandData) {
+    return chrome.tabs.sendMessage(tabId, {
+        type: 'EXECUTE_COMMAND',
+        data: commandData
+    });
+}
+
+async function sendSafeCommandAfterNavigation(tabId, commandData, initialError) {
+    if (!isSafeContentScriptRetryCommand(commandData?.command) || !isExpectedNavigationChannelClose(initialError)) {
+        throw initialError;
+    }
+
+    const loadResult = await waitForTabLoadComplete(
+        tabId,
+        Math.min(Math.max(Number(commandData.timeoutMs) || 10000, 3000), 15000)
+    );
+
+    let lastError = initialError;
+    for (let attempt = 1; attempt <= 8; attempt++) {
+        try {
+            const response = await sendCommandToContentScript(tabId, commandData);
+            console.log(`[VCP Background] ✅ 导航后只读命令重试成功: ${commandData.command}, attempt=${attempt}`);
+            return {
+                response,
+                retry: {
+                    applied: true,
+                    attempts: attempt,
+                    loadReason: loadResult.reason,
+                    initialError: String(initialError?.message || initialError)
+                }
+            };
+        } catch (error) {
+            lastError = error;
+            if (!isExpectedNavigationChannelClose(error)) throw error;
+            await new Promise(resolve => setTimeout(resolve, Math.min(250 * attempt, 1000)));
+        }
+    }
+
+    const error = new Error(`导航已发生，但新页面 content script 在安全重试窗口内仍未就绪: ${lastError?.message || lastError}`);
+    error.code = 'CONTENT_SCRIPT_NOT_READY_AFTER_NAVIGATION';
+    error.details = {
+        command: commandData.command,
+        tabId,
+        loadReason: loadResult.reason,
+        attempts: 8,
+        initialError: String(initialError?.message || initialError),
+        lastError: String(lastError?.message || lastError)
+    };
+    throw error;
+}
+
+async function resolveActionTargetInPage(tabId, target) {
+    if (!target) {
+        return {
+            found: true,
+            target: null,
+            rect: null,
+            point: null,
+            tagName: null,
+            type: null,
+            value: null,
+            checked: null
+        };
+    }
+    const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'ISOLATED',
+        func: (targetValue) => {
+            const escapeValue = value => {
+                if (globalThis.CSS?.escape) return CSS.escape(String(value));
+                return String(value).replace(/["\\]/g, '\\$&');
+            };
+            const targetText = String(targetValue || '').trim();
+            let element = document.querySelector(`[data-vcp-kind-id="${escapeValue(targetText)}"],[data-vcp-handle="${escapeValue(targetText)}"],[data-vcp-snapshot-handle="${escapeValue(targetText)}"],[vcp-id="${escapeValue(targetText)}"]`);
+            if (!element) {
+                try {
+                    if (targetText.startsWith('#') || targetText.startsWith('.') || targetText.includes('[')) {
+                        element = document.querySelector(targetText);
+                    }
+                } catch {}
+            }
+            if (!element) element = document.getElementById(targetText);
+            if (!element) element = document.querySelector(`[name="${escapeValue(targetText)}"],[aria-label="${escapeValue(targetText)}"],[placeholder="${escapeValue(targetText)}"]`);
+            if (!element) return { found: false, target: targetText };
+
+            element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            const viewportWidth = innerWidth || document.documentElement.clientWidth;
+            const viewportHeight = innerHeight || document.documentElement.clientHeight;
+            const visibleLeft = Math.max(0, rect.left);
+            const visibleTop = Math.max(0, rect.top);
+            const visibleRight = Math.min(viewportWidth, rect.right);
+            const visibleBottom = Math.min(viewportHeight, rect.bottom);
+            const visibleWidth = Math.max(0, visibleRight - visibleLeft);
+            const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) <= 0 || visibleWidth <= 0 || visibleHeight <= 0) {
+                return { found: true, interactable: false, code: 'ELEMENT_OUTSIDE_VIEWPORT', rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
+            }
+            if (element.disabled || element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('inert')) {
+                return { found: true, interactable: false, code: 'ELEMENT_NOT_INTERACTABLE' };
+            }
+
+            const points = [
+                [visibleLeft + visibleWidth / 2, visibleTop + visibleHeight / 2],
+                [visibleLeft + Math.min(6, visibleWidth * 0.2), visibleTop + Math.min(6, visibleHeight * 0.2)],
+                [visibleRight - Math.min(6, visibleWidth * 0.2), visibleTop + Math.min(6, visibleHeight * 0.2)],
+                [visibleLeft + Math.min(6, visibleWidth * 0.2), visibleBottom - Math.min(6, visibleHeight * 0.2)],
+                [visibleRight - Math.min(6, visibleWidth * 0.2), visibleBottom - Math.min(6, visibleHeight * 0.2)]
+            ];
+            let point = null;
+            let hitCount = 0;
+            let occluder = null;
+            for (const [x, y] of points) {
+                const hit = document.elementFromPoint(x, y);
+                const related = hit === element || element.contains(hit) || hit?.contains?.(element) ||
+                    (hit?.tagName === 'LABEL' && hit.htmlFor === element.id);
+                if (related) {
+                    hitCount++;
+                    if (!point) point = { x: Math.round(x), y: Math.round(y) };
+                } else if (!occluder && hit) {
+                    occluder = {
+                        tag: hit.tagName?.toLowerCase(),
+                        role: hit.getAttribute?.('role'),
+                        label: hit.getAttribute?.('aria-label') || hit.textContent?.trim().slice(0, 80)
+                    };
+                }
+            }
+            return {
+                found: true,
+                interactable: hitCount > 0,
+                code: hitCount > 0 ? null : 'ELEMENT_OCCLUDED',
+                target: targetText,
+                point,
+                hitCount,
+                sampleCount: points.length,
+                hitRatio: hitCount / points.length,
+                occluder,
+                tagName: element.tagName.toLowerCase(),
+                type: element.getAttribute('type') || '',
+                rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                value: element.type === 'password' ? undefined : (element.value ?? element.textContent ?? ''),
+                valueLength: String(element.value ?? element.textContent ?? '').length,
+                checked: typeof element.checked === 'boolean' ? element.checked : element.getAttribute('aria-checked'),
+                selectedIndex: typeof element.selectedIndex === 'number' ? element.selectedIndex : null
+            };
+        },
+        args: [target]
+    });
+    return results?.[0]?.result || { found: false, target };
+}
+
+async function focusActionTarget(tabId, target) {
+    const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'ISOLATED',
+        func: (targetValue) => {
+            const escaped = globalThis.CSS?.escape ? CSS.escape(String(targetValue)) : String(targetValue).replace(/["\\]/g, '\\$&');
+            const element = document.querySelector(`[data-vcp-kind-id="${escaped}"],[data-vcp-handle="${escaped}"],[data-vcp-snapshot-handle="${escaped}"],[vcp-id="${escaped}"]`) ||
+                document.getElementById(String(targetValue));
+            if (!element) return false;
+            element.focus({ preventScroll: true });
+            return document.activeElement === element;
+        },
+        args: [target]
+    });
+    return results?.[0]?.result === true;
+}
+
+function normalizeCdpKeys(keys) {
+    if (Array.isArray(keys)) return keys.map(String);
+    return String(keys || '').split(/\s*\+\s*|\s*,\s*/).filter(Boolean);
+}
+
+function getCdpKeyDescriptor(rawKey) {
+    const aliases = {
+        esc: 'Escape',
+        return: 'Enter',
+        space: ' ',
+        arrowup: 'ArrowUp',
+        arrowdown: 'ArrowDown',
+        arrowleft: 'ArrowLeft',
+        arrowright: 'ArrowRight',
+        pageup: 'PageUp',
+        pagedown: 'PageDown'
+    };
+    const key = aliases[String(rawKey || '').toLowerCase()] || String(rawKey || '');
+    const specialKeys = {
+        Enter: { code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, text: '\r' },
+        Tab: { code: 'Tab', windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9, text: '\t' },
+        Escape: { code: 'Escape', windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 },
+        Backspace: { code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
+        Delete: { code: 'Delete', windowsVirtualKeyCode: 46, nativeVirtualKeyCode: 46 },
+        ArrowLeft: { code: 'ArrowLeft', windowsVirtualKeyCode: 37, nativeVirtualKeyCode: 37 },
+        ArrowUp: { code: 'ArrowUp', windowsVirtualKeyCode: 38, nativeVirtualKeyCode: 38 },
+        ArrowRight: { code: 'ArrowRight', windowsVirtualKeyCode: 39, nativeVirtualKeyCode: 39 },
+        ArrowDown: { code: 'ArrowDown', windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40 },
+        PageUp: { code: 'PageUp', windowsVirtualKeyCode: 33, nativeVirtualKeyCode: 33 },
+        PageDown: { code: 'PageDown', windowsVirtualKeyCode: 34, nativeVirtualKeyCode: 34 },
+        Home: { code: 'Home', windowsVirtualKeyCode: 36, nativeVirtualKeyCode: 36 },
+        End: { code: 'End', windowsVirtualKeyCode: 35, nativeVirtualKeyCode: 35 },
+        ' ': { code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32, text: ' ' }
+    };
+    if (specialKeys[key]) return { key, location: 0, ...specialKeys[key] };
+
+    const character = key.slice(0, 1);
+    const upper = character.toUpperCase();
+    return {
+        key: character,
+        code: /^[a-z]$/i.test(character) ? `Key${upper}` : (/^\d$/.test(character) ? `Digit${character}` : character),
+        windowsVirtualKeyCode: upper.charCodeAt(0) || 0,
+        nativeVirtualKeyCode: upper.charCodeAt(0) || 0,
+        location: 0,
+        text: character
+    };
+}
+
+async function dispatchCdpKeySequence(tabId, keys) {
+    const tokens = normalizeCdpKeys(keys);
+    if (!tokens.length) throw new Error('send_keys 缺少 keys 参数');
+    const modifiersMap = { alt: 1, ctrl: 2, control: 2, meta: 4, cmd: 4, command: 4, shift: 8 };
+    let modifiers = 0;
+    const actionKeys = [];
+    for (const token of tokens) {
+        const lower = token.toLowerCase();
+        if (modifiersMap[lower]) modifiers |= modifiersMap[lower];
+        else actionKeys.push(token);
+    }
+
+    const descriptors = [];
+    for (const rawKey of actionKeys) {
+        const descriptor = getCdpKeyDescriptor(rawKey);
+        descriptors.push(descriptor);
+        const common = {
+            key: descriptor.key,
+            code: descriptor.code,
+            modifiers,
+            location: descriptor.location,
+            windowsVirtualKeyCode: descriptor.windowsVirtualKeyCode,
+            nativeVirtualKeyCode: descriptor.nativeVirtualKeyCode
+        };
+        await sendCdpCommand(tabId, 'Input.dispatchKeyEvent', {
+            type: descriptor.text && modifiers === 0 ? 'keyDown' : 'rawKeyDown',
+            ...common
+        });
+        if (descriptor.text && modifiers === 0) {
+            await sendCdpCommand(tabId, 'Input.dispatchKeyEvent', {
+                type: 'char',
+                ...common,
+                text: descriptor.text,
+                unmodifiedText: descriptor.text
+            });
+        }
+        await sendCdpCommand(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...common });
+    }
+    return { keys: actionKeys, modifiers, descriptors };
+}
+
+function summarizeTabState(tabs) {
+    return (Array.isArray(tabs) ? tabs : []).map(tab => ({
+        id: tab.id,
+        url: tab.url || '',
+        title: tab.title || '',
+        active: tab.active === true
+    }));
+}
+
+function detectKeyboardPageTransition(beforeTabs, afterTabs, sourceTabId) {
+    const beforeById = new Map(beforeTabs.map(tab => [tab.id, tab]));
+    const afterSource = afterTabs.find(tab => tab.id === sourceTabId) || null;
+    const beforeSource = beforeById.get(sourceTabId) || null;
+    const createdTabs = afterTabs.filter(tab => !beforeById.has(tab.id));
+    const sourceNavigated = !!beforeSource && !!afterSource && beforeSource.url !== afterSource.url;
+    return {
+        observed: sourceNavigated || createdTabs.length > 0,
+        sourceNavigated,
+        createdTabs,
+        beforeSource,
+        afterSource,
+        tabCountBefore: beforeTabs.length,
+        tabCountAfter: afterTabs.length
+    };
+}
+
+async function waitForKeyboardPageTransition(beforeTabs, sourceTabId, timeoutMs = 3000) {
+    const startedAt = Date.now();
+    let transition = detectKeyboardPageTransition(
+        beforeTabs,
+        summarizeTabState(await queryAllTabs()),
+        sourceTabId
+    );
+
+    while (!transition.observed && Date.now() - startedAt < timeoutMs) {
+        await new Promise(resolve => setTimeout(resolve, 150));
+        transition = detectKeyboardPageTransition(
+            beforeTabs,
+            summarizeTabState(await queryAllTabs()),
+            sourceTabId
+        );
+    }
+
+    return {
+        ...transition,
+        observationMs: Date.now() - startedAt,
+        observationTimedOut: !transition.observed
+    };
+}
+
+async function executeCdpAction(commandData, tabId) {
+    await ensureDebuggerAttached(tabId);
+    const command = commandData.command;
+    const tabsBefore = command === 'send_keys' ? summarizeTabState(await queryAllTabs()) : null;
+    const targetState = await resolveActionTargetInPage(tabId, commandData.target);
+    if (commandData.target && !targetState.found) {
+        const error = new Error(`CDP Input 无法解析目标: ${commandData.target}`);
+        error.code = 'ELEMENT_HANDLE_EXPIRED';
+        throw error;
+    }
+    if (commandData.target && !targetState.interactable) {
+        const error = new Error(targetState.code === 'ELEMENT_OCCLUDED' ? '目标元素被遮挡' : '目标元素不可交互');
+        error.code = targetState.code || 'ELEMENT_NOT_INTERACTABLE';
+        error.details = targetState;
+        throw error;
+    }
+
+    if (command === 'click') {
+        const { x, y } = targetState.point;
+        await sendCdpCommand(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+        await sendCdpCommand(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+        await sendCdpCommand(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+    } else if (command === 'hover') {
+        const { x, y } = targetState.point;
+        await sendCdpCommand(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+    } else if (command === 'type' || command === 'set_value') {
+        await focusActionTarget(tabId, commandData.target);
+        await dispatchCdpKeySequence(tabId, ['Ctrl', 'a']);
+        await dispatchCdpKeySequence(tabId, ['Backspace']);
+        await sendCdpCommand(tabId, 'Input.insertText', { text: String(commandData.value ?? commandData.text ?? '') });
+    } else if (command === 'send_keys') {
+        if (commandData.target) await focusActionTarget(tabId, commandData.target);
+        await dispatchCdpKeySequence(tabId, commandData.keys || commandData.text);
+    } else if (command === 'scroll') {
+        const x = targetState.point?.x ??  Math.round((commandData.x ?? 0) || 0);
+        const y = targetState.point?.y ?? Math.round((commandData.y ?? 0) || 0);
+        const amount = parseNumberParam(commandData.amount, 600, 1, 100000);
+        const direction = String(commandData.direction || 'down').toLowerCase();
+        const deltaY = ['up', 'page_up'].includes(direction) ? -amount : (['down', 'page_down'].includes(direction) ? amount : 0);
+        const deltaX = ['left', 'page_left'].includes(direction) ? -amount : (['right', 'page_right'].includes(direction) ? amount : 0);
+        await sendCdpCommand(tabId, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX, deltaY });
+    } else {
+        throw new Error(`CDP Input 不支持动作: ${command}`);
+    }
+
+    const dispatchedKeys = command === 'send_keys'
+        ? normalizeCdpKeys(commandData.keys || commandData.text).map(key => String(key).toLowerCase())
+        : [];
+    const enterOnInput = command === 'send_keys' &&
+        dispatchedKeys.some(key => key === 'enter' || key === 'return') &&
+        !!commandData.target &&
+        ['input', 'textarea'].includes(targetState?.tagName);
+    await new Promise(resolve => setTimeout(resolve, 120));
+
+    let afterState = null;
+    try {
+        afterState = commandData.target ? await resolveActionTargetInPage(tabId, commandData.target) : null;
+    } catch (error) {
+        // 导航后旧文档句柄不可解析本身属于页面迁移证据，后续由标签状态确权。
+        afterState = { unavailableAfterDispatch: true, reason: error.message };
+    }
+
+    const expectedValue = String(commandData.value ?? commandData.text ?? '');
+    let verified = (command === 'type' || command === 'set_value')
+        ? (afterState?.type === 'password' ? afterState?.valueLength === expectedValue.length : String(afterState?.value ?? '') === expectedValue)
+        : null;
+    let verificationType = verified === null ? 'cdp-dispatch-observed' : 'value-readback';
+    let keyboardTransition = null;
+
+    if (enterOnInput) {
+        keyboardTransition = await waitForKeyboardPageTransition(tabsBefore || [], tabId, 3000);
+        // 未在有限观察窗中看到导航不能证明 Enter 无效；站点可能延迟创建标签
+        // 或先执行异步校验。此时标记“尚未确认”，不得把已生效动作包装成错误。
+        verified = keyboardTransition.observed ? true : null;
+        verificationType = keyboardTransition.observed
+            ? 'enter-submit-page-transition'
+            : 'enter-dispatched-transition-unconfirmed';
+    }
+
+    return {
+        message: enterOnInput && verified === null
+            ? 'Enter 已通过 CDP Input 发送；观察窗内尚未确认页面迁移，后续应通过 URL、标签页或页面快照确权'
+            : `动作已通过 CDP Input 执行: ${command}`,
+        code: verified === false
+            ? 'ACTION_VERIFICATION_FAILED'
+            : (verified === true
+                ? 'ACTION_VERIFIED'
+                : (enterOnInput ? 'ACTION_DISPATCHED_UNCONFIRMED' : 'ACTION_DISPATCHED')),
+        result: {
+            attempted: true,
+            verified,
+            verificationType,
+            beforeState: targetState,
+            afterState,
+            keyboardTransition,
+            targetResolution: targetState,
+            backendUsed: 'cdp-input',
+            fallbackUsed: false,
+            requiresFreshSnapshot: true
+        }
+    };
 }
 
 async function handleIncomingCommand(commandData) {
     const { command, requestId, sourceClientId } = commandData;
+
+    const cdpInputCommands = new Set(['click', 'type', 'set_value', 'send_keys', 'hover', 'scroll']);
+    const wantsCdpInput = cdpInputCommands.has(command) &&
+        (commandData.actionBackend === 'cdp-input' || commandData.actionBackend === 'auto') &&
+        (runtimeIdentity.managedRuntime || runtimeIdentity.clientKind === 'agent');
+
+    if (wantsCdpInput) {
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const tabId = tabs[0]?.id;
+        if (!tabId) {
+            sendResponseToWs({
+                type: 'command_result',
+                data: { requestId, sourceClientId, status: 'error', code: 'NO_ACTIVE_TAB', error: '没有活动的标签页' }
+            });
+            return;
+        }
+        try {
+            const cdpResult = await executeCdpAction(commandData, tabId);
+            sendResponseToWs({
+                type: 'command_result',
+                data: {
+                    requestId,
+                    sourceClientId,
+                    status: cdpResult.code === 'ACTION_VERIFICATION_FAILED' ? 'error' : 'success',
+                    ...cdpResult
+                }
+            });
+            setTimeout(() => requestPageInfoWithRetry(tabId), 350);
+            return;
+        } catch (cdpError) {
+            if (commandData.allowFallback === false || commandData.actionBackend === 'cdp-input') {
+                sendResponseToWs({
+                    type: 'command_result',
+                    data: {
+                        requestId,
+                        sourceClientId,
+                        status: 'error',
+                        code: cdpError.code || 'CDP_BACKEND_UNAVAILABLE',
+                        error: cdpError.message,
+                        details: cdpError.details || null
+                    }
+                });
+                return;
+            }
+            console.warn(`[VCP Background] CDP Input ${command} 失败，回退 content script:`, cdpError.message);
+            try {
+                await sendCommandToContentScript(tabId, {
+                    ...commandData,
+                    actionBackend: 'content-script',
+                    fallbackUsed: true,
+                    fallbackReason: cdpError.code || cdpError.message
+                });
+                return;
+            } catch (fallbackError) {
+                sendResponseToWs({
+                    type: 'command_result',
+                    data: {
+                        requestId,
+                        sourceClientId,
+                        status: 'error',
+                        code: fallbackError.code || 'ACTION_DISPATCH_FAILED',
+                        error: fallbackError.message,
+                        details: {
+                            cdpError: cdpError.message,
+                            fallbackError: fallbackError.message
+                        }
+                    }
+                });
+                return;
+            }
+        }
+    }
     
     // 某些指令由 background 直接处理 (CDP 相关 / 主世界脚本执行 / 标签页管理 / 截图)
     if (command.startsWith('cdp_') || command === 'execute_script' || command === 'list_tabs' || command === 'switch_tab' || command === 'close_tab' || isScreenshotCommand(command)) {
@@ -731,64 +1297,68 @@ async function handleIncomingCommand(commandData) {
         return;
     }
 
-    // 其他指令转发给 content_script
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0]) {
-            chrome.tabs.sendMessage(tabs[0].id, {
-                type: 'EXECUTE_COMMAND',
-                data: commandData
-            }).catch(err => {
-                if (shouldTreatChannelCloseAsNavigation(commandData, err)) {
-                    console.log('[VCP Background] 🔄 点击触发导航导致 content script 通道关闭，等待标签页完成加载:', err.message);
-                    waitForTabLoadComplete(tabs[0].id, 12000).then((loadResult) => {
-                        sendResponseToWs({
-                            type: 'command_result',
-                            data: {
-                                requestId,
-                                sourceClientId,
-                                status: 'success',
-                                code: 'NAVIGATION_COMPLETED_OR_STABLE',
-                                message: `点击已触发页面导航，已等待标签页状态: ${loadResult.reason}，随后请求新页面信息。`,
-                                result: {
-                                    navigationInProgress: false,
-                                    navigationWaitReason: loadResult.reason,
-                                    tab: loadResult.tab ? {
-                                        id: loadResult.tab.id,
-                                        title: loadResult.tab.title,
-                                        url: loadResult.tab.url,
-                                        status: loadResult.tab.status
-                                    } : null,
-                                    originalChannelError: err.message
-                                }
-                            }
-                        });
+    // 其他指令转发给 content_script。导航后只允许重试无副作用查询/等待命令；
+    // click/type/send_keys 等动作绝不自动重放，避免重复提交。
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const activeTab = tabs[0];
+    if (!activeTab) {
+        sendResponseToWs({
+            type: 'command_result',
+            data: { requestId, sourceClientId, status: 'error', code: 'NO_ACTIVE_TAB', error: '没有活动的标签页' }
+        });
+        return;
+    }
 
-// 必须在 command_result 之后请求 page_info：
-                        // 服务端只有收到 command_result 后才会把 pending 标记为 commandExecuted。
-                        // Bing/Google 搜索结果页 load complete 后还会异步填充结果列表，过早抓取只会得到顶部导航。
-                        setTimeout(() => requestPageInfoWithRetry(tabs[0].id), 2500);
-                    });
-                    return;
-                }
-
-                sendResponseToWs({
-                    type: 'command_result',
-                    data: {
-                        requestId,
-                        sourceClientId,
-                        status: 'error',
-                        code: 'CONTENT_SCRIPT_CONTEXT_LOST',
-                        error: '无法连接到页面脚本: ' + err.message
-                    }
-                });
-            });
-        } else {
+    try {
+        await sendCommandToContentScript(activeTab.id, commandData);
+    } catch (err) {
+        if (shouldTreatChannelCloseAsNavigation(commandData, err)) {
+            console.log('[VCP Background] 🔄 点击触发导航导致 content script 通道关闭，等待标签页完成加载:', err.message);
+            const loadResult = await waitForTabLoadComplete(activeTab.id, 12000);
             sendResponseToWs({
                 type: 'command_result',
-                data: { requestId, sourceClientId, status: 'error', code: 'NO_ACTIVE_TAB', error: '没有活动的标签页' }
+                data: {
+                    requestId,
+                    sourceClientId,
+                    status: 'success',
+                    code: 'NAVIGATION_COMPLETED_OR_STABLE',
+                    message: `点击已触发页面导航，已等待标签页状态: ${loadResult.reason}，随后请求新页面信息。`,
+                    result: {
+                        navigationInProgress: false,
+                        navigationWaitReason: loadResult.reason,
+                        tab: loadResult.tab ? {
+                            id: loadResult.tab.id,
+                            title: loadResult.tab.title,
+                            url: loadResult.tab.url,
+                            status: loadResult.tab.status
+                        } : null,
+                        originalChannelError: err.message
+                    }
+                }
+            });
+            // 必须在 command_result 之后请求 page_info：服务端收到结果后才会将 pending 标记为已执行。
+            setTimeout(() => requestPageInfoWithRetry(activeTab.id), 2500);
+            return;
+        }
+
+        try {
+            await sendSafeCommandAfterNavigation(activeTab.id, commandData, err);
+            // content script 会自行通过 COMMAND_RESULT 回传原命令结果，此处不能重复发送。
+            return;
+        } catch (retryError) {
+            sendResponseToWs({
+                type: 'command_result',
+                data: {
+                    requestId,
+                    sourceClientId,
+                    status: 'error',
+                    code: retryError.code || 'CONTENT_SCRIPT_CONTEXT_LOST',
+                    error: '无法连接到页面脚本: ' + retryError.message,
+                    details: retryError.details || null
+                }
             });
         }
-    });
+    }
 }
 
 function sendResponseToWs(message) {
@@ -825,6 +1395,43 @@ function parseNumberParam(value, defaultValue, minValue, maxValue) {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) return defaultValue;
     return Math.min(Math.max(parsed, minValue), maxValue);
+}
+
+function estimateCdpBodyBytes(body, base64Encoded) {
+    const text = String(body || '');
+    if (!base64Encoded) return new TextEncoder().encode(text).byteLength;
+    const normalized = text.replace(/\s+/g, '');
+    const padding = normalized.endsWith('==') ? 2 : (normalized.endsWith('=') ? 1 : 0);
+    return Math.max(0, Math.floor(normalized.length * 3 / 4) - padding);
+}
+
+async function sha256Text(text) {
+    const bytes = new TextEncoder().encode(String(text || ''));
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function buildCdpResponseBodyResult(response, commandData = {}) {
+    const body = String(response?.body || '');
+    const base64Encoded = response?.base64Encoded === true;
+    const bodyChars = body.length;
+    const bodyBytes = estimateCdpBodyBytes(body, base64Encoded);
+    const metadataOnly = parseBooleanParam(commandData.metadataOnly, false);
+    const maxBodyChars = Math.round(parseNumberParam(commandData.maxBodyChars, 16384, 0, 1000000));
+    const truncated = !metadataOnly && bodyChars > maxBodyChars;
+    const exposedBody = metadataOnly ? undefined : (truncated ? body.slice(0, maxBodyChars) : body);
+
+    return {
+        ...(exposedBody === undefined ? {} : { body: exposedBody }),
+        base64Encoded,
+        bodyBytes,
+        bodyChars,
+        sha256: await sha256Text(body),
+        metadataOnly,
+        maxBodyChars,
+        truncated,
+        omittedChars: metadataOnly ? bodyChars : Math.max(0, bodyChars - maxBodyChars)
+    };
 }
 
 async function ensureDebuggerAttached(tabId) {
@@ -912,22 +1519,43 @@ async function captureScreenshot(commandData = {}) {
 async function executeScriptInMainWorld(commandData) {
     const tabId = currentActiveTabId;
     const code = commandData.text || '';
+    const requestedWorld = String(commandData.executionWorld || commandData.world || 'MAIN').trim().toUpperCase();
+    const executionWorld = requestedWorld === 'ISOLATED' ? 'ISOLATED' : 'MAIN';
     if (!tabId) throw new Error('没有活动的标签页');
     if (!code.trim()) throw new Error('execute_script 缺少 text 代码内容');
 
     const injectionResults = await chrome.scripting.executeScript({
         target: { tabId },
-        world: 'MAIN',
+        world: executionWorld,
         func: async (userCode) => {
-            const fn = new Function(`return (async () => {\n${userCode}\n})()`);
-            return await fn();
+            // 必须逐层 return/await。否则用户代码中的 return 只会退出动态函数，
+            // chrome.scripting.executeScript() 最终会得到 undefined（经 JSON 后表现为 null）。
+            const runner = new Function(`return (async () => {\n${userCode}\n})()`);
+            return await runner();
         },
         args: [code]
     });
 
+    const firstFrame = Array.isArray(injectionResults) ? injectionResults[0] : null;
+    const scriptResult = firstFrame?.result;
+    const resultPresent = Boolean(firstFrame) &&
+        Object.prototype.hasOwnProperty.call(firstFrame, 'result') &&
+        scriptResult !== undefined;
+
     return {
-        message: '脚本执行成功',
-        result: injectionResults?.[0]?.result
+        message: resultPresent
+            ? `脚本执行成功 (${executionWorld})`
+            : `脚本执行完成，但未返回可序列化结果 (${executionWorld})`,
+        result: scriptResult === undefined ? null : scriptResult,
+        code: resultPresent ? 'SCRIPT_RESULT_RETURNED' : 'SCRIPT_RESULT_MISSING',
+        details: {
+            executionWorld,
+            frameCount: Array.isArray(injectionResults) ? injectionResults.length : 0,
+            frameId: firstFrame?.frameId ?? null,
+            documentId: firstFrame?.documentId ?? null,
+            resultPresent,
+            resultType: scriptResult === null ? 'null' : typeof scriptResult
+        }
     };
 }
 
@@ -1085,9 +1713,15 @@ async function processCdpCommand(commandData) {
             });
             return { result: logs };
 
-        case 'cdp_get_response_body':
+        case 'cdp_get_response_body': {
             if (!attachedTabId) throw new Error('CDP 未启动');
-            return { result: await sendCdpCommand(attachedTabId, 'Network.getResponseBody', { requestId: cdpRequestId }) };
+            if (!cdpRequestId) throw new Error('cdp_get_response_body 缺少 requestId');
+            const response = await sendCdpCommand(attachedTabId, 'Network.getResponseBody', { requestId: cdpRequestId });
+            return {
+                message: 'Response Body 读取成功；大正文按 maxBodyChars 自动截断',
+                result: await buildCdpResponseBodyResult(response, commandData)
+            };
+        }
 
         case 'cdp_clear_network':
             networkLogs.clear();
@@ -1257,6 +1891,19 @@ chrome.debugger.onDetach.addListener((source) => {
     }
 });
 
+function broadcastPrivacySettingsToTabs() {
+    chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] }, (tabs) => {
+        tabs.forEach(tab => {
+            chrome.tabs.sendMessage(tab.id, {
+                type: 'PRIVACY_SETTINGS_CHANGED',
+                redactSensitiveDom
+            }).catch(() => {
+                // 页面脚本尚未注入或页面已销毁时无需重试。
+            });
+        });
+    });
+}
+
 function broadcastMonitoringStatusToTabs() {
     chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] }, (tabs) => {
         tabs.forEach(tab => {
@@ -1379,13 +2026,18 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     }
 });
 
-// 从storage恢复监控状态
-chrome.storage.local.get(['isMonitoringEnabled'], (result) => {
+// 从storage恢复监控与隐私状态。隐私设置未出现时按 true 初始化。
+chrome.storage.local.get(['isMonitoringEnabled', 'redactSensitiveDom'], (result) => {
     if (result.isMonitoringEnabled !== undefined) {
         isMonitoringEnabled = result.isMonitoringEnabled;
         console.log('[VCP Background] 📡 恢复监控状态:', isMonitoringEnabled ? '开启' : '关闭');
         broadcastMonitoringStatusToTabs();
     }
+    redactSensitiveDom = result.redactSensitiveDom !== false;
+    if (result.redactSensitiveDom === undefined) {
+        chrome.storage.local.set({ redactSensitiveDom: true });
+    }
+    broadcastPrivacySettingsToTabs();
 });
 
 // 初始化图标状态
