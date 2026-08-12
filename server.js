@@ -872,6 +872,12 @@ app.use((req, res, next) => {
         return next();
     }
 
+    // VCPChatSyncHub uses its own dedicated sync token so VCPMobile can keep
+    // using the upstream Mobile Sync V2 protocol without knowing the main VCP key.
+    if (req.path.startsWith('/api/mobile-sync')) {
+        return next();
+    }
+
     const authHeader = req.headers.authorization;
     if (!authHeader || authHeader !== `Bearer ${serverKey}`) {
         return res.status(401).json({ error: 'Unauthorized (Bearer token required)' });

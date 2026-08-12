@@ -1,0 +1,4 @@
+sync_state.db
+logs/
+data/
+config.env

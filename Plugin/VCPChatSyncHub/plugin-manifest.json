@@ -1,0 +1,19 @@
+{
+  "name": "VCPChatSyncHub",
+  "displayName": "VCPChat Central Sync Hub",
+  "version": "1.0.0",
+  "description": "Central bidirectional sync hub shared by VCPChat desktop clients and VCPMobile.",
+  "author": "Nova",
+  "pluginType": "service",
+  "entryPoint": {
+    "script": "index.js"
+  },
+  "communication": {
+    "protocol": "direct"
+  },
+  "configSchema": {
+    "MobileSyncToken": "string",
+    "MobileSyncPort": "integer",
+    "SyncHubAppDataPath": "string"
+  }
+}

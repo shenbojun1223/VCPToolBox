@@ -1,0 +1,39 @@
+# VCPChatSyncHub
+
+VCPChatSyncHub turns VCPToolBox into a central data plane shared by multiple
+VCPChat desktop clients and VCPMobile. It keeps the upstream Mobile Sync V2
+transport and AppData-compatible entity layout, including agents, groups,
+topics, messages, avatars, attachments and deletion tombstones.
+
+## Configure
+
+Copy `config.env.example` to `config.env`, set a strong `MobileSyncToken`, and
+restart VCPToolBox. The hub refuses to start when the token is empty or still
+uses the example placeholder.
+
+Defaults:
+
+- HTTP: `http(s)://<toolbox-host>:<toolbox-port>/api/mobile-sync`
+- WebSocket: `ws(s)://<toolbox-host>:5975/ws-sync`
+- Data: `Plugin/VCPChatSyncHub/data/AppData`
+
+The HTTP and WebSocket transports use the same token. HTTP accepts
+`x-sync-token`, `Authorization: Bearer <token>`, or `?token=...`; WebSocket uses
+`?token=...`.
+
+For an Internet-facing deployment, terminate TLS in the existing reverse proxy
+and forward both the HTTP path and WebSocket endpoint. Do not expose port 5975
+without TLS on an untrusted network.
+
+## VCPMobile
+
+Use the VCPToolBox public base URL as the mobile HTTP service URL and the public
+WebSocket URL as the mobile WebSocket service URL. The protocol is inherited
+from upstream VCPMobileSync, so existing Mobile Sync V2 clients can use the hub
+without changing their payload format.
+
+## Storage and backup
+
+The central store is deliberately ignored by Git. Back up the configured
+AppData directory together with the adjacent `sync_state.db`; source-control
+sync is not a database backup strategy.
