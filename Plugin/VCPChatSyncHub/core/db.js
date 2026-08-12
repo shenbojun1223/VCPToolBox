@@ -22,6 +22,7 @@ let db = null;
 function initDb(dbPath) {
   if (!Database) return null;
 
+  closeDb();
   db = new Database(dbPath);
 
   // 1. 实体索引表 (Agent, Group, Topic)
@@ -89,9 +90,8 @@ function initDb(dbPath) {
     )
   `);
 
-  // Desktop clients exchange the complete Agent/Group configuration through
-  // a separate compatibility layer. Mobile Sync V2 continues to use the
-  // whitelisted DTO hash in entity_index.
+  // Desktop clients exchange complete sanitized Agent/Group configs through
+  // a compatibility layer that is intentionally separate from Mobile DTOs.
   db.exec(`
     CREATE TABLE IF NOT EXISTS desktop_config_index (
       id TEXT NOT NULL,
@@ -137,15 +137,34 @@ function closeDb() {
 function upsertEntityIndex(id, type, filePath, hash, updatedAt = Date.now()) {
   if (!db) return;
 
+  if (["topic", "agent_topic", "group_topic"].includes(type)) {
+    const existing = db
+      .prepare(
+        "SELECT file_path FROM entity_index WHERE id = ? AND (type = 'topic' OR type = 'agent_topic' OR type = 'group_topic')",
+      )
+      .get(id);
+    if (
+      existing?.file_path &&
+      filePath &&
+      pathIdentity(existing.file_path) !== pathIdentity(filePath)
+    ) {
+      throw new Error(`Topic id ${id} is ambiguous across desktop owners`);
+    }
+  }
+
   if (filePath === null) {
     // 仅更新已存在实体的哈希与时间戳 (用于 WS 通知等场景)
-    db.prepare(
+    const result = db.prepare(
       `
       UPDATE entity_index
       SET hash = ?, updated_at = ?
       WHERE id = ? AND type = ?
     `,
     ).run(hash, updatedAt, id, type);
+    if (result.changes !== 1) {
+      throw new Error(`Entity index update missed ${type}/${id}`);
+    }
+    return result;
   } else {
     // 标准 upsert (含文件路径)
     db.prepare(
@@ -153,11 +172,18 @@ function upsertEntityIndex(id, type, filePath, hash, updatedAt = Date.now()) {
       INSERT INTO entity_index (id, type, file_path, hash, updated_at)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(id, type) DO UPDATE SET
+        file_path = excluded.file_path,
         hash = excluded.hash,
-        updated_at = CASE WHEN entity_index.hash <> excluded.hash THEN excluded.updated_at ELSE entity_index.updated_at END
+        updated_at = CASE WHEN entity_index.hash <> excluded.hash THEN excluded.updated_at ELSE entity_index.updated_at END,
+        deleted_at = NULL
     `,
     ).run(id, type, filePath, hash, updatedAt);
   }
+}
+
+function pathIdentity(value) {
+  const normalized = String(value || "").replace(/\\/g, "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 /**
@@ -176,7 +202,8 @@ function upsertMessageIndex(msgId, topicId, hash, updatedAt = Date.now()) {
     VALUES (?, ?, ?, ?)
     ON CONFLICT(topic_id, msg_id) DO UPDATE SET
       hash = excluded.hash,
-      updated_at = CASE WHEN message_index.hash <> excluded.hash THEN excluded.updated_at ELSE message_index.updated_at END
+      updated_at = CASE WHEN message_index.hash <> excluded.hash THEN excluded.updated_at ELSE message_index.updated_at END,
+      deleted_at = NULL
   `,
   ).run(msgId, topicId, hash, updatedAt);
 }
@@ -188,11 +215,10 @@ function upsertMessageIndex(msgId, topicId, hash, updatedAt = Date.now()) {
  * @param {number} updatedAt - 更新时间戳
  */
 function upsertAttachmentIndex(hash, filePath, updatedAt = Date.now()) {
-  if (!db) return;
+  if (!db) throw new Error("Database not initialized");
 
-  try {
-    db.prepare(
-      `
+  db.prepare(
+    `
       INSERT INTO attachment_index (hash, file_path, updated_at)
       VALUES (?, ?, ?)
       ON CONFLICT(hash) DO UPDATE SET
@@ -200,15 +226,7 @@ function upsertAttachmentIndex(hash, filePath, updatedAt = Date.now()) {
         updated_at = excluded.updated_at,
         deleted_at = NULL
     `,
-    ).run(hash, filePath, updatedAt);
-  } catch (e) {
-    const logger = getLogger();
-    if (logger) {
-      logger.logOperation("reconcile", "attachment", hash.substring(0, 16), "error", e.message);
-    } else {
-      console.error(`[VCPMobileSync] 附件索引失败 [${hash}]:`, e.message);
-    }
-  }
+  ).run(hash, filePath, updatedAt);
 }
 
 /**
@@ -248,8 +266,10 @@ function upsertAvatarIndex(
     INSERT INTO avatar_index (owner_id, owner_type, file_path, hash, updated_at)
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(owner_id, owner_type) DO UPDATE SET
+      file_path = excluded.file_path,
       hash = excluded.hash,
-      updated_at = CASE WHEN avatar_index.hash <> excluded.hash THEN excluded.updated_at ELSE avatar_index.updated_at END
+      updated_at = CASE WHEN avatar_index.hash <> excluded.hash THEN excluded.updated_at ELSE avatar_index.updated_at END,
+      deleted_at = NULL
   `,
   ).run(ownerId, ownerType, filePath, hash, updatedAt);
 }
@@ -349,9 +369,20 @@ function upsertDesktopConfigIndex(id, type, filePath, hash, updatedAt = Date.now
 function softDeleteEntityIndex(id, type, deletedAt = Date.now()) {
   if (!db) return;
 
-  db.prepare(
-    `UPDATE entity_index SET deleted_at = ? WHERE id = ? AND type = ?`,
-  ).run(deletedAt, id, type);
+  const topicType = ["topic", "agent_topic", "group_topic"].includes(type);
+  const sql = topicType
+    ? `UPDATE entity_index
+       SET deleted_at = CASE
+         WHEN deleted_at IS NULL THEN ?1 ELSE MIN(deleted_at, ?1) END
+       WHERE id = ?2
+         AND (type = 'topic' OR type = 'agent_topic' OR type = 'group_topic')`
+    : `UPDATE entity_index
+       SET deleted_at = CASE
+         WHEN deleted_at IS NULL THEN ?1 ELSE MIN(deleted_at, ?1) END
+       WHERE id = ?2 AND type = ?3`;
+  return topicType
+    ? db.prepare(sql).run(deletedAt, id)
+    : db.prepare(sql).run(deletedAt, id, type);
 }
 
 /**
@@ -364,16 +395,23 @@ function softDeleteMessageIndex(msgId, deletedAt = Date.now(), topicId = null) {
   if (!db) return;
 
   if (topicId) {
-    db.prepare(`UPDATE message_index SET deleted_at = ? WHERE topic_id = ? AND msg_id = ?`).run(
-      deletedAt,
-      topicId,
-      msgId,
-    );
+    return db
+      .prepare(
+        `UPDATE message_index
+         SET deleted_at = CASE
+           WHEN deleted_at IS NULL THEN ?1 ELSE MIN(deleted_at, ?1) END
+         WHERE topic_id = ?2 AND msg_id = ?3`,
+      )
+      .run(deletedAt, topicId, msgId);
   } else {
-    db.prepare(`UPDATE message_index SET deleted_at = ? WHERE msg_id = ?`).run(
-      deletedAt,
-      msgId,
-    );
+    return db
+      .prepare(
+        `UPDATE message_index
+         SET deleted_at = CASE
+           WHEN deleted_at IS NULL THEN ?1 ELSE MIN(deleted_at, ?1) END
+         WHERE msg_id = ?2`,
+      )
+      .run(deletedAt, msgId);
   }
 }
 
@@ -386,9 +424,14 @@ function softDeleteMessageIndex(msgId, deletedAt = Date.now(), topicId = null) {
 function softDeleteAvatarIndex(ownerId, ownerType, deletedAt = Date.now()) {
   if (!db) return;
 
-  db.prepare(
-    `UPDATE avatar_index SET deleted_at = ? WHERE owner_id = ? AND owner_type = ?`,
-  ).run(deletedAt, ownerId, ownerType);
+  return db
+    .prepare(
+      `UPDATE avatar_index
+       SET deleted_at = CASE
+         WHEN deleted_at IS NULL THEN ?1 ELSE MIN(deleted_at, ?1) END
+       WHERE owner_id = ?2 AND owner_type = ?3`,
+    )
+    .run(deletedAt, ownerId, ownerType);
 }
 
 /**

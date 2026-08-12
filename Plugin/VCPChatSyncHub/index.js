@@ -8,6 +8,7 @@ const {
   initDb,
   getDb,
   closeDb,
+  getEntityIndex,
   upsertEntityIndex,
   upsertAttachmentIndex,
   upsertAvatarIndex,
@@ -33,6 +34,7 @@ const { handleSyncTopicHashBatch, handleSyncMessageDiffBatch } = require("./sync
 const { ingestHistoryToDb } = require("./sync/message");
 const { isWriteLocked, sanitizeId, deleteEntity, deleteMessage } = require("./sync/entity");
 const { getLogger, resetLogger } = require("./core/logger");
+const { createPhaseAck, createVersionAck } = require("./protocol");
 const {
   AGENT_SYNC_FIELDS,
   GROUP_SYNC_FIELDS,
@@ -42,7 +44,6 @@ const {
   extractGroupDTO,
   extractTopicDTO,
 } = require("./dto");
-
 let chokidar = null;
 let activeWatcher = null;
 let cleanupTimer = null;
@@ -57,19 +58,19 @@ try {
 async function initializeRoutes(app, pluginConfig, projectBasePath) {
   const syncToken = String(pluginConfig.MobileSyncToken || "").trim();
   if (!syncToken || syncToken === "your_super_secret_token_here") {
-    console.error(
-      "[VCPChatSyncHub] MobileSyncToken is required. Copy config.env.example to config.env and set a strong token.",
+    throw new Error(
+      "MobileSyncToken is required. Copy config.env.example to config.env and set a strong token.",
     );
-    return;
   }
 
-  shutdown();
+  await shutdown();
 
   const configuredDataPath = String(pluginConfig.SyncHubAppDataPath || "").trim();
   const appDataPath = configuredDataPath
     ? path.resolve(projectBasePath, configuredDataPath)
     : path.join(__dirname, "data", "AppData");
   const wsPort = parseInt(pluginConfig.MobileSyncPort) || 5975;
+  const centralSync = null;
 
   await Promise.all([
     fs.mkdir(path.join(appDataPath, "Agents"), { recursive: true }),
@@ -99,27 +100,39 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
           // Avatar 仍由本插件的兼容资产目录（内存 avatar_index + 物理文件）
           // 负责。不能把 avatar Manifest 转给 CDS，否则 CDS 会把本地清单
           // 视为空集，生成错误的全量 PUSH，并破坏 Owner Metadata 阶段。
+          if (centralSync && payload.dataType !== "avatar") {
+            return centralSync.handleSyncManifest(payload);
+          }
           return handleSyncManifest(payload);
         }
         case "GET_MESSAGE_MANIFEST": {
           logger.logOperation("websocket", "message", payload.type, "info", `topicId=${payload.topicId}`);
-          return handleMessageManifest(payload);
+          return centralSync
+            ? centralSync.handleMessageManifest(payload)
+            : handleMessageManifest(payload);
         }
         case "SYNC_TOPIC_HASH_BATCH": {
           const topicCount = Object.keys(payload.hashes || {}).length;
           logger.logOperation("websocket", "message", payload.type, "info", `topics=${topicCount}`);
-          return handleSyncTopicHashBatch(payload);
+          return centralSync
+            ? centralSync.handleTopicHashBatch(payload)
+            : handleSyncTopicHashBatch(payload);
         }
         case "SYNC_TOPIC_HASH_BATCH_V2": {
           const topicCount = Object.keys(payload.hashes || {}).length;
           logger.logOperation("websocket", "message", payload.type, "info", `topics=${topicCount}`);
+          if (centralSync) {
+            return centralSync.handleTopicHashBatch(payload);
+          }
           const { handleSyncTopicHashBatchV2 } = require("./sync/diff");
           return handleSyncTopicHashBatchV2(payload);
         }
         case "SYNC_MESSAGE_DIFF_BATCH": {
           const topicCount = Object.keys(payload.topics || {}).length;
           logger.logOperation("websocket", "message", payload.type, "info", `topics=${topicCount}`);
-          return handleSyncMessageDiffBatch(payload);
+          return centralSync
+            ? centralSync.handleMessageDiffBatch(payload)
+            : handleSyncMessageDiffBatch(payload);
         }
         case "PHASE_START": {
           const phase = payload.phase || "owner_metadata";
@@ -127,80 +140,198 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
 
           // 所有 manifest 已在 SYNC_MANIFEST 阶段由手机端主动发送并处理完毕。
           // PHASE_START 仅作为阶段确认，不再返回冗余的 PHASE_MANIFESTS。
-          return { type: "PHASE_ACK", phase };
+          return createPhaseAck(payload);
         }
         case "PHASE_COMPLETED": {
           const phase = payload.phase || "owner_metadata";
+          if (
+            centralSync &&
+            (phase === "owner_metadata" || phase === "topic_metadata")
+          ) {
+            // Entity/topic files are written by the plugin while CDS owns the
+            // central SQLite view. Do not acknowledge the phase until that view
+            // has durably observed the parent records needed by later messages.
+            await centralSync.reconcile();
+          }
           logger.completePhase(phase);
-          return { type: "PHASE_ACK", phase };
+          return createPhaseAck(payload, { echoFinalIdentity: true });
         }
         case "SYNC_ENTITY_UPDATE": {
           const { id, dataType, hash, ts } = payload;
+          if (
+            typeof id !== "string" ||
+            sanitizeId(id) !== id ||
+            !["agent", "group", "topic", "agent_topic", "group_topic"].includes(dataType) ||
+            typeof hash !== "string" ||
+            !/^[a-f0-9]{64}$/.test(hash) ||
+            !Number.isSafeInteger(ts) ||
+            ts < 0
+          ) {
+            throw Object.assign(new Error("SYNC_ENTITY_UPDATE contains invalid fields"), {
+              code: "SYNC_PROTOCOL_INVALID",
+            });
+          }
           logger.logOperation("websocket", "entity_update", id, "info", `type=${dataType}`);
 
-          const { upsertEntityIndex } = require("./core/db");
-          upsertEntityIndex(id, dataType, null, hash, ts);
+          // 旧通知只携带派生哈希，无法更新 CDS 完整数据；中央模式等待
+          // 随后的实体 HTTP 上传或消息 Push，不再双写私有数据库。
+          if (!centralSync) {
+            const existing = getEntityIndex(id, dataType);
+            if (!existing?.file_path) {
+              throw Object.assign(
+                new Error(`Cannot update missing local entity ${dataType}/${id}`),
+                { code: "SYNC_ENTITY_NOT_FOUND" },
+              );
+            }
+            upsertEntityIndex(id, dataType, existing.file_path, hash, ts);
+          }
 
           return { type: "SYNC_ACK", id };
         }
         case "VERSION_CHECK": {
           const manifest = require("./plugin-manifest.json");
           logger.logOperation("websocket", "version_check", "mobile", "info", `mobileVersion=${payload.mobileVersion}, pluginVersion=${manifest.version}`);
-          return { type: "VERSION_ACK", version: manifest.version };
+          return createVersionAck(payload, manifest.version);
         }
-        case "SYNC_DELETE_NOTIFY": {
-          const { id, dataType } = payload;
-          const safeId = sanitizeId(id);
-          const deletedAt = Date.now();
+        case "SYNC_ENTITY_DELETE": {
+          const { id: rawId, dataType, topicId } = payload;
+          const deletedAt = payload.deletedAt;
+          let safeId = "";
+          let avatarOwnerType = null;
+          if (dataType === "avatar" && typeof rawId === "string") {
+            const separator = rawId.indexOf(":");
+            if (separator > 0 && separator === rawId.lastIndexOf(":")) {
+              avatarOwnerType = rawId.slice(0, separator);
+              const ownerId = rawId.slice(separator + 1);
+              if (
+                ["agent", "group", "user"].includes(avatarOwnerType) &&
+                sanitizeId(ownerId) === ownerId &&
+                (avatarOwnerType !== "user" || ownerId === "user_avatar")
+              ) {
+                safeId = ownerId;
+              }
+            }
+          } else if (typeof rawId === "string" && sanitizeId(rawId) === rawId) {
+            safeId = rawId;
+          }
 
-          if (!safeId || !dataType) {
-            logger.logOperation("websocket", "delete_notify", id || "unknown", "warn", "missing id or dataType");
+          if (
+            !safeId ||
+            ![
+              "agent",
+              "group",
+              "topic",
+              "agent_topic",
+              "group_topic",
+              "avatar",
+              "message",
+            ].includes(dataType) ||
+            !Number.isSafeInteger(deletedAt) ||
+            deletedAt < 0
+          ) {
+            const error = new Error(
+              "SYNC_ENTITY_DELETE requires id, dataType and non-negative integer deletedAt",
+            );
+            error.code = "SYNC_DELETE_INVALID";
+            throw error;
+          }
+
+          if (centralSync) {
+            if (dataType === "message") {
+              if (
+                typeof topicId !== "string" ||
+                !sanitizeId(topicId) ||
+                sanitizeId(topicId) !== topicId
+              ) {
+                const error = new Error(
+                  "Message delete requires a non-empty topicId",
+                );
+                error.code = "SYNC_DELETE_INVALID";
+                throw error;
+              }
+              await centralSync.deleteMessage({
+                topicId: sanitizeId(topicId),
+                msgId: safeId,
+                deletedAt,
+              });
+            } else {
+              const result = await deleteEntity({
+                id: safeId,
+                type: dataType,
+                ownerType: avatarOwnerType,
+                deletedAt,
+                appDataPath,
+              });
+              if (!result?.success) {
+                const error = new Error(result?.error || "entity delete failed");
+                error.code = "SYNC_DELETE_FAILED";
+                throw error;
+              }
+              await centralSync.reconcile();
+            }
             return { type: "SYNC_ACK", id: safeId };
           }
 
           if (dataType === "message") {
-            deleteMessage({ msgId: safeId, deletedAt });
+            const safeTopicId = sanitizeId(topicId);
+            if (!safeTopicId || safeTopicId !== topicId) {
+              const error = new Error("Message delete requires a non-empty topicId");
+              error.code = "SYNC_DELETE_INVALID";
+              throw error;
+            }
+            const result = await deleteMessage({
+              msgId: safeId,
+              deletedAt,
+              topicId: safeTopicId,
+              appDataPath,
+            });
+            if (!result?.success) throw new Error(result?.error || "message delete failed");
             logger.logOperation("websocket", "delete_notify", safeId, "success", "type=message");
           } else if (dataType === "avatar") {
-            const parts = safeId.split(":");
-            if (parts.length === 2) {
-              deleteEntity({ id: parts[1], type: "avatar", deletedAt, appDataPath });
-              logger.logOperation("websocket", "delete_notify", safeId, "success", "type=avatar");
-            } else {
-              logger.logOperation("websocket", "delete_notify", safeId, "warn", "invalid avatar id format");
-            }
+            const result = await deleteEntity({
+              id: safeId,
+              type: "avatar",
+              ownerType: avatarOwnerType,
+              deletedAt,
+              appDataPath,
+            });
+            if (!result?.success) throw new Error(result?.error || "avatar delete failed");
+            logger.logOperation("websocket", "delete_notify", rawId, "success", "type=avatar");
           } else {
-            deleteEntity({ id: safeId, type: dataType, deletedAt, appDataPath });
+            const result = await deleteEntity({ id: safeId, type: dataType, deletedAt, appDataPath });
+            if (!result?.success) throw new Error(result?.error || "entity delete failed");
             logger.logOperation("websocket", "delete_notify", safeId, "success", `type=${dataType}`);
           }
 
-          return { type: "SYNC_ACK", id: safeId };
+          return { type: "SYNC_ACK", id: rawId };
         }
         default:
           logger.logOperation("websocket", "unknown_message", payload.type, "warn");
-          return null;
+          throw Object.assign(
+            new Error(`Unsupported sync frame type: ${payload.type || "missing"}`),
+            { code: "SYNC_PROTOCOL_INVALID" },
+          );
       }
     },
   });
 
   // HTTP/NDJSON 传输层保持兼容，消息数据面由所选后端提供。
-  registerHttpRoutes(app, { syncToken, appDataPath });
+  registerHttpRoutes(app, { syncToken, appDataPath, centralSync });
 
   // 中央模式由 CDS 的 notify/reconcile 独占历史监听和消息墓碑持久化。
-  if (chokidar) {
+  if (!centralSync && chokidar) {
     activeWatcher = startFileWatcher(appDataPath);
   }
 
-  cleanupTimer = setInterval(
-    () => {
-      cleanupOldDeletedRecords();
-    },
-    60 * 60 * 1000,
-  );
-  cleanupTimer.unref?.();
-  cleanupOldDeletedRecords();
-
-  logger.logInfo("system", `中心同步数据目录: ${appDataPath}`);
+  if (!centralSync) {
+    cleanupTimer = setInterval(
+      () => {
+        cleanupOldDeletedRecords();
+      },
+      60 * 60 * 1000,
+    );
+    cleanupOldDeletedRecords();
+  }
 }
 
 /**
@@ -222,16 +353,14 @@ async function reconcileCompatibilityAssets(appDataPath) {
       const filePath = path.join(attachmentsDir, file);
       const stats = await fs.stat(filePath);
       if (!stats.isFile()) continue;
-      let hash = file.split(".")[0];
-      if (!/^[a-f0-9]{64}$/i.test(hash)) {
+      let hash = file.split(".")[0].toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(hash)) {
         hash = computeBinaryHash(await fs.readFile(filePath));
       }
       upsertAttachmentIndex(hash, filePath, now);
     }
   } catch (error) {
-    if (error.code !== "ENOENT") {
-      logger.logOperation("central", "attachment_catalog", "batch", "error", error.message);
-    }
+    if (error.code !== "ENOENT") throw error;
   }
 
   try {
@@ -243,7 +372,9 @@ async function reconcileCompatibilityAssets(appDataPath) {
       computeBinaryHash(await fs.readFile(avatar)),
       now,
     );
-  } catch {}
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
 
   await scanEntities(
     path.join(appDataPath, "Agents"),
@@ -275,11 +406,9 @@ async function reconcileLocalFiles(appDataPath) {
   logger.logInfo("reconcile", "正在执行轻量级索引扫描...");
 
   // 物理清除任何残留的 default 脏话题索引以及冗余的 agent_topic / group_topic 类型记录
-  try {
-    db.prepare("DELETE FROM entity_index WHERE id = 'default'").run();
-    db.prepare("DELETE FROM message_index WHERE topic_id = 'default'").run();
-    db.prepare("DELETE FROM entity_index WHERE type = 'agent_topic' OR type = 'group_topic'").run();
-  } catch (e) {}
+  db.prepare("DELETE FROM entity_index WHERE id = 'default'").run();
+  db.prepare("DELETE FROM message_index WHERE topic_id = 'default'").run();
+  db.prepare("DELETE FROM entity_index WHERE type = 'agent_topic' OR type = 'group_topic'").run();
 
   const agentsDir = path.join(appDataPath, "Agents");
   const groupsDir = path.join(appDataPath, "AgentGroups");
@@ -294,31 +423,26 @@ async function reconcileLocalFiles(appDataPath) {
   let messageCount = 0;
 
   // 1. 扫描附件
+  let attachmentFiles = [];
   try {
-    if (await fs.access(attachmentsDir).then(() => true).catch(() => false)) {
-      const files = await fs.readdir(attachmentsDir);
+    attachmentFiles = await fs.readdir(attachmentsDir);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    logger.logInfo("reconcile", `附件目录不存在: ${attachmentsDir}`, "warn");
+  }
+  for (const file of attachmentFiles) {
+    const filePath = path.join(attachmentsDir, file);
+    const stats = await fs.stat(filePath);
+    if (!stats.isFile()) continue;
 
-      for (const file of files) {
-        const filePath = path.join(attachmentsDir, file);
-        const stats = await fs.stat(filePath);
-        if (!stats.isFile()) continue;
-
-        let hash = file.split('.')[0];
-        let fromFilename = true;
-        if (!/^[a-f0-9]{64}$/i.test(hash)) {
-          const buffer = await fs.readFile(filePath);
-          hash = computeBinaryHash(buffer);
-          fromFilename = false;
-        }
-
-        upsertAttachmentIndex(hash, filePath, now);
-        attachmentCount++;
-      }
-    } else {
-      logger.logInfo("reconcile", `附件目录不存在: ${attachmentsDir}`, "warn");
+    let hash = file.split('.')[0].toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(hash)) {
+      const buffer = await fs.readFile(filePath);
+      hash = computeBinaryHash(buffer);
     }
-  } catch (e) {
-    logger.logOperation("reconcile", "attachment", "batch", "error", e.message);
+
+    upsertAttachmentIndex(hash, filePath, now);
+    attachmentCount++;
   }
 
   // 2. 扫描系统级头像 (用户头像)
@@ -327,8 +451,8 @@ async function reconcileLocalFiles(appDataPath) {
     const buffer = await fs.readFile(userAvatarPath);
     const hash = computeBinaryHash(buffer);
     upsertAvatarIndex("user_avatar", "user", userAvatarPath, hash, now);
-  } catch (e) {
-    // 可能用户还没设置头像，忽略
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
   }
 
   // 3. 扫描智能体与群组
@@ -394,65 +518,69 @@ const SYSTEM_FOLDERS = [
 async function scanEntities(baseDir, type, db, now, appDataPath, logger) {
   let count = 0;
   let topicCount = 0;
+  let entries;
   try {
-    const entries = await fs.readdir(baseDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if (SYSTEM_FOLDERS.includes(entry.name)) continue;
+    entries = await fs.readdir(baseDir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") return { count, topicCount };
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (SYSTEM_FOLDERS.includes(entry.name)) continue;
 
-      const entityDir = path.join(baseDir, entry.name);
-      const configPath = path.join(entityDir, "config.json");
+    const entityDir = path.join(baseDir, entry.name);
+    const configPath = path.join(entityDir, "config.json");
 
-      try {
-        const content = await fs.readFile(configPath, "utf-8");
-        const config = JSON.parse(content);
-        const id = config.id || entry.name;
-
-        // 索引主实体 (V2: 使用 DTO 提取以对齐默认值处理)
-        const dto = type === "agent" ? extractAgentDTO(config) : extractGroupDTO(config);
-        const hash = computeDtoHash(
-          dto,
-          type === "agent" ? AGENT_SYNC_FIELDS : GROUP_SYNC_FIELDS,
-        );
-        upsertEntityIndex(id, type, configPath, hash, now);
-        count++;
-
-        const topicLen = Array.isArray(config.topics) ? config.topics.length : 0;
-        if (topicLen > 0) {
-          topicCount += topicLen;
-        }
-        // 索引头像
-        const avatarExts = ["png", "jpg", "jpeg", "webp", "gif"];
-        for (const ext of avatarExts) {
-          const avatarPath = path.join(entityDir, `avatar.${ext}`);
-          try {
-            const buffer = await fs.readFile(avatarPath);
-            const avatarHash = computeBinaryHash(buffer);
-            upsertAvatarIndex(id, type, avatarPath, avatarHash, now);
-            break;
-          } catch {}
-        }
-
-        // 索引子话题（跳过 default 内部 topic）
-        if (Array.isArray(config.topics)) {
-          for (const topic of config.topics) {
-            if (topic.id === "default") continue;
-            const topicDto = extractTopicDTO(topic, id, type);
-            const topicHash = computeDtoHash(
-              topicDto,
-              type === "group"
-                ? GROUP_TOPIC_SYNC_FIELDS
-                : AGENT_TOPIC_SYNC_FIELDS,
-            );
-            upsertEntityIndex(topic.id, "topic", configPath, topicHash, now);
-          }
-        }
-      } catch (e) {
-        logger.logOperation("reconcile", type, entry.name, "error", e.message);
+    try {
+      const content = await fs.readFile(configPath, "utf-8");
+      const config = JSON.parse(content);
+      if (!config || typeof config !== "object" || Array.isArray(config)) {
+        throw new Error("Entity config root must be an object");
       }
+      const id = config.id || entry.name;
+
+      // 索引主实体 (V2: 使用 DTO 提取以对齐默认值处理)
+      const dto = type === "agent" ? extractAgentDTO(config) : extractGroupDTO(config);
+      const hash = computeDtoHash(
+        dto,
+        type === "agent" ? AGENT_SYNC_FIELDS : GROUP_SYNC_FIELDS,
+      );
+      upsertEntityIndex(id, type, configPath, hash, now);
+      count++;
+
+      const topicLen = Array.isArray(config.topics) ? config.topics.length : 0;
+      if (topicLen > 0) topicCount += topicLen;
+      const avatarExts = ["png", "jpg", "jpeg", "webp", "gif"];
+      for (const ext of avatarExts) {
+        const avatarPath = path.join(entityDir, `avatar.${ext}`);
+        try {
+          const buffer = await fs.readFile(avatarPath);
+          const avatarHash = computeBinaryHash(buffer);
+          upsertAvatarIndex(id, type, avatarPath, avatarHash, now);
+          break;
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      }
+
+      if (Array.isArray(config.topics)) {
+        for (const topic of config.topics) {
+          if (topic.id === "default") continue;
+          const topicDto = extractTopicDTO(topic, id, type);
+          const topicHash = computeDtoHash(
+            topicDto,
+            type === "group"
+              ? GROUP_TOPIC_SYNC_FIELDS
+              : AGENT_TOPIC_SYNC_FIELDS,
+          );
+          upsertEntityIndex(topic.id, "topic", configPath, topicHash, now);
+        }
+      }
+    } catch (error) {
+      logger.logOperation("reconcile", type, entry.name, "error", error.message);
+      throw error;
     }
-  } catch (e) {
-    logger.logOperation("reconcile", type, "batch", "error", e.message);
   }
   return { count, topicCount };
 }
@@ -462,34 +590,39 @@ async function scanEntities(baseDir, type, db, now, appDataPath, logger) {
  */
 async function scanHistory(userDataDir, db, logger) {
   let totalMessages = 0;
+  let entries;
   try {
-    const entries = await fs.readdir(userDataDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if (SYSTEM_FOLDERS.includes(entry.name)) continue;
+    entries = await fs.readdir(userDataDir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") return 0;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (SYSTEM_FOLDERS.includes(entry.name)) continue;
 
-      const agentId = entry.name;
-      const topicsDir = path.join(userDataDir, agentId, "topics");
-      try {
-        const topicFolders = await fs.readdir(topicsDir);
-        for (const topicId of topicFolders) {
-          if (topicId === "default") continue;
-          const historyPath = path.join(topicsDir, topicId, "history.json");
-          try {
-            const content = await fs.readFile(historyPath, "utf-8");
-            const history = JSON.parse(content);
-            const msgCount = Array.isArray(history) ? history.length : 0;
-            totalMessages += msgCount;
-            await ingestHistoryToDb(historyPath, topicId, "reconcile");
-          } catch (e) {
-            // ENOENT（文件不存在）在 reconcile 阶段很常见，降级为静默跳过
-            if (e.code === "ENOENT") continue;
-            logger.logOperation("reconcile", "history", topicId, "error", e.message);
-          }
-        }
-      } catch {}
+    const topicsDir = path.join(userDataDir, entry.name, "topics");
+    let topicFolders;
+    try {
+      topicFolders = await fs.readdir(topicsDir, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw error;
     }
-  } catch {}
+    for (const topicEntry of topicFolders) {
+      if (!topicEntry.isDirectory() || topicEntry.name === "default") continue;
+      const topicId = topicEntry.name;
+      const historyPath = path.join(topicsDir, topicId, "history.json");
+      try {
+        const { history } = await readHistoryStrict(historyPath);
+        totalMessages += history.length;
+        await ingestHistoryToDb(historyPath, topicId, "reconcile");
+      } catch (error) {
+        logger.logOperation("reconcile", "history", topicId, "error", error.message);
+        throw error;
+      }
+    }
+  }
   return totalMessages;
 }
 
@@ -499,7 +632,9 @@ async function scanHistory(userDataDir, db, logger) {
 function computeAggregatedHashes(db, logger) {
   let updatedCount = 0;
   const entities = db
-    .prepare("SELECT id, type, hash, aggregated_hash, file_path FROM entity_index")
+    .prepare(
+      "SELECT id, type, hash, aggregated_hash, file_path FROM entity_index WHERE deleted_at IS NULL",
+    )
     .all();
 
   // 1. 预加载所有 Topic 并按 Parent ID 分组，消除 N+1 查询
@@ -664,9 +799,11 @@ async function ingestConfigToDb(configPath, type) {
   }
 }
 
-function shutdown() {
+async function shutdown() {
   if (activeWatcher) {
-    void activeWatcher.close().catch(() => {});
+    try {
+      await activeWatcher.close();
+    } catch {}
     activeWatcher = null;
   }
   if (cleanupTimer) {
@@ -678,11 +815,11 @@ function shutdown() {
 }
 
 function registerRoutes(app, pluginConfig, projectBasePath) {
-  // PluginManager's legacy route hook is synchronous and does not await a
-  // returned Promise, so contain asynchronous initialization errors here.
-  void initializeRoutes(app, pluginConfig, projectBasePath).catch((error) => {
+  // VCPToolBox's legacy service hook is synchronous, so contain async startup
+  // failures here and leave the plugin fully shut down on error.
+  void initializeRoutes(app, pluginConfig, projectBasePath).catch(async (error) => {
     console.error("[VCPChatSyncHub] Initialization failed:", error);
-    shutdown();
+    await shutdown();
   });
 }
 

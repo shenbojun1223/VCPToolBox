@@ -2,7 +2,7 @@
 
 VCPChatSyncHub turns VCPToolBox into a central data plane shared by multiple
 VCPChat desktop clients and VCPMobile. It keeps the upstream Mobile Sync V2
-transport and AppData-compatible entity layout, including agents, groups,
+transport on wire protocol 1.1 and the AppData-compatible entity layout, including agents, groups,
 topics, messages, avatars, attachments and deletion tombstones.
 
 ## Configure
@@ -29,8 +29,11 @@ without TLS on an untrusted network.
 
 Use the VCPToolBox public base URL as the mobile HTTP service URL and the public
 WebSocket URL as the mobile WebSocket service URL. The protocol is inherited
-from upstream VCPMobileSync, so existing Mobile Sync V2 clients can use the hub
-without changing their payload format.
+from upstream VCPMobileSync 1.1. The first WebSocket business frame must be a
+`VERSION_CHECK` with `protocolVersion: "1.1"`; incompatible clients fail closed.
+
+The hub also retains three authenticated desktop-only HTTP endpoints under
+`/api/mobile-sync/desktop/*` for complete Agent and Group configuration sync.
 
 ## Storage and backup
 

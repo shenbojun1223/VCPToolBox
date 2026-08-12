@@ -19,14 +19,18 @@ cleanupTimer.unref?.();
 /**
  * 检查操作是否重复（幂等性检查）
  * @param {string} opId - 操作 ID
- * @returns {{ duplicate: boolean, result?: any }}
+ * @returns {{ duplicate: boolean, result?: any, statusCode?: number }}
  */
 function checkIdempotency(opId) {
   if (!opId) return { duplicate: false };
 
   const existing = recentOperations.get(opId);
   if (existing && Date.now() - existing.timestamp < IDEMPOTENCY_TTL) {
-    return { duplicate: true, result: existing.result };
+    return {
+      duplicate: true,
+      result: existing.result,
+      statusCode: existing.statusCode,
+    };
   }
   return { duplicate: false };
 }
@@ -35,10 +39,11 @@ function checkIdempotency(opId) {
  * 记录操作结果
  * @param {string} opId - 操作 ID
  * @param {any} result - 操作结果
+ * @param {number} statusCode - 原始 HTTP 状态，重放时不得把失败改成 200
  */
-function recordOperation(opId, result) {
+function recordOperation(opId, result, statusCode = 200) {
   if (!opId) return;
-  recentOperations.set(opId, { timestamp: Date.now(), result });
+  recentOperations.set(opId, { timestamp: Date.now(), result, statusCode });
 }
 
 module.exports = {

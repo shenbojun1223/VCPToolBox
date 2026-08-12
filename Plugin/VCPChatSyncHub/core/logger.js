@@ -1,7 +1,7 @@
 /**
  * SyncLogger - 桌面端同步日志系统
  * 结构与手机端对齐：Session → Phase → Operation
- * 前缀强制为 [VCPChatSyncHub]，支持文件持久化与 WebSocket 广播
+ * 前缀强制为 [VCPMobileSync]，支持文件持久化与 WebSocket 广播
  */
 
 const fs = require("fs");
@@ -46,14 +46,14 @@ class SyncLogger {
         toDelete.forEach(file => {
           try {
             fs.unlinkSync(file.path);
-            console.log(`[VCPChatSyncHub] Purged old log: ${file.name}`);
+            console.log(`[VCPMobileSync] Purged old log: ${file.name}`);
           } catch (e) {
-            console.error(`[VCPChatSyncHub] Failed to delete old log ${file.name}:`, e);
+            console.error(`[VCPMobileSync] Failed to delete old log ${file.name}:`, e);
           }
         });
       }
     } catch (err) {
-      console.error("[VCPChatSyncHub] Error during cleaning up old logs:", err);
+      console.error("[VCPMobileSync] Error during cleaning up old logs:", err);
     }
   }
 
@@ -200,7 +200,7 @@ class SyncLogger {
 
   log(message) {
     const timestamp = new Date().toLocaleTimeString();
-    console.log(`[VCPChatSyncHub] [${timestamp}] ${message}`);
+    console.log(`[VCPMobile] [${timestamp}] ${message}`);
   }
 
   writeToFile(message) {
