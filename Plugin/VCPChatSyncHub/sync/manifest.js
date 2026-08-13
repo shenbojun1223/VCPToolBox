@@ -231,10 +231,16 @@ function normalizeRemoteManifestItem(item, dataType, index) {
       throw syncContractError(`Topic manifest ${id} requires agent/group ownerType`);
     }
     normalized.ownerType = item.ownerType;
-    normalized.ownerId = requireNonEmptyString(
-      item.ownerId,
-      `Topic manifest ${id} ownerId`,
-    );
+    // VCPMobile 1.1.3's EntityState intentionally carries ownerType but not
+    // ownerId. Keep rejecting explicit null/empty values while accepting the
+    // genuinely omitted legacy field. Existing topics are resolved against
+    // the desktop index below; new topics upload a full DTO containing ownerId.
+    if (item.ownerId !== undefined) {
+      normalized.ownerId = requireNonEmptyString(
+        item.ownerId,
+        `Topic manifest ${id} ownerId`,
+      );
+    }
   }
   return normalized;
 }
@@ -243,22 +249,38 @@ function matchesTopicOwnerType(value) {
   return value === "agent" || value === "group";
 }
 
-function assertSameTopicOwner(remote, local) {
+function resolveTopicOwner(remote, local, ownerFilter) {
+  if (remote.ownerId !== undefined && !ownerFilter.has(remote.ownerId)) {
+    throw syncContractError(
+      `Topic ${remote.id} owner is outside targetedOwners`,
+      "SYNC_OWNER_CONFLICT",
+    );
+  }
+
+  if (!local) {
+    // Do not guess ownership for a new legacy topic. Match the upstream 1.0
+    // desktop plugin and omit ownerId; VCPMobile reads the authoritative value
+    // from its own topic row before uploading the complete topic DTO.
+    return;
+  }
+
   if (
     remote.ownerType !== local.ownerType ||
-    remote.ownerId !== local.ownerId
+    (remote.ownerId !== undefined && remote.ownerId !== local.ownerId)
   ) {
     throw syncContractError(
       `Topic ${remote.id} owner conflicts with the desktop index`,
       "SYNC_OWNER_CONFLICT",
     );
   }
+  remote.ownerId = local.ownerId;
 }
 
 function actionIdentity(item, dataType) {
-  return dataType === "topic"
-    ? { ownerType: item.ownerType, ownerId: item.ownerId }
-    : {};
+  if (dataType !== "topic") return {};
+  const identity = { ownerType: item.ownerType };
+  if (item.ownerId !== undefined) identity.ownerId = item.ownerId;
+  return identity;
 }
 
 function handleSyncManifest(payload, database = getDb()) {
@@ -295,6 +317,9 @@ function handleSyncManifest(payload, database = getDb()) {
   if (dataType === "topic" && ownerFilter === null) {
     throw syncContractError("Topic manifest requires targetedOwners");
   }
+  if (dataType === "topic" && ownerFilter.size === 0 && remoteItems.length > 0) {
+    throw syncContractError("Non-empty topic manifest requires targetedOwners");
+  }
   const normalizedRemoteItems = remoteItems.map((item, index) =>
     normalizeRemoteManifestItem(item, dataType, index),
   );
@@ -308,14 +333,25 @@ function handleSyncManifest(payload, database = getDb()) {
 
   const localItems = getLocalManifest(dataType, targetedOwners, database);
   const localById = new Map(localItems.map((item) => [item.id, item]));
+  const indexedTopicById = dataType === "topic"
+    ? new Map(getLocalManifest("topic", null, database).map((item) => [item.id, item]))
+    : null;
   const results = [];
   const processedIds = new Set();
 
   for (const remote of normalizedRemoteItems) {
-    const local = localById.get(remote.id);
+    let local = localById.get(remote.id);
     const remoteDeletedAt = remote.deletedAt;
-    if (dataType === "topic" && local) {
-      assertSameTopicOwner(remote, local);
+    if (dataType === "topic") {
+      const indexedLocal = indexedTopicById.get(remote.id);
+      if (indexedLocal && !ownerFilter.has(indexedLocal.ownerId)) {
+        throw syncContractError(
+          `Topic ${remote.id} exists outside targetedOwners`,
+          "SYNC_OWNER_CONFLICT",
+        );
+      }
+      local = indexedLocal || local;
+      resolveTopicOwner(remote, local, ownerFilter);
     }
 
     if (remoteDeletedAt !== null) {

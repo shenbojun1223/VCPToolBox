@@ -20,7 +20,11 @@ class SyncLogger {
   constructor() {
     this.currentSession = null;
     this.currentPhase = "system"; // 默认相位
-    this.logDir = path.join(__dirname, "..", "logs", "sync");
+    // Tests can point the singleton at an isolated temporary directory before
+    // loading sync modules. Production keeps the established plugin path.
+    this.logDir = process.env.VCP_MOBILE_SYNC_LOG_DIR
+      ? path.resolve(process.env.VCP_MOBILE_SYNC_LOG_DIR)
+      : path.join(__dirname, "..", "logs", "sync");
     if (!fs.existsSync(this.logDir)) {
       fs.mkdirSync(this.logDir, { recursive: true });
     }

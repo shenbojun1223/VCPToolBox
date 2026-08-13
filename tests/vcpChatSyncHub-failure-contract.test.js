@@ -4,7 +4,16 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { test } = require("node:test");
+const { after, test } = require("node:test");
+
+const syncLogTestDir = fs.mkdtempSync(
+  path.join(os.tmpdir(), "vcp-chat-sync-hub-test-logs-"),
+);
+process.env.VCP_MOBILE_SYNC_LOG_DIR = syncLogTestDir;
+after(() => {
+  delete process.env.VCP_MOBILE_SYNC_LOG_DIR;
+  fs.rmSync(syncLogTestDir, { recursive: true, force: true });
+});
 
 const {
   resolveCentralIndexPreference,
@@ -373,7 +382,6 @@ test("Topic manifest 使用复合 Owner 身份且不做路径模糊匹配", () =
         contentHash: "",
         ts: 1,
         ownerType: "agent",
-        ownerId: "agent-a",
       }],
     },
     database,
@@ -394,6 +402,54 @@ test("Topic manifest 使用复合 Owner 身份且不做路径模糊匹配", () =
           ts: 1,
           ownerType: "agent",
           ownerId: "agent-b",
+        }],
+      },
+      database,
+    ),
+    (error) => error.code === "SYNC_OWNER_CONFLICT",
+  );
+});
+
+test("VCPMobile 1.1.3 Topic Manifest 可省略 ownerId 且不会猜测多 Owner 归属", () => {
+  const hash = "c".repeat(64);
+  const database = fakeManifestDatabase();
+  const result = handleSyncManifest(
+    {
+      dataType: "topic",
+      phase: 2,
+      targetedOwners: ["agent-a", "agent-b"],
+      data: [{
+        id: "topic-mobile-only",
+        hash,
+        configHash: hash,
+        contentHash: "",
+        ts: 1,
+        ownerType: "agent",
+      }],
+    },
+    database,
+  );
+
+  assert.deepEqual(result.data, [{
+    id: "topic-mobile-only",
+    action: "PUSH",
+    ownerType: "agent",
+  }]);
+
+  assert.throws(
+    () => handleSyncManifest(
+      {
+        dataType: "topic",
+        phase: 2,
+        targetedOwners: ["agent-a", "agent-b"],
+        data: [{
+          id: "topic-outside-scope",
+          hash,
+          configHash: hash,
+          contentHash: "",
+          ts: 1,
+          ownerType: "agent",
+          ownerId: "agent-c",
         }],
       },
       database,

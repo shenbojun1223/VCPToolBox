@@ -36,7 +36,10 @@ version still fails closed. `VERSION_ACK` exposes both the mobile-compatible
 legacy `version: "1.0.0"` identifier and the actual desktop
 `pluginVersion: "1.1.0"`/`protocolVersion: "1.1"` fields. These values are
 deliberately independent: changing the hub package version must not break the
-mobile client's legacy package-version gate.
+mobile client's legacy package-version gate. VCPMobile 1.1.3 topic manifests
+also omit per-item `ownerId`; the hub resolves existing topics from its global
+index and lets new topics provide ownership in their subsequent full DTO. An
+explicit empty, out-of-scope, or conflicting owner still fails closed.
 
 The hub also retains three authenticated desktop-only HTTP endpoints under
 `/api/mobile-sync/desktop/*` for complete Agent and Group configuration sync.
