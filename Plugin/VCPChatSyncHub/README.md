@@ -39,7 +39,11 @@ deliberately independent: changing the hub package version must not break the
 mobile client's legacy package-version gate. VCPMobile 1.1.3 topic manifests
 also omit per-item `ownerId`; the hub resolves existing topics from its global
 index and lets new topics provide ownership in their subsequent full DTO. An
-explicit empty, out-of-scope, or conflicting owner still fails closed.
+explicit empty, out-of-scope, or conflicting owner still fails closed. Its
+Phase 2.5 double-hash frame also omits the newer compound `topics` array, and
+its Phase 3 message states omit `ownerType`/`ownerId`; for these read-only diff
+operations the hub uses its indexed topic owner, while continuing to validate
+any explicitly supplied compound identity.
 
 The hub also retains three authenticated desktop-only HTTP endpoints under
 `/api/mobile-sync/desktop/*` for complete Agent and Group configuration sync.

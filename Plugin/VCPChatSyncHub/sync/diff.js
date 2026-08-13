@@ -49,6 +49,9 @@ function requireTopicHashMap(payload, { doubleHash = false } = {}) {
 }
 
 function requireCompoundTopicStates(payload, entries) {
+  // VCPMobile 1.1.3 sends only the double-hash map. Newer desktop/mobile
+  // clients may additionally send compound owner states, which remain strict.
+  if (payload?.topics === undefined) return null;
   if (!Array.isArray(payload?.topics) || payload.topics.length !== entries.length) {
     throw Object.assign(
       new Error("SYNC_TOPIC_HASH_BATCH_V2.topics must exactly cover hashes"),
@@ -217,16 +220,18 @@ function handleSyncTopicHashBatchV2(payload, database = getDb()) {
         continue;
       }
 
-      const expectedOwner = topicStates.get(topicId);
       const actualOwner = indexedTopicOwner(topicRow.file_path);
-      if (
-        actualOwner.ownerType !== expectedOwner.ownerType ||
-        actualOwner.ownerId !== expectedOwner.ownerId
-      ) {
-        throw Object.assign(
-          new Error(`Topic hash owner identity conflicts for ${topicId}`),
-          { code: "SYNC_OWNER_CONFLICT" },
-        );
+      if (topicStates) {
+        const expectedOwner = topicStates.get(topicId);
+        if (
+          actualOwner.ownerType !== expectedOwner.ownerType ||
+          actualOwner.ownerId !== expectedOwner.ownerId
+        ) {
+          throw Object.assign(
+            new Error(`Topic hash owner identity conflicts for ${topicId}`),
+            { code: "SYNC_OWNER_CONFLICT" },
+          );
+        }
       }
 
       const localConfig = topicRow.hash || "";
@@ -293,6 +298,15 @@ function handleSyncMessageDiffBatch(payload, database = getDb()) {
   let messageCount = 0;
 
   for (const [topicId, localState] of Object.entries(topics)) {
+    const hasOwnerType = localState?.ownerType !== undefined;
+    const hasOwnerId = localState?.ownerId !== undefined;
+    const validOptionalOwner =
+      (!hasOwnerType && !hasOwnerId) ||
+      (hasOwnerType &&
+        hasOwnerId &&
+        ["agent", "group"].includes(localState.ownerType) &&
+        typeof localState.ownerId === "string" &&
+        localState.ownerId.length > 0);
     if (
       !topicId ||
       topicId === "default" ||
@@ -301,9 +315,7 @@ function handleSyncMessageDiffBatch(payload, database = getDb()) {
       Array.isArray(localState) ||
       typeof localState.topicHash !== "string" ||
       !CONTENT_HASH_PATTERN.test(localState.topicHash) ||
-      !["agent", "group"].includes(localState.ownerType) ||
-      typeof localState.ownerId !== "string" ||
-      localState.ownerId.length === 0 ||
+      !validOptionalOwner ||
       !localState.messages ||
       typeof localState.messages !== "object" ||
       Array.isArray(localState.messages)
@@ -350,10 +362,10 @@ function handleSyncMessageDiffBatch(payload, database = getDb()) {
       }
 
       const actualOwner = indexedTopicOwner(topicRow.file_path);
-      if (
+      if (hasOwnerType && (
         actualOwner.ownerType !== localState.ownerType ||
         actualOwner.ownerId !== localState.ownerId
-      ) {
+      )) {
         throw Object.assign(
           new Error(`Message diff owner identity conflicts for ${topicId}`),
           { code: "SYNC_OWNER_CONFLICT" },

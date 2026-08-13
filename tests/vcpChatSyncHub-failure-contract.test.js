@@ -131,14 +131,10 @@ test("Phase 3 decision 只返回严格判别联合且不在 diff 中执行删除
       topics: {
         "topic-live": {
           topicHash: "c".repeat(64),
-          ownerType: "agent",
-          ownerId: "agent-a",
           messages: { "message-1": "DELETED" },
         },
         "topic-missing": {
           topicHash: "",
-          ownerType: "agent",
-          ownerId: "agent-a",
           messages: {},
         },
       },
@@ -181,6 +177,22 @@ test("Phase 3 malformed hash 与 DB 查询错误都不能伪装成 no-op 完成"
               ownerType: "agent",
               ownerId: "agent-a",
               messages: { message: "not-a-hash" },
+            },
+          },
+        },
+        fakeDiffDatabase(),
+      ),
+    (error) => error.code === "SYNC_PROTOCOL_INVALID",
+  );
+  assert.throws(
+    () =>
+      handleSyncMessageDiffBatch(
+        {
+          topics: {
+            topic: {
+              topicHash: "",
+              ownerType: "agent",
+              messages: {},
             },
           },
         },
@@ -407,6 +419,45 @@ test("Topic manifest 使用复合 Owner 身份且不做路径模糊匹配", () =
       database,
     ),
     (error) => error.code === "SYNC_OWNER_CONFLICT",
+  );
+});
+
+test("VCPMobile 1.1.3 Phase 2.5 双哈希帧可省略 topics 复合身份", () => {
+  const configHash = "a".repeat(64);
+  const contentHash = "b".repeat(64);
+  const topicId = "topic-mobile-113";
+  const result = handleSyncTopicHashBatchV2(
+    {
+      hashes: {
+        [topicId]: { configHash, contentHash },
+      },
+    },
+    fakeDiffDatabase({
+      topics: {
+        [topicId]: {
+          hash: configHash,
+          aggregated_hash: contentHash,
+          file_path: "/app/Agents/agent-a/config.json",
+        },
+      },
+    }),
+  );
+
+  assert.deepEqual(result, {
+    type: "SYNC_TOPIC_HASH_RESULTS",
+    changedTopics: [],
+  });
+  assert.throws(
+    () => handleSyncTopicHashBatchV2(
+      {
+        hashes: {
+          [topicId]: { configHash, contentHash },
+        },
+        topics: [],
+      },
+      fakeDiffDatabase(),
+    ),
+    (error) => error.code === "SYNC_PROTOCOL_INVALID",
   );
 });
 
