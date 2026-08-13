@@ -138,7 +138,7 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   );
   assert.deepEqual(versionAck, {
     type: "VERSION_ACK",
-    version: "1.1.0",
+    version: "1.0.0",
     pluginVersion: "1.1.0",
     protocolVersion: "1.1",
   });
@@ -154,7 +154,7 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   );
   assert.deepEqual(mobileVersionAck, {
     type: "VERSION_ACK",
-    version: "1.1.0",
+    version: "1.0.0",
     pluginVersion: "1.1.0",
     protocolVersion: "1.1",
   });

@@ -3,6 +3,10 @@
 const FINAL_ACK_IDENTITY_FIELDS = ["sessionId", "attemptId", "nonce"];
 const WIRE_PROTOCOL_VERSION = "1.1";
 const EXPECTED_PLUGIN_VERSION = "1.1.0";
+// Official VCPMobile 1.1.3 validates the legacy `VERSION_ACK.version` field
+// against the upstream VCPMobileSync package version, independently from the
+// hub implementation version exposed to desktop clients.
+const MOBILE_COMPAT_PLUGIN_VERSION = "1.0.0";
 
 function parseJsonWithoutDuplicateKeys(text) {
   if (typeof text !== "string") {
@@ -159,9 +163,9 @@ function createVersionAck(payload, pluginVersion) {
   }
   return {
     type: "VERSION_ACK",
-    // `version` is the field consumed by the official mobile client. Keep the
-    // explicit fields for desktop clients and protocol-aware future clients.
-    version: pluginVersion,
+    // Keep the legacy mobile compatibility identifier independent from the
+    // actual hub package and wire versions exposed in the explicit fields.
+    version: MOBILE_COMPAT_PLUGIN_VERSION,
     pluginVersion,
     protocolVersion: WIRE_PROTOCOL_VERSION,
   };
@@ -193,6 +197,7 @@ function createPhaseAck(payload, { echoFinalIdentity = false } = {}) {
 
 module.exports = {
   EXPECTED_PLUGIN_VERSION,
+  MOBILE_COMPAT_PLUGIN_VERSION,
   WIRE_PROTOCOL_VERSION,
   createPhaseAck,
   createVersionAck,

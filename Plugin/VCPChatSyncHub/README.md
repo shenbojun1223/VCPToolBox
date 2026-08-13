@@ -33,7 +33,10 @@ from upstream VCPMobileSync 1.1. The first WebSocket business frame must be a
 `VERSION_CHECK`. Official VCPMobile 1.1.x clients may omit `protocolVersion`;
 desktop clients send `protocolVersion: "1.1"`, and an explicitly incompatible
 version still fails closed. `VERSION_ACK` exposes both the mobile-compatible
-`version` field and the desktop `pluginVersion`/`protocolVersion` fields.
+legacy `version: "1.0.0"` identifier and the actual desktop
+`pluginVersion: "1.1.0"`/`protocolVersion: "1.1"` fields. These values are
+deliberately independent: changing the hub package version must not break the
+mobile client's legacy package-version gate.
 
 The hub also retains three authenticated desktop-only HTTP endpoints under
 `/api/mobile-sync/desktop/*` for complete Agent and Group configuration sync.
