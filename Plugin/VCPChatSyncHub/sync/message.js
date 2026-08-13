@@ -115,6 +115,23 @@ async function writeHistoryAtomic(filePath, history, expectedSourceHash) {
   }
 }
 
+function indexedTopicOwner(filePath) {
+  const parts = String(filePath || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean);
+  const ownerId = parts.at(-2);
+  const ownerType = parts.includes("AgentGroups")
+    ? "group"
+    : parts.includes("Agents")
+      ? "agent"
+      : null;
+  if (!ownerType || !ownerId) {
+    throw new Error("Topic index has an invalid owner path");
+  }
+  return { ownerType, ownerId };
+}
+
 /**
  * 流式批量下载消息 (NDJSON) — 对标 Phase 3 万级话题 Pull
  *
@@ -122,7 +139,7 @@ async function writeHistoryAtomic(filePath, history, expectedSourceHash) {
  * 每个 topic 独立读取 history.json 后立即 flush，手机端逐行消费，
  * 不缓冲整个响应。单 topic 失败只影响自身，不中断流。
  *
- * @param {object[]} requests - [{ topicId, msgIds: string[] }]
+ * @param {object[]} requests - [{ topicId, msgIds: string[], ownerType?, ownerId? }]
  * @param {string} appDataPath - AppData 路径
  * @param {object} res - Express response (用于流式写入)
  */
@@ -167,12 +184,20 @@ async function downloadMessagesStreamRaw(requests, appDataPath, res) {
       ) {
         throw new Error("Message pull IDs must be non-empty strings and unique");
       }
+      const hasOwnerType = ownerType !== undefined;
+      const hasOwnerId = ownerId !== undefined;
+      if (hasOwnerType !== hasOwnerId) {
+        throw new Error("Message pull requires ownerType and ownerId together");
+      }
       if (
-        !["agent", "group"].includes(ownerType) ||
-        typeof ownerId !== "string" ||
-        ownerId.length === 0
+        hasOwnerType &&
+        (
+          !["agent", "group"].includes(ownerType) ||
+          typeof ownerId !== "string" ||
+          ownerId.length === 0
+        )
       ) {
-        throw new Error("Message pull requires exact ownerType and ownerId");
+        throw new Error("Message pull owner identity is invalid");
       }
       seenTopics.add(safeTopicId);
       assertHistoryTopicHealthy(safeTopicId);
@@ -187,11 +212,13 @@ async function downloadMessagesStreamRaw(requests, appDataPath, res) {
         continue;
       }
 
-      const parentId = path.basename(path.dirname(row.file_path));
-      const actualOwnerType = row.file_path.includes("AgentGroups") ? "group" : "agent";
+      const {
+        ownerType: actualOwnerType,
+        ownerId: parentId,
+      } = indexedTopicOwner(row.file_path);
       if (
-        ownerType !== actualOwnerType ||
-        ownerId !== parentId
+        hasOwnerType &&
+        (ownerType !== actualOwnerType || ownerId !== parentId)
       ) {
         throw new Error("topic owner identity conflicts with desktop index");
       }

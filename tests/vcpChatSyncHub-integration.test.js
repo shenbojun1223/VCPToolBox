@@ -189,4 +189,45 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   assert.deepEqual(JSON.parse(authorizedBody), {
     actions: [{ id: ownerId, type: "agent", action: "PULL" }],
   });
+
+  const mobileMessagePull = await fetch(`${baseUrl}/download-messages-stream`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-sync-token": token,
+    },
+    body: JSON.stringify({
+      requests: [{ topicId, msgIds: ["message-existing"] }],
+    }),
+  });
+  const mobileMessagePullText = await mobileMessagePull.text();
+  assert.equal(mobileMessagePull.status, 200, mobileMessagePullText);
+  const mobileMessageFrame = JSON.parse(mobileMessagePullText.trim());
+  assert.equal(mobileMessageFrame.topicId, topicId);
+  assert.equal(mobileMessageFrame.ownerType, "agent");
+  assert.equal(mobileMessageFrame.ownerId, ownerId);
+  assert.deepEqual(
+    mobileMessageFrame.messages.map((message) => message.id),
+    ["message-existing"],
+  );
+
+  const conflictingMessagePull = await fetch(`${baseUrl}/download-messages-stream`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-sync-token": token,
+    },
+    body: JSON.stringify({
+      requests: [{
+        topicId,
+        ownerType: "group",
+        ownerId,
+        msgIds: ["message-existing"],
+      }],
+    }),
+  });
+  const conflictingMessageFrame = JSON.parse(
+    (await conflictingMessagePull.text()).trim(),
+  );
+  assert.match(conflictingMessageFrame._error, /owner identity conflicts/);
 });

@@ -47,7 +47,10 @@ or Group hashes, still fail closed. Its
 Phase 2.5 double-hash frame also omits the newer compound `topics` array, and
 its Phase 3 message states omit `ownerType`/`ownerId`; for these read-only diff
 operations the hub uses its indexed topic owner, while continuing to validate
-any explicitly supplied compound identity.
+any explicitly supplied compound identity. Its Phase 3 HTTP message-pull
+requests likewise contain only `topicId` and `msgIds`; the hub resolves the
+response owner from the central topic index and rejects any explicitly supplied
+identity that conflicts with that index.
 
 The hub also retains three authenticated desktop-only HTTP endpoints under
 `/api/mobile-sync/desktop/*` for complete Agent and Group configuration sync.
