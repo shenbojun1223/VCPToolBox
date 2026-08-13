@@ -82,6 +82,25 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   const appDataPath = path.join(tempRoot, "AppData");
   const wsPort = await reservePort();
   const token = "integration-test-token";
+  const ownerId = "agent-existing-history";
+  const topicId = "topic-existing-history";
+  await fs.mkdir(path.join(appDataPath, "Agents", ownerId), { recursive: true });
+  await fs.mkdir(
+    path.join(appDataPath, "UserData", ownerId, "topics", topicId),
+    { recursive: true },
+  );
+  await fs.writeFile(
+    path.join(appDataPath, "Agents", ownerId, "config.json"),
+    JSON.stringify({
+      id: ownerId,
+      name: "Existing Agent",
+      topics: [{ id: topicId, name: "Existing Topic", createdAt: 1 }],
+    }),
+  );
+  await fs.writeFile(
+    path.join(appDataPath, "UserData", ownerId, "topics", topicId, "history.json"),
+    JSON.stringify([{ id: "message-existing", role: "user", content: "hello", timestamp: 1 }]),
+  );
   const app = express();
   const httpServer = app.listen();
   const httpPort = await new Promise((resolve, reject) => {
@@ -150,5 +169,7 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   });
   const authorizedBody = await authorized.text();
   assert.equal(authorized.status, 200, authorizedBody);
-  assert.deepEqual(JSON.parse(authorizedBody), { actions: [] });
+  assert.deepEqual(JSON.parse(authorizedBody), {
+    actions: [{ id: ownerId, type: "agent", action: "PULL" }],
+  });
 });
