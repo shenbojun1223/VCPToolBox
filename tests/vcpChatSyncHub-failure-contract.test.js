@@ -47,7 +47,12 @@ const {
   uploadEntity,
 } = require("../Plugin/VCPChatSyncHub/sync/entity");
 
-function fakeDiffDatabase({ topics = {}, messages = {}, fail = false } = {}) {
+function fakeDiffDatabase({
+  topics = {},
+  messages = {},
+  attachments = {},
+  fail = false,
+} = {}) {
   return {
     prepare(sql) {
       if (fail) throw new Error("injected database failure");
@@ -55,6 +60,9 @@ function fakeDiffDatabase({ topics = {}, messages = {}, fail = false } = {}) {
         return { get: (topicId) => topics[topicId] };
       }
       if (sql.includes("FROM message_index")) {
+        if (sql.includes("JOIN message_attachments")) {
+          return { all: (topicId) => attachments[topicId] || [] };
+        }
         return { all: (topicId) => messages[topicId] || [] };
       }
       throw new Error(`unexpected SQL in fake database: ${sql}`);
@@ -188,6 +196,52 @@ test("Phase 3 malformed hash 与 DB 查询错误都不能伪装成 no-op 完成"
   assert.equal(result.results.topic.ok, false);
   assert.equal(result.results.topic.error.code, "MESSAGE_DIFF_FAILED");
   assert.match(result.results.topic.error.message, /injected database failure/);
+});
+
+test("Phase 3 消息哈希一致时仍会要求补传缺失附件", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vcp-sync-attachment-repair-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const attachmentPath = path.join(directory, "attachment.bin");
+  const topicId = "topic-attachment-repair";
+  const hash = "a".repeat(64);
+  const payload = {
+    topics: {
+      [topicId]: {
+        topicHash: hash,
+        ownerType: "agent",
+        ownerId: "agent-a",
+        messages: { "message-1": hash },
+      },
+    },
+  };
+  const database = fakeDiffDatabase({
+    topics: {
+      [topicId]: {
+        aggregated_hash: hash,
+        file_path: "/app/Agents/agent-a/config.json",
+      },
+    },
+    messages: { [topicId]: [{ msg_id: "message-1", hash }] },
+    attachments: { [topicId]: [{ hash, file_path: attachmentPath }] },
+  });
+
+  assert.equal(
+    handleSyncMessageDiffBatch(payload, database).results[topicId].toPush,
+    true,
+  );
+
+  fs.writeFileSync(attachmentPath, "attachment");
+  assert.deepEqual(handleSyncMessageDiffBatch(payload, database).results[topicId], {
+    ok: true,
+    toPull: [],
+    toPush: false,
+  });
+
+  fs.rmSync(attachmentPath);
+  assert.equal(
+    handleSyncMessageDiffBatch(payload, database).results[topicId].toPush,
+    true,
+  );
 });
 
 test("Phase 2.5 topic hash 对错误类型和超预算 fail closed", () => {

@@ -3,6 +3,8 @@
  * 手机端发送所有 topic 的本地消息哈希，桌面端直接返回需要 pull/push 的结果
  */
 
+const fs = require("fs");
+
 const { getDb } = require("../core/db");
 const { getLogger } = require("../core/logger");
 const { assertHistoryTopicHealthy } = require("./message");
@@ -106,6 +108,30 @@ function indexedTopicOwner(filePath) {
     });
   }
   return { ownerType, ownerId };
+}
+
+function topicHasMissingAttachments(db, topicId) {
+  const rows = db
+    .prepare(`
+      SELECT DISTINCT ma.hash, ai.file_path
+      FROM message_index mi
+      JOIN message_attachments ma ON ma.msg_id = mi.msg_id
+      LEFT JOIN attachment_index ai
+        ON ai.hash = ma.hash AND ai.deleted_at IS NULL
+      WHERE mi.topic_id = ? AND mi.deleted_at IS NULL
+    `)
+    .all(topicId);
+
+  for (const row of rows) {
+    if (!row.file_path) return true;
+    try {
+      if (!fs.statSync(row.file_path).isFile()) return true;
+    } catch (error) {
+      if (error?.code === "ENOENT") return true;
+      throw error;
+    }
+  }
+  return false;
 }
 
 /**
@@ -334,7 +360,13 @@ function handleSyncMessageDiffBatch(payload, database = getDb()) {
         );
       }
 
-      if (topicRow.aggregated_hash !== null && topicRow.aggregated_hash === localState.topicHash) {
+      const needsAttachmentRepair = topicHasMissingAttachments(db, topicId);
+
+      if (
+        !needsAttachmentRepair &&
+        topicRow.aggregated_hash !== null &&
+        topicRow.aggregated_hash === localState.topicHash
+      ) {
         results[topicId] = { ok: true, toPull: [], toPush: false };
         fastPathCount++;
         // fast-path 的 topic 不输出单条日志，避免日志噪音
@@ -350,7 +382,7 @@ function handleSyncMessageDiffBatch(payload, database = getDb()) {
       const localMap = localState.messages;
 
       const toPull = [];
-      let toPush = false;
+      let toPush = needsAttachmentRepair;
 
       for (const [msgId, remoteHash] of remoteMap) {
         const localHash = localMap[msgId];
