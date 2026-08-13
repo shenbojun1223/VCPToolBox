@@ -23,20 +23,32 @@ test("VCPMobileSync 协议版本与移动端 1.1.0 对齐", () => {
     ),
     {
       type: "VERSION_ACK",
+      version: "1.1.0",
       pluginVersion: "1.1.0",
       protocolVersion: "1.1",
     },
   );
 });
 
-test("VERSION_CHECK 缺字段或协议漂移时 fail closed", () => {
+test("官方 VCPMobile 1.1.3 省略 protocolVersion 时保持兼容", () => {
+  assert.deepEqual(
+    createVersionAck(
+      { type: "VERSION_CHECK", mobileVersion: "1.1.3" },
+      manifest.version,
+    ),
+    {
+      type: "VERSION_ACK",
+      version: "1.1.0",
+      pluginVersion: "1.1.0",
+      protocolVersion: "1.1",
+    },
+  );
+});
+
+test("VERSION_CHECK 缺少客户端版本或显式协议漂移时 fail closed", () => {
   assert.throws(
-    () =>
-      createVersionAck(
-        { type: "VERSION_CHECK", mobileVersion: "1.1.4" },
-        manifest.version,
-      ),
-    /protocolVersion/,
+    () => createVersionAck({ type: "VERSION_CHECK" }, manifest.version),
+    /mobileVersion/,
   );
   assert.throws(
     () =>

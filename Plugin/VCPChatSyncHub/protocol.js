@@ -134,10 +134,15 @@ function createVersionAck(payload, pluginVersion) {
     throw error;
   }
   requireNonEmptyString(payload.mobileVersion, "VERSION_CHECK.mobileVersion");
-  const protocolVersion = requireNonEmptyString(
-    payload.protocolVersion,
-    "VERSION_CHECK.protocolVersion",
-  );
+  // Official VCPMobile 1.1.x only sends `mobileVersion` in VERSION_CHECK.
+  // Desktop sync clients send an explicit wire version, so keep validating it
+  // whenever it is present while treating the omitted legacy field as 1.1.
+  const protocolVersion = payload.protocolVersion === undefined
+    ? WIRE_PROTOCOL_VERSION
+    : requireNonEmptyString(
+      payload.protocolVersion,
+      "VERSION_CHECK.protocolVersion",
+    );
   if (protocolVersion !== WIRE_PROTOCOL_VERSION) {
     const error = new Error(
       `wire protocol mismatch: expected ${WIRE_PROTOCOL_VERSION}, received ${protocolVersion}`,
@@ -154,6 +159,9 @@ function createVersionAck(payload, pluginVersion) {
   }
   return {
     type: "VERSION_ACK",
+    // `version` is the field consumed by the official mobile client. Keep the
+    // explicit fields for desktop clients and protocol-aware future clients.
+    version: pluginVersion,
     pluginVersion,
     protocolVersion: WIRE_PROTOCOL_VERSION,
   };
