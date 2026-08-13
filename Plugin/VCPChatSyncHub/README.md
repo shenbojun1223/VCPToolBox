@@ -40,6 +40,10 @@ mobile client's legacy package-version gate. VCPMobile 1.1.3 topic manifests
 also omit per-item `ownerId`; the hub resolves existing topics from its global
 index and lets new topics provide ownership in their subsequent full DTO. An
 explicit empty, out-of-scope, or conflicting owner still fails closed. Its
+topic manifest can also temporarily report empty `hash`/`configHash` values
+after applying a pull; the hub treats those topic-only empty values as unknown
+and continues to the diff phases. Non-empty malformed hashes, and empty Agent
+or Group hashes, still fail closed. Its
 Phase 2.5 double-hash frame also omits the newer compound `topics` array, and
 its Phase 3 message states omit `ownerType`/`ownerId`; for these read-only diff
 operations the hub uses its indexed topic owner, while continuing to validate

@@ -471,8 +471,8 @@ test("VCPMobile 1.1.3 Topic Manifest 可省略 ownerId 且不会猜测多 Owner 
       targetedOwners: ["agent-a", "agent-b"],
       data: [{
         id: "topic-mobile-only",
-        hash,
-        configHash: hash,
+        hash: "",
+        configHash: "",
         contentHash: "",
         ts: 1,
         ownerType: "agent",
@@ -514,6 +514,36 @@ test("Manifest 错型、重复 ID 和 deletedAt=0 均按硬切契约处理", () 
   const database = fakeManifestDatabase();
   assert.throws(
     () => handleSyncManifest({ dataType: "agent", phase: 1, data: {} }, database),
+    (error) => error.code === "SYNC_PROTOCOL_INVALID",
+  );
+  assert.throws(
+    () => handleSyncManifest({
+      dataType: "agent",
+      phase: 1,
+      data: [{
+        id: "agent-empty-hash",
+        hash: "",
+        configHash: "",
+        contentHash: "",
+        ts: 1,
+      }],
+    }, database),
+    (error) => error.code === "SYNC_PROTOCOL_INVALID",
+  );
+  assert.throws(
+    () => handleSyncManifest({
+      dataType: "topic",
+      phase: 2,
+      targetedOwners: ["agent-a"],
+      data: [{
+        id: "topic-malformed-hash",
+        hash: "not-a-hash",
+        configHash: "not-a-hash",
+        contentHash: "",
+        ts: 1,
+        ownerType: "agent",
+      }],
+    }, database),
     (error) => error.code === "SYNC_PROTOCOL_INVALID",
   );
   const item = {

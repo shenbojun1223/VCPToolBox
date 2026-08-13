@@ -202,9 +202,15 @@ function normalizeRemoteManifestItem(item, dataType, index) {
     throw syncContractError(`Manifest item ${index} must be an object`);
   }
   const id = requireNonEmptyString(item.id, `Manifest item ${index} id`);
+  // VCPMobile 1.1.3 can transiently persist an empty topic config hash after
+  // applying a pull. Treat that one topic-only state as "unknown" so the
+  // later diff phases can repair it; every non-empty hash remains strict.
+  const allowEmptyConfigHash = dataType === "topic";
   const normalized = {
     id,
-    hash: requireHash(item.hash, `Manifest item ${id} hash`),
+    hash: requireHash(item.hash, `Manifest item ${id} hash`, {
+      allowEmpty: allowEmptyConfigHash,
+    }),
     ts: requireTimestamp(item.ts, `Manifest item ${id} timestamp`),
     deletedAt: requireOptionalTombstone(
       item.deletedAt,
@@ -220,6 +226,7 @@ function normalizeRemoteManifestItem(item, dataType, index) {
   normalized.configHash = requireHash(
     item.configHash,
     `Manifest item ${id} configHash`,
+    { allowEmpty: allowEmptyConfigHash },
   );
   normalized.contentHash = requireHash(
     item.contentHash,
