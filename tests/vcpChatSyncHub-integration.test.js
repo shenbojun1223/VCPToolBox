@@ -9,6 +9,11 @@ const { test } = require("node:test");
 const express = require("express");
 const WebSocket = require("ws");
 
+const syncLogTestDir = path.join(
+  os.tmpdir(),
+  `vcp-sync-hub-integration-logs-${process.pid}`,
+);
+process.env.VCP_MOBILE_SYNC_LOG_DIR = syncLogTestDir;
 const hub = require("../Plugin/VCPChatSyncHub");
 
 function listen(server, port = 0) {
@@ -77,6 +82,39 @@ function exchange(port, token, firstFrame, expectedType) {
   });
 }
 
+function exchangeAfterVersion(port, token, businessFrame, expectedType) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${port}/ws-sync?token=${encodeURIComponent(token)}`,
+    );
+    const timer = setTimeout(() => {
+      socket.terminate();
+      reject(new Error(`Timed out waiting for ${expectedType}`));
+    }, 10_000);
+
+    socket.once("open", () => {
+      socket.send(
+        JSON.stringify({ type: "VERSION_CHECK", mobileVersion: "1.1.3" }),
+      );
+    });
+    socket.on("message", (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      if (message.type === "VERSION_ACK") {
+        socket.send(JSON.stringify(businessFrame));
+        return;
+      }
+      if (message.type !== expectedType) return;
+      clearTimeout(timer);
+      socket.close(1000, "test complete");
+      resolve(message);
+    });
+    socket.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
 test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { timeout: 15_000 }, async (t) => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vcp-sync-hub-"));
   const appDataPath = path.join(tempRoot, "AppData");
@@ -84,9 +122,14 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   const token = "integration-test-token";
   const ownerId = "agent-existing-history";
   const topicId = "topic-existing-history";
+  const deletableTopicId = "topic-mobile-delete";
   await fs.mkdir(path.join(appDataPath, "Agents", ownerId), { recursive: true });
   await fs.mkdir(
     path.join(appDataPath, "UserData", ownerId, "topics", topicId),
+    { recursive: true },
+  );
+  await fs.mkdir(
+    path.join(appDataPath, "UserData", ownerId, "topics", deletableTopicId),
     { recursive: true },
   );
   await fs.writeFile(
@@ -94,7 +137,10 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
     JSON.stringify({
       id: ownerId,
       name: "Existing Agent",
-      topics: [{ id: topicId, name: "Existing Topic", createdAt: 1 }],
+      topics: [
+        { id: topicId, name: "Existing Topic", createdAt: 1 },
+        { id: deletableTopicId, name: "Mobile Delete Topic", createdAt: 2 },
+      ],
     }),
   );
   const historyPath = path.join(
@@ -109,6 +155,19 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
     historyPath,
     JSON.stringify([{ id: "message-existing", role: "user", content: "hello", timestamp: 1 }]),
   );
+  await fs.writeFile(
+    path.join(
+      appDataPath,
+      "UserData",
+      ownerId,
+      "topics",
+      deletableTopicId,
+      "history.json",
+    ),
+    JSON.stringify([
+      { id: "message-deleted-topic", role: "user", content: "preserved", timestamp: 2 },
+    ]),
+  );
   const app = express();
   const httpServer = app.listen();
   const httpPort = await new Promise((resolve, reject) => {
@@ -121,6 +180,7 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
     await hub.shutdown();
     await closeServer(httpServer);
     await fs.rm(tempRoot, { recursive: true, force: true });
+    await fs.rm(syncLogTestDir, { recursive: true, force: true });
   });
 
   hub.registerRoutes(
@@ -286,4 +346,51 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   );
   assert.equal(conflictingMessagePushFrame.success, false);
   assert.match(conflictingMessagePushFrame.error, /owner identity conflicts/);
+
+  const mobileDeleteAck = await exchangeAfterVersion(
+    wsPort,
+    token,
+    {
+      type: "SYNC_ENTITY_DELETE",
+      id: deletableTopicId,
+      dataType: "topic",
+    },
+    "SYNC_ACK",
+  );
+  assert.deepEqual(mobileDeleteAck, {
+    type: "SYNC_ACK",
+    id: deletableTopicId,
+  });
+  const configAfterMobileDelete = JSON.parse(
+    await fs.readFile(
+      path.join(appDataPath, "Agents", ownerId, "config.json"),
+      "utf8",
+    ),
+  );
+  assert.deepEqual(
+    configAfterMobileDelete.topics.map((topic) => topic.id),
+    [topicId],
+  );
+
+  // PC/mobile topic deletion intentionally leaves the old history directory
+  // recoverable. A subsequent server restart must skip that tombstoned source
+  // instead of preventing the sync WebSocket from starting.
+  await hub.shutdown();
+  hub.registerRoutes(
+    app,
+    {
+      MobileSyncToken: token,
+      MobileSyncPort: wsPort,
+      SyncHubAppDataPath: appDataPath,
+    },
+    path.join(__dirname, ".."),
+  );
+  await waitForPort(wsPort);
+  const restartVersionAck = await exchange(
+    wsPort,
+    token,
+    { type: "VERSION_CHECK", mobileVersion: "1.1.3" },
+    "VERSION_ACK",
+  );
+  assert.equal(restartVersionAck.protocolVersion, "1.1");
 });

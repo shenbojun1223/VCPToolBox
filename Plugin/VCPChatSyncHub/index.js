@@ -34,7 +34,11 @@ const { handleSyncTopicHashBatch, handleSyncMessageDiffBatch } = require("./sync
 const { ingestHistoryToDb, readHistoryStrict } = require("./sync/message");
 const { isWriteLocked, sanitizeId, deleteEntity, deleteMessage } = require("./sync/entity");
 const { getLogger, resetLogger } = require("./core/logger");
-const { createPhaseAck, createVersionAck } = require("./protocol");
+const {
+  createPhaseAck,
+  createVersionAck,
+  resolveDeleteTimestamp,
+} = require("./protocol");
 const {
   AGENT_SYNC_FIELDS,
   GROUP_SYNC_FIELDS,
@@ -195,7 +199,6 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
         }
         case "SYNC_ENTITY_DELETE": {
           const { id: rawId, dataType, topicId } = payload;
-          const deletedAt = payload.deletedAt;
           let safeId = "";
           let avatarOwnerType = null;
           if (dataType === "avatar" && typeof rawId === "string") {
@@ -225,16 +228,15 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
               "group_topic",
               "avatar",
               "message",
-            ].includes(dataType) ||
-            !Number.isSafeInteger(deletedAt) ||
-            deletedAt < 0
+            ].includes(dataType)
           ) {
             const error = new Error(
-              "SYNC_ENTITY_DELETE requires id, dataType and non-negative integer deletedAt",
+              "SYNC_ENTITY_DELETE requires a valid id and dataType",
             );
             error.code = "SYNC_DELETE_INVALID";
             throw error;
           }
+          const deletedAt = resolveDeleteTimestamp(payload.deletedAt);
 
           if (centralSync) {
             if (dataType === "message") {
@@ -614,6 +616,19 @@ async function scanHistory(userDataDir, db, logger) {
       const topicId = topicEntry.name;
       const historyPath = path.join(topicsDir, topicId, "history.json");
       try {
+        const topicRow = getEntityIndex(topicId, "topic");
+        if (!topicRow || topicRow.deleted_at != null) {
+          logger.logOperation(
+            "reconcile",
+            "history",
+            topicId,
+            "info",
+            topicRow
+              ? "skipped history for tombstoned topic"
+              : "skipped orphan history without topic metadata",
+          );
+          continue;
+        }
         const { history } = await readHistoryStrict(historyPath);
         totalMessages += history.length;
         await ingestHistoryToDb(historyPath, topicId, "reconcile");

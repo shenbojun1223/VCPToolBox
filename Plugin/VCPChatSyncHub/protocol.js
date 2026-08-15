@@ -172,6 +172,24 @@ function createVersionAck(payload, pluginVersion) {
 }
 
 /**
+ * Official VCPMobile 1.1.3 emits SYNC_ENTITY_DELETE without deletedAt for
+ * both local deletes and PUSH_DELETE acknowledgements. Generate the missing
+ * tombstone time on the authenticated server, while keeping explicitly
+ * supplied timestamps strict so malformed clients still fail closed.
+ */
+function resolveDeleteTimestamp(value, now = Date.now) {
+  const resolved = value === undefined ? now() : value;
+  if (!Number.isSafeInteger(resolved) || resolved < 0) {
+    const error = new Error(
+      "SYNC_ENTITY_DELETE.deletedAt must be a non-negative integer when provided",
+    );
+    error.code = "SYNC_DELETE_INVALID";
+    throw error;
+  }
+  return resolved;
+}
+
+/**
  * 构造阶段确认帧。
  *
  * 最终 messages 阶段必须原样回显移动端提供的会话身份；字段缺失时不伪造
@@ -202,4 +220,5 @@ module.exports = {
   createPhaseAck,
   createVersionAck,
   parseJsonWithoutDuplicateKeys,
+  resolveDeleteTimestamp,
 };

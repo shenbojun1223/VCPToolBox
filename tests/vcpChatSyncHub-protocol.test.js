@@ -8,6 +8,7 @@ const {
   createPhaseAck,
   createVersionAck,
   parseJsonWithoutDuplicateKeys,
+  resolveDeleteTimestamp,
 } = require("../Plugin/VCPChatSyncHub/protocol");
 
 test("VCPMobileSync 协议版本与移动端 1.1.0 对齐", () => {
@@ -42,6 +43,28 @@ test("官方 VCPMobile 1.1.3 省略 protocolVersion 时保持兼容", () => {
       pluginVersion: "1.1.0",
       protocolVersion: "1.1",
     },
+  );
+});
+
+test("官方 VCPMobile 1.1.3 删除帧省略 deletedAt 时由服务端生成墓碑时间", () => {
+  const officialFrame = {
+    type: "SYNC_ENTITY_DELETE",
+    id: "topic_123",
+    dataType: "topic",
+  };
+
+  assert.equal(
+    resolveDeleteTimestamp(officialFrame.deletedAt, () => 1700000000000),
+    1700000000000,
+  );
+  assert.equal(resolveDeleteTimestamp(123), 123);
+  assert.throws(
+    () => resolveDeleteTimestamp(null),
+    (error) => error.code === "SYNC_DELETE_INVALID",
+  );
+  assert.throws(
+    () => resolveDeleteTimestamp("123"),
+    (error) => error.code === "SYNC_DELETE_INVALID",
   );
 });
 
