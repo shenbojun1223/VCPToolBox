@@ -373,16 +373,14 @@ function softDeleteEntityIndex(id, type, deletedAt = Date.now()) {
   const sql = topicType
     ? `UPDATE entity_index
        SET deleted_at = CASE
-         WHEN deleted_at IS NULL THEN ?1 ELSE MIN(deleted_at, ?1) END
-       WHERE id = ?2
+         WHEN deleted_at IS NULL THEN @deletedAt ELSE MIN(deleted_at, @deletedAt) END
+       WHERE id = @id
          AND (type = 'topic' OR type = 'agent_topic' OR type = 'group_topic')`
     : `UPDATE entity_index
        SET deleted_at = CASE
-         WHEN deleted_at IS NULL THEN ?1 ELSE MIN(deleted_at, ?1) END
-       WHERE id = ?2 AND type = ?3`;
-  return topicType
-    ? db.prepare(sql).run(deletedAt, id)
-    : db.prepare(sql).run(deletedAt, id, type);
+         WHEN deleted_at IS NULL THEN @deletedAt ELSE MIN(deleted_at, @deletedAt) END
+       WHERE id = @id AND type = @type`;
+  return db.prepare(sql).run({ deletedAt, id, type });
 }
 
 /**
@@ -399,19 +397,19 @@ function softDeleteMessageIndex(msgId, deletedAt = Date.now(), topicId = null) {
       .prepare(
         `UPDATE message_index
          SET deleted_at = CASE
-           WHEN deleted_at IS NULL THEN ?1 ELSE MIN(deleted_at, ?1) END
-         WHERE topic_id = ?2 AND msg_id = ?3`,
+           WHEN deleted_at IS NULL THEN @deletedAt ELSE MIN(deleted_at, @deletedAt) END
+         WHERE topic_id = @topicId AND msg_id = @msgId`,
       )
-      .run(deletedAt, topicId, msgId);
+      .run({ deletedAt, topicId, msgId });
   } else {
     return db
       .prepare(
         `UPDATE message_index
          SET deleted_at = CASE
-           WHEN deleted_at IS NULL THEN ?1 ELSE MIN(deleted_at, ?1) END
-         WHERE msg_id = ?2`,
+           WHEN deleted_at IS NULL THEN @deletedAt ELSE MIN(deleted_at, @deletedAt) END
+         WHERE msg_id = @msgId`,
       )
-      .run(deletedAt, msgId);
+      .run({ deletedAt, msgId });
   }
 }
 
@@ -428,10 +426,10 @@ function softDeleteAvatarIndex(ownerId, ownerType, deletedAt = Date.now()) {
     .prepare(
       `UPDATE avatar_index
        SET deleted_at = CASE
-         WHEN deleted_at IS NULL THEN ?1 ELSE MIN(deleted_at, ?1) END
-       WHERE owner_id = ?2 AND owner_type = ?3`,
+         WHEN deleted_at IS NULL THEN @deletedAt ELSE MIN(deleted_at, @deletedAt) END
+       WHERE owner_id = @ownerId AND owner_type = @ownerType`,
     )
-    .run(deletedAt, ownerId, ownerType);
+    .run({ deletedAt, ownerId, ownerType });
 }
 
 /**
