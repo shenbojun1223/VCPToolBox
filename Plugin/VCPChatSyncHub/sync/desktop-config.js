@@ -101,7 +101,7 @@ async function refreshDesktopConfigIndex(appDataPath) {
 async function compareDesktopConfigManifest(appDataPath, remoteItems) {
   await refreshDesktopConfigIndex(appDataPath);
   const remote = Array.isArray(remoteItems) ? remoteItems : [];
-  const localRows = getDesktopConfigs().filter((row) => !row.deleted_at);
+  const localRows = getDesktopConfigs();
   const localMap = new Map(localRows.map((row) => [`${row.type}:${row.id}`, row]));
   const remoteMap = new Map();
   const results = [];
@@ -115,6 +115,13 @@ async function compareDesktopConfigManifest(appDataPath, remoteItems) {
     const local = localMap.get(key);
     if (!local) {
       results.push({ id, type, action: "PUSH" });
+    } else if (local.deleted_at != null) {
+      results.push({
+        id,
+        type,
+        action: "DELETE",
+        deletedAt: local.deleted_at,
+      });
     } else if (local.hash !== item.hash) {
       const remoteTs = Number(item.ts) || 0;
       results.push({
@@ -126,6 +133,7 @@ async function compareDesktopConfigManifest(appDataPath, remoteItems) {
   }
 
   for (const row of localRows) {
+    if (row.deleted_at != null) continue;
     const key = `${row.type}:${row.id}`;
     if (!remoteMap.has(key)) {
       results.push({ id: row.id, type: row.type, action: "PULL" });
@@ -166,6 +174,16 @@ async function uploadDesktopConfigs(appDataPath, items) {
     const type = item?.type === "group" ? "group" : item?.type === "agent" ? "agent" : "";
     if (!id || !type || !item.data || typeof item.data !== "object") {
       results.push({ id: id || item?.id, type, success: false, error: "Invalid item" });
+      continue;
+    }
+    const current = getDesktopConfigIndex(id, type);
+    if (current?.deleted_at != null) {
+      results.push({
+        id,
+        type,
+        success: false,
+        error: "Desktop config is tombstoned",
+      });
       continue;
     }
 

@@ -12,6 +12,7 @@ const {
   upsertAttachmentIndex,
   upsertAvatarIndex,
   softDeleteEntityIndex,
+  softDeleteDesktopConfigIndex,
   softDeleteAvatarIndex,
   softDeleteMessageIndex,
 } = require("../core/db");
@@ -874,6 +875,9 @@ async function deleteEntity({ id, type, ownerType = null, deletedAt, appDataPath
     }
 
     softDeleteEntityIndex(safeId, row?.type || type, deletedAt);
+    if (type === "agent" || type === "group") {
+      softDeleteDesktopConfigIndex(safeId, type, deletedAt);
+    }
     if (row && (type === "agent" || type === "group")) {
       softDeleteAvatarIndex(safeId, type, deletedAt);
       db.prepare(

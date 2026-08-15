@@ -15,6 +15,10 @@ after(() => {
 
 const database = require("../Plugin/VCPChatSyncHub/core/db");
 const { deleteEntity } = require("../Plugin/VCPChatSyncHub/sync/entity");
+const {
+  compareDesktopConfigManifest,
+  uploadDesktopConfigs,
+} = require("../Plugin/VCPChatSyncHub/sync/desktop-config");
 
 test("sync tombstone helpers bind named SQLite parameters and preserve the earliest delete", (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vcp-sync-delete-db-"));
@@ -58,6 +62,7 @@ test("owner deletion tombstones child topics without positional binding failures
   }));
   database.upsertEntityIndex("agent-1", "agent", configPath, "a".repeat(64), 10);
   database.upsertEntityIndex("topic-child", "topic", configPath, "b".repeat(64), 10);
+  database.upsertDesktopConfigIndex("agent-1", "agent", configPath, "c".repeat(64), 10);
 
   const result = await deleteEntity({
     id: "agent-1",
@@ -69,5 +74,41 @@ test("owner deletion tombstones child topics without positional binding failures
   assert.equal(result.success, true);
   assert.equal(db.prepare("SELECT deleted_at FROM entity_index WHERE id = 'agent-1'").get().deleted_at, 1700000000000);
   assert.equal(db.prepare("SELECT deleted_at FROM entity_index WHERE id = 'topic-child'").get().deleted_at, 1700000000000);
+  assert.equal(db.prepare("SELECT deleted_at FROM desktop_config_index WHERE id = 'agent-1'").get().deleted_at, 1700000000000);
+  assert.equal(fs.existsSync(path.dirname(configPath)), false);
+
+  assert.deepEqual(
+    await compareDesktopConfigManifest(appDataPath, [{
+      id: "agent-1",
+      type: "agent",
+      hash: "c".repeat(64),
+      ts: 10,
+    }]),
+    {
+      actions: [{
+        id: "agent-1",
+        type: "agent",
+        action: "DELETE",
+        deletedAt: 1700000000000,
+      }],
+    },
+  );
+  assert.deepEqual(
+    await uploadDesktopConfigs(appDataPath, [{
+      id: "agent-1",
+      type: "agent",
+      data: { name: "stale copy" },
+      hash: "d".repeat(64),
+      ts: 20,
+    }]),
+    {
+      items: [{
+        id: "agent-1",
+        type: "agent",
+        success: false,
+        error: "Desktop config is tombstoned",
+      }],
+    },
+  );
   assert.equal(fs.existsSync(path.dirname(configPath)), false);
 });

@@ -360,6 +360,18 @@ function upsertDesktopConfigIndex(id, type, filePath, hash, updatedAt = Date.now
   `).run(id, type, filePath, hash, updatedAt);
 }
 
+function softDeleteDesktopConfigIndex(id, type, deletedAt = Date.now()) {
+  if (!db) return;
+  return db
+    .prepare(
+      `UPDATE desktop_config_index
+       SET deleted_at = CASE
+         WHEN deleted_at IS NULL THEN @deletedAt ELSE MIN(deleted_at, @deletedAt) END
+       WHERE id = @id AND type = @type`,
+    )
+    .run({ deletedAt, id, type });
+}
+
 /**
  * 软删除实体索引
  * @param {string} id - 实体 ID
@@ -456,13 +468,19 @@ function cleanupOldDeletedRecords() {
       `DELETE FROM avatar_index WHERE deleted_at IS NOT NULL AND deleted_at < ?`,
     )
     .run(thirtyDaysAgo);
+  const desktopConfigResult = db
+    .prepare(
+      `DELETE FROM desktop_config_index WHERE deleted_at IS NOT NULL AND deleted_at < ?`,
+    )
+    .run(thirtyDaysAgo);
 
   if (
     entityResult.changes > 0 ||
     messageResult.changes > 0 ||
-    avatarResult.changes > 0
+    avatarResult.changes > 0 ||
+    desktopConfigResult.changes > 0
   ) {
-    logger.logOperation("cleanup", "purge", "batch", "success", `entity=${entityResult.changes} message=${messageResult.changes} avatar=${avatarResult.changes}`);
+    logger.logOperation("cleanup", "purge", "batch", "success", `entity=${entityResult.changes} message=${messageResult.changes} avatar=${avatarResult.changes} desktopConfig=${desktopConfigResult.changes}`);
   }
 }
 
@@ -481,6 +499,7 @@ module.exports = {
   getDesktopConfigIndex,
   getDesktopConfigs,
   upsertDesktopConfigIndex,
+  softDeleteDesktopConfigIndex,
   softDeleteEntityIndex,
   softDeleteMessageIndex,
   softDeleteAvatarIndex,
