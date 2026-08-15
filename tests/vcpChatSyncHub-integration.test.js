@@ -97,8 +97,16 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
       topics: [{ id: topicId, name: "Existing Topic", createdAt: 1 }],
     }),
   );
+  const historyPath = path.join(
+    appDataPath,
+    "UserData",
+    ownerId,
+    "topics",
+    topicId,
+    "history.json",
+  );
   await fs.writeFile(
-    path.join(appDataPath, "UserData", ownerId, "topics", topicId, "history.json"),
+    historyPath,
     JSON.stringify([{ id: "message-existing", role: "user", content: "hello", timestamp: 1 }]),
   );
   const app = express();
@@ -230,4 +238,52 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
     (await conflictingMessagePull.text()).trim(),
   );
   assert.match(conflictingMessageFrame._error, /owner identity conflicts/);
+
+  const mobileMessagePush = await fetch(`${baseUrl}/upload-messages-batch`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-ndjson",
+      "x-sync-token": token,
+    },
+    body: `${JSON.stringify({
+      topicId,
+      messages: [{
+        id: "message-mobile-push",
+        role: "user",
+        content: "mobile push",
+        timestamp: 2,
+      }],
+    })}\n`,
+  });
+  const mobileMessagePushText = await mobileMessagePush.text();
+  assert.equal(mobileMessagePush.status, 200, mobileMessagePushText);
+  assert.deepEqual(JSON.parse(mobileMessagePushText.trim()), {
+    topicId,
+    success: true,
+    neededAttachmentHashes: [],
+  });
+  const updatedHistory = JSON.parse(await fs.readFile(historyPath, "utf8"));
+  assert.deepEqual(
+    updatedHistory.map((message) => message.id),
+    ["message-existing", "message-mobile-push"],
+  );
+
+  const conflictingMessagePush = await fetch(`${baseUrl}/upload-messages-batch`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-ndjson",
+      "x-sync-token": token,
+    },
+    body: `${JSON.stringify({
+      topicId,
+      ownerType: "group",
+      ownerId,
+      messages: [],
+    })}\n`,
+  });
+  const conflictingMessagePushFrame = JSON.parse(
+    (await conflictingMessagePush.text()).trim(),
+  );
+  assert.equal(conflictingMessagePushFrame.success, false);
+  assert.match(conflictingMessagePushFrame.error, /owner identity conflicts/);
 });

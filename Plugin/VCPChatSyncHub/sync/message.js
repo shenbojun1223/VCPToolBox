@@ -379,12 +379,20 @@ async function uploadMessagesBatchRaw(req, appDataPath, res) {
         if (!Array.isArray(messages)) {
           throw new Error("messages must be an array");
         }
+        const hasOwnerType = ownerType !== undefined;
+        const hasOwnerId = ownerId !== undefined;
+        if (hasOwnerType !== hasOwnerId) {
+          throw new Error("Message push requires ownerType and ownerId together");
+        }
         if (
-          !["agent", "group"].includes(ownerType) ||
-          typeof ownerId !== "string" ||
-          ownerId.length === 0
+          hasOwnerType &&
+          (
+            !["agent", "group"].includes(ownerType) ||
+            typeof ownerId !== "string" ||
+            ownerId.length === 0
+          )
         ) {
-          throw new Error("Message push requires exact ownerType and ownerId");
+          throw new Error("Message push owner identity is invalid");
         }
         topicCount += 1;
         messageCount += messages.length;
@@ -411,13 +419,13 @@ async function uploadMessagesBatchRaw(req, appDataPath, res) {
           errorCount++;
           continue;
         }
-        const actualOwnerId = path.basename(path.dirname(row.file_path));
-        const actualOwnerType = row.file_path.includes("AgentGroups")
-          ? "group"
-          : "agent";
+        const {
+          ownerType: actualOwnerType,
+          ownerId: actualOwnerId,
+        } = indexedTopicOwner(row.file_path);
         if (
-          ownerType !== actualOwnerType ||
-          ownerId !== actualOwnerId
+          hasOwnerType &&
+          (ownerType !== actualOwnerType || ownerId !== actualOwnerId)
         ) {
           throw new Error("topic owner identity conflicts with desktop index");
         }

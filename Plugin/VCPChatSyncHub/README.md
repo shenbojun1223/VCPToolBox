@@ -50,7 +50,10 @@ operations the hub uses its indexed topic owner, while continuing to validate
 any explicitly supplied compound identity. Its Phase 3 HTTP message-pull
 requests likewise contain only `topicId` and `msgIds`; the hub resolves the
 response owner from the central topic index and rejects any explicitly supplied
-identity that conflicts with that index.
+identity that conflicts with that index. Its Phase 3 NDJSON message-push frames
+contain only `topicId` and `messages`; the hub likewise resolves the destination
+owner from the indexed topic before writing, while rejecting partial, invalid,
+or conflicting explicit identities.
 
 The hub also retains three authenticated desktop-only HTTP endpoints under
 `/api/mobile-sync/desktop/*` for complete Agent and Group configuration sync.
