@@ -1,9 +1,10 @@
 # VCPChatSyncHub
 
 VCPChatSyncHub turns VCPToolBox into a central data plane shared by multiple
-VCPChat desktop clients and VCPMobile. It keeps the upstream Mobile Sync V2
-transport on wire protocol 1.1 and the AppData-compatible entity layout, including agents, groups,
-topics, messages, avatars, attachments and deletion tombstones.
+VCPChat desktop clients and VCPMobile. It supports released VCPMobile 1.1.3 on
+legacy Wire 1.1 and protocol-aware clients on strict Wire 1.2 while keeping one
+AppData-compatible entity layout for agents, groups, topics, messages, avatars,
+attachments and deletion tombstones.
 
 ## Configure
 
@@ -28,32 +29,21 @@ without TLS on an untrusted network.
 ## VCPMobile
 
 Use the VCPToolBox public base URL as the mobile HTTP service URL and the public
-WebSocket URL as the mobile WebSocket service URL. The protocol is inherited
-from upstream VCPMobileSync 1.1. The first WebSocket business frame must be a
-`VERSION_CHECK`. Official VCPMobile 1.1.x clients may omit `protocolVersion`;
-desktop clients send `protocolVersion: "1.1"`, and an explicitly incompatible
-version still fails closed. `VERSION_ACK` exposes both the mobile-compatible
-legacy `version: "1.0.0"` identifier and the actual desktop
-`pluginVersion: "1.1.0"`/`protocolVersion: "1.1"` fields. These values are
-deliberately independent: changing the hub package version must not break the
-mobile client's legacy package-version gate. VCPMobile 1.1.3 topic manifests
-also omit per-item `ownerId`; the hub resolves existing topics from its global
-index and lets new topics provide ownership in their subsequent full DTO. An
-explicit empty, out-of-scope, or conflicting owner still fails closed. Its
-topic manifest can also temporarily report empty `hash`/`configHash` values
-after applying a pull; the hub treats those topic-only empty values as unknown
-and continues to the diff phases. Non-empty malformed hashes, and empty Agent
-or Group hashes, still fail closed. Its
-Phase 2.5 double-hash frame also omits the newer compound `topics` array, and
-its Phase 3 message states omit `ownerType`/`ownerId`; for these read-only diff
-operations the hub uses its indexed topic owner, while continuing to validate
-any explicitly supplied compound identity. Its Phase 3 HTTP message-pull
-requests likewise contain only `topicId` and `msgIds`; the hub resolves the
-response owner from the central topic index and rejects any explicitly supplied
-identity that conflicts with that index. Its Phase 3 NDJSON message-push frames
-contain only `topicId` and `messages`; the hub likewise resolves the destination
-owner from the indexed topic before writing, while rejecting partial, invalid,
-or conflicting explicit identities.
+WebSocket URL as the mobile WebSocket service URL. The first WebSocket business
+frame must be `VERSION_CHECK`. A missing `protocolVersion`, as emitted by the
+released VCPMobile 1.1.3 APK, negotiates legacy Wire 1.1 and receives
+`version: "1.0.0"`, `pluginVersion: "1.1.0"`, and `protocolVersion: "1.1"`.
+An explicit `protocolVersion: "1.2"` receives the strict 1.2 contract and
+plugin version 1.2.0. Other versions fail closed.
+
+Compatibility is scoped to the negotiated connection. Wire 1.1 accepts the
+known 1.1.3 omissions: topic `ownerId`, the Phase 2.5 compound `topics` array,
+Phase 3 message owner identity, transient empty topic hashes, and missing
+`deletedAt` on authenticated delete frames. Wire 1.2 keeps all of those fields
+strict. HTTP message pull/push cannot carry WebSocket connection state, so an
+omitted owner is resolved from the authoritative topic index; partial,
+invalid, or conflicting explicit identities are always rejected. Legacy
+per-topic stream errors remain strings while Wire 1.2 uses structured errors.
 
 The hub also retains three authenticated desktop-only HTTP endpoints under
 `/api/mobile-sync/desktop/*` for complete Agent and Group configuration sync.

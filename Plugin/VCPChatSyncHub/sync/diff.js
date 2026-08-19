@@ -7,7 +7,12 @@ const fs = require("fs");
 
 const { getDb } = require("../core/db");
 const { getLogger } = require("../core/logger");
+const { LEGACY_WIRE_PROTOCOL_VERSION } = require("../protocol");
 const { assertHistoryTopicHealthy } = require("./message");
+const {
+  normalizeSyncError,
+  withSyncErrorContext,
+} = require("../error-contract");
 
 const CONTENT_HASH_PATTERN = /^(?:|[a-f0-9]{64})$/;
 
@@ -48,10 +53,8 @@ function requireTopicHashMap(payload, { doubleHash = false } = {}) {
   return { hashes, entries };
 }
 
-function requireCompoundTopicStates(payload, entries) {
-  // VCPMobile 1.1.3 sends only the double-hash map. Newer desktop/mobile
-  // clients may additionally send compound owner states, which remain strict.
-  if (payload?.topics === undefined) return null;
+function requireCompoundTopicStates(payload, entries, { legacy = false } = {}) {
+  if (legacy && payload?.topics === undefined) return null;
   if (!Array.isArray(payload?.topics) || payload.topics.length !== entries.length) {
     throw Object.assign(
       new Error("SYNC_TOPIC_HASH_BATCH_V2.topics must exactly cover hashes"),
@@ -170,10 +173,11 @@ function handleSyncTopicHashBatch(payload, database = getDb()) {
       }
       changedTopics.push(topicId);
     } catch (e) {
-      throw Object.assign(
-        new Error(`Topic hash lookup failed for ${topicId}: ${e.message}`),
-        { code: "SYNC_DB_QUERY_FAILED" },
-      );
+      throw withSyncErrorContext(e, {
+        code: "SYNC_DB_QUERY_FAILED",
+        stage: "topic_validation",
+        failedTopicIds: [topicId],
+      });
     }
   }
 
@@ -190,11 +194,13 @@ function handleSyncTopicHashBatch(payload, database = getDb()) {
  * 处理 SYNC_TOPIC_HASH_BATCH_V2 (V2: 支持双哈希对比)
  * @param {object} payload - { hashes: { topicId: { configHash, contentHash } } }
  */
-function handleSyncTopicHashBatchV2(payload, database = getDb()) {
+function handleSyncTopicHashBatchV2(payload, database = getDb(), options = {}) {
   const { hashes, entries } = requireTopicHashMap(payload, {
     doubleHash: true,
   });
-  const topicStates = requireCompoundTopicStates(payload, entries);
+  const topicStates = requireCompoundTopicStates(payload, entries, {
+    legacy: options.protocolVersion === LEGACY_WIRE_PROTOCOL_VERSION,
+  });
   const db = database;
   const logger = getLogger();
   if (!db) {
@@ -245,10 +251,11 @@ function handleSyncTopicHashBatchV2(payload, database = getDb()) {
         changedTopics.push(topicId);
       }
     } catch (e) {
-      throw Object.assign(
-        new Error(`Topic hash lookup failed for ${topicId}: ${e.message}`),
-        { code: "SYNC_DB_QUERY_FAILED" },
-      );
+      throw withSyncErrorContext(e, {
+        code: "SYNC_DB_QUERY_FAILED",
+        stage: "topic_validation",
+        failedTopicIds: [topicId],
+      });
     }
   }
 
@@ -266,7 +273,7 @@ function handleSyncTopicHashBatchV2(payload, database = getDb()) {
  * @param {object} payload - { topics: { topicId: { topicHash, messages: { msgId: hash } } } }
  * @returns {object} strict discriminated results: `{ok:true,toPull,toPush}` or `{ok:false,error}`
  */
-function handleSyncMessageDiffBatch(payload, database = getDb()) {
+function handleSyncMessageDiffBatch(payload, database = getDb(), options = {}) {
   const db = database;
   const logger = getLogger();
   if (!db) {
@@ -295,18 +302,29 @@ function handleSyncMessageDiffBatch(payload, database = getDb()) {
   }
   let fastPathCount = 0;
   let detailedCount = 0;
+  let errorCount = 0;
   let messageCount = 0;
+  const legacy = options.protocolVersion === LEGACY_WIRE_PROTOCOL_VERSION;
 
   for (const [topicId, localState] of Object.entries(topics)) {
     const hasOwnerType = localState?.ownerType !== undefined;
     const hasOwnerId = localState?.ownerId !== undefined;
-    const validOptionalOwner =
-      (!hasOwnerType && !hasOwnerId) ||
-      (hasOwnerType &&
+    const validOwner = legacy
+      ? (
+        (!hasOwnerType && !hasOwnerId) ||
+        (hasOwnerType &&
+          hasOwnerId &&
+          ["agent", "group"].includes(localState.ownerType) &&
+          typeof localState.ownerId === "string" &&
+          localState.ownerId.length > 0)
+      )
+      : (
+        hasOwnerType &&
         hasOwnerId &&
         ["agent", "group"].includes(localState.ownerType) &&
         typeof localState.ownerId === "string" &&
-        localState.ownerId.length > 0);
+        localState.ownerId.length > 0
+      );
     if (
       !topicId ||
       topicId === "default" ||
@@ -315,7 +333,7 @@ function handleSyncMessageDiffBatch(payload, database = getDb()) {
       Array.isArray(localState) ||
       typeof localState.topicHash !== "string" ||
       !CONTENT_HASH_PATTERN.test(localState.topicHash) ||
-      !validOptionalOwner ||
+      !validOwner ||
       !localState.messages ||
       typeof localState.messages !== "object" ||
       Array.isArray(localState.messages)
@@ -351,21 +369,27 @@ function handleSyncMessageDiffBatch(payload, database = getDb()) {
         .get(topicId);
 
       if (!topicRow) {
+        errorCount++;
         results[topicId] = {
           ok: false,
-          error: {
-            code: "TOPIC_NOT_FOUND",
-            message: `Topic ${topicId} was not found in the desktop index`,
-          },
+          error: normalizeSyncError(
+            `Topic ${topicId} was not found in the desktop index`,
+            {
+              code: "TOPIC_NOT_FOUND",
+              stage: "messages",
+              failedTopicIds: [topicId],
+            },
+          ),
         };
         continue;
       }
 
       const actualOwner = indexedTopicOwner(topicRow.file_path);
-      if (hasOwnerType && (
-        actualOwner.ownerType !== localState.ownerType ||
-        actualOwner.ownerId !== localState.ownerId
-      )) {
+      if (
+        hasOwnerType &&
+        (actualOwner.ownerType !== localState.ownerType ||
+          actualOwner.ownerId !== localState.ownerId)
+      ) {
         throw Object.assign(
           new Error(`Message diff owner identity conflicts for ${topicId}`),
           { code: "SYNC_OWNER_CONFLICT" },
@@ -389,11 +413,18 @@ function handleSyncMessageDiffBatch(payload, database = getDb()) {
       const remoteRows = db
         .prepare("SELECT msg_id, hash FROM message_index WHERE topic_id = ? AND deleted_at IS NULL")
         .all(topicId);
+      const remoteDeletedRows = db
+        .prepare(
+          "SELECT msg_id FROM message_index WHERE topic_id = ? AND deleted_at IS NOT NULL",
+        )
+        .all(topicId);
 
       const remoteMap = new Map(remoteRows.map((r) => [r.msg_id, r.hash]));
+      const remoteDeletedIds = new Set(remoteDeletedRows.map((r) => r.msg_id));
       const localMap = localState.messages;
 
       const toPull = [];
+      const toDelete = [];
       let toPush = needsAttachmentRepair;
 
       for (const [msgId, remoteHash] of remoteMap) {
@@ -408,30 +439,53 @@ function handleSyncMessageDiffBatch(payload, database = getDb()) {
         }
       }
 
+      for (const msgId of remoteDeletedIds) {
+        if (localMap[msgId] && localMap[msgId] !== "DELETED") {
+          toDelete.push(msgId);
+        }
+      }
+
       // 本地有而远程没有的 → push
       for (const msgId of Object.keys(localMap)) {
-        if (localMap[msgId] !== "DELETED" && !remoteMap.has(msgId)) {
+        if (
+          localMap[msgId] !== "DELETED" &&
+          !remoteMap.has(msgId) &&
+          !remoteDeletedIds.has(msgId)
+        ) {
           toPush = true;
           break;
         }
       }
 
-      results[topicId] = { ok: true, toPull, toPush };
+      results[topicId] = {
+        ok: true,
+        toPull,
+        toPush,
+        ...(toDelete.length ? { toDelete } : {}),
+      };
       detailedCount++;
       logger.logOperation("messages", "diff", topicId, "success", `toPull=${toPull.length} toPush=${toPush}`);
     } catch (e) {
+      errorCount++;
       logger.logOperation("messages", "diff", topicId, "error", e.message);
       results[topicId] = {
         ok: false,
-        error: {
+        error: normalizeSyncError(e, {
           code: "MESSAGE_DIFF_FAILED",
-          message: e.message,
-        },
+          stage: "messages",
+          failedTopicIds: [topicId],
+        }),
       };
     }
   }
 
-  logger.logOperation("messages", "diff_batch", "summary", "success", `topics=${topicIds.length} fast_path=${fastPathCount} detailed=${detailedCount}`);
+  logger.logOperation(
+    "messages",
+    "diff_batch",
+    "summary",
+    errorCount > 0 ? "warn" : "success",
+    `topics=${topicIds.length} fast_path=${fastPathCount} detailed=${detailedCount} errors=${errorCount}`,
+  );
 
   return {
     type: "SYNC_DIFF_RESULTS_BATCH",

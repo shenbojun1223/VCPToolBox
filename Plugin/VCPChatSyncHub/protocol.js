@@ -1,12 +1,15 @@
 "use strict";
 
 const FINAL_ACK_IDENTITY_FIELDS = ["sessionId", "attemptId", "nonce"];
-const WIRE_PROTOCOL_VERSION = "1.1";
-const EXPECTED_PLUGIN_VERSION = "1.1.0";
-// Official VCPMobile 1.1.3 validates the legacy `VERSION_ACK.version` field
-// against the upstream VCPMobileSync package version, independently from the
-// hub implementation version exposed to desktop clients.
-const MOBILE_COMPAT_PLUGIN_VERSION = "1.0.0";
+const LEGACY_WIRE_PROTOCOL_VERSION = "1.1";
+const LEGACY_PLUGIN_VERSION = "1.1.0";
+const LEGACY_MOBILE_COMPAT_VERSION = "1.0.0";
+const WIRE_PROTOCOL_VERSION = "1.2";
+const EXPECTED_PLUGIN_VERSION = "1.2.0";
+const SUPPORTED_WIRE_PROTOCOL_VERSIONS = new Set([
+  LEGACY_WIRE_PROTOCOL_VERSION,
+  WIRE_PROTOCOL_VERSION,
+]);
 
 function parseJsonWithoutDuplicateKeys(text) {
   if (typeof text !== "string") {
@@ -131,6 +134,23 @@ function requireNonEmptyString(value, field) {
   return value;
 }
 
+function resolveWireProtocol(payload) {
+  const protocolVersion = payload?.protocolVersion === undefined
+    ? LEGACY_WIRE_PROTOCOL_VERSION
+    : requireNonEmptyString(
+      payload.protocolVersion,
+      "VERSION_CHECK.protocolVersion",
+    );
+  if (!SUPPORTED_WIRE_PROTOCOL_VERSIONS.has(protocolVersion)) {
+    const error = new Error(
+      `wire protocol mismatch: supported ${LEGACY_WIRE_PROTOCOL_VERSION} or ${WIRE_PROTOCOL_VERSION}, received ${protocolVersion}`,
+    );
+    error.code = "PROTOCOL_MISMATCH";
+    throw error;
+  }
+  return protocolVersion;
+}
+
 function createVersionAck(payload, pluginVersion) {
   if (!payload || payload.type !== "VERSION_CHECK") {
     const error = new Error("expected VERSION_CHECK");
@@ -138,22 +158,7 @@ function createVersionAck(payload, pluginVersion) {
     throw error;
   }
   requireNonEmptyString(payload.mobileVersion, "VERSION_CHECK.mobileVersion");
-  // Official VCPMobile 1.1.x only sends `mobileVersion` in VERSION_CHECK.
-  // Desktop sync clients send an explicit wire version, so keep validating it
-  // whenever it is present while treating the omitted legacy field as 1.1.
-  const protocolVersion = payload.protocolVersion === undefined
-    ? WIRE_PROTOCOL_VERSION
-    : requireNonEmptyString(
-      payload.protocolVersion,
-      "VERSION_CHECK.protocolVersion",
-    );
-  if (protocolVersion !== WIRE_PROTOCOL_VERSION) {
-    const error = new Error(
-      `wire protocol mismatch: expected ${WIRE_PROTOCOL_VERSION}, received ${protocolVersion}`,
-    );
-    error.code = "PROTOCOL_MISMATCH";
-    throw error;
-  }
+  const protocolVersion = resolveWireProtocol(payload);
   if (pluginVersion !== EXPECTED_PLUGIN_VERSION) {
     const error = new Error(
       `plugin package mismatch: expected ${EXPECTED_PLUGIN_VERSION}, received ${pluginVersion}`,
@@ -161,27 +166,30 @@ function createVersionAck(payload, pluginVersion) {
     error.code = "PLUGIN_VERSION_MISMATCH";
     throw error;
   }
+  if (protocolVersion === LEGACY_WIRE_PROTOCOL_VERSION) {
+    return {
+      type: "VERSION_ACK",
+      version: LEGACY_MOBILE_COMPAT_VERSION,
+      pluginVersion: LEGACY_PLUGIN_VERSION,
+      protocolVersion: LEGACY_WIRE_PROTOCOL_VERSION,
+    };
+  }
   return {
     type: "VERSION_ACK",
-    // Keep the legacy mobile compatibility identifier independent from the
-    // actual hub package and wire versions exposed in the explicit fields.
-    version: MOBILE_COMPAT_PLUGIN_VERSION,
+    version: pluginVersion,
     pluginVersion,
     protocolVersion: WIRE_PROTOCOL_VERSION,
   };
 }
 
-/**
- * Official VCPMobile 1.1.3 emits SYNC_ENTITY_DELETE without deletedAt for
- * both local deletes and PUSH_DELETE acknowledgements. Generate the missing
- * tombstone time on the authenticated server, while keeping explicitly
- * supplied timestamps strict so malformed clients still fail closed.
- */
-function resolveDeleteTimestamp(value, now = Date.now) {
-  const resolved = value === undefined ? now() : value;
+function resolveDeleteTimestamp(value, protocolVersion, now = Date.now) {
+  const legacy = protocolVersion === LEGACY_WIRE_PROTOCOL_VERSION;
+  const resolved = value === undefined && legacy ? now() : value;
   if (!Number.isSafeInteger(resolved) || resolved < 0) {
     const error = new Error(
-      "SYNC_ENTITY_DELETE.deletedAt must be a non-negative integer when provided",
+      legacy
+        ? "SYNC_ENTITY_DELETE.deletedAt must be a non-negative integer when provided"
+        : "SYNC_ENTITY_DELETE.deletedAt is required and must be a non-negative integer",
     );
     error.code = "SYNC_DELETE_INVALID";
     throw error;
@@ -215,10 +223,13 @@ function createPhaseAck(payload, { echoFinalIdentity = false } = {}) {
 
 module.exports = {
   EXPECTED_PLUGIN_VERSION,
-  MOBILE_COMPAT_PLUGIN_VERSION,
+  LEGACY_MOBILE_COMPAT_VERSION,
+  LEGACY_PLUGIN_VERSION,
+  LEGACY_WIRE_PROTOCOL_VERSION,
   WIRE_PROTOCOL_VERSION,
   createPhaseAck,
   createVersionAck,
   parseJsonWithoutDuplicateKeys,
   resolveDeleteTimestamp,
+  resolveWireProtocol,
 };

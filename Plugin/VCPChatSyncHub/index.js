@@ -39,6 +39,7 @@ const {
   createVersionAck,
   resolveDeleteTimestamp,
 } = require("./protocol");
+const { withSyncErrorContext } = require("./error-contract");
 const {
   AGENT_SYNC_FIELDS,
   GROUP_SYNC_FIELDS,
@@ -93,8 +94,11 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
   startWsServer({
     port: wsPort,
     syncToken,
-    onMessage: async (payload) => {
+    onMessage: async (payload, connection = {}) => {
       const logger = getLogger();
+      const protocolOptions = {
+        protocolVersion: connection.protocolVersion,
+      };
 
       switch (payload.type) {
         case "SYNC_MANIFEST": {
@@ -107,7 +111,7 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
           if (centralSync && payload.dataType !== "avatar") {
             return centralSync.handleSyncManifest(payload);
           }
-          return handleSyncManifest(payload);
+          return handleSyncManifest(payload, undefined, protocolOptions);
         }
         case "GET_MESSAGE_MANIFEST": {
           logger.logOperation("websocket", "message", payload.type, "info", `topicId=${payload.topicId}`);
@@ -129,14 +133,14 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
             return centralSync.handleTopicHashBatch(payload);
           }
           const { handleSyncTopicHashBatchV2 } = require("./sync/diff");
-          return handleSyncTopicHashBatchV2(payload);
+          return handleSyncTopicHashBatchV2(payload, undefined, protocolOptions);
         }
         case "SYNC_MESSAGE_DIFF_BATCH": {
           const topicCount = Object.keys(payload.topics || {}).length;
           logger.logOperation("websocket", "message", payload.type, "info", `topics=${topicCount}`);
           return centralSync
             ? centralSync.handleMessageDiffBatch(payload)
-            : handleSyncMessageDiffBatch(payload);
+            : handleSyncMessageDiffBatch(payload, undefined, protocolOptions);
         }
         case "PHASE_START": {
           const phase = payload.phase || "owner_metadata";
@@ -194,7 +198,13 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
         }
         case "VERSION_CHECK": {
           const manifest = require("./plugin-manifest.json");
-          logger.logOperation("websocket", "version_check", "mobile", "info", `mobileVersion=${payload.mobileVersion}, pluginVersion=${manifest.version}`);
+          logger.logOperation(
+            "websocket",
+            "version_check",
+            "mobile",
+            "info",
+            `mobileVersion=${payload.mobileVersion}, wire=${connection.protocolVersion}, pluginVersion=${manifest.version}`,
+          );
           return createVersionAck(payload, manifest.version);
         }
         case "SYNC_ENTITY_DELETE": {
@@ -236,8 +246,10 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
             error.code = "SYNC_DELETE_INVALID";
             throw error;
           }
-          const deletedAt = resolveDeleteTimestamp(payload.deletedAt);
-
+          const deletedAt = resolveDeleteTimestamp(
+            payload.deletedAt,
+            connection.protocolVersion,
+          );
           if (centralSync) {
             if (dataType === "message") {
               if (
@@ -265,9 +277,10 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
                 appDataPath,
               });
               if (!result?.success) {
-                const error = new Error(result?.error || "entity delete failed");
-                error.code = "SYNC_DELETE_FAILED";
-                throw error;
+                throw withSyncErrorContext(
+                  result?.error || "entity delete failed",
+                  { code: "SYNC_DELETE_FAILED", stage: "owner_metadata" },
+                );
               }
               await centralSync.reconcile();
             }
@@ -287,7 +300,16 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
               topicId: safeTopicId,
               appDataPath,
             });
-            if (!result?.success) throw new Error(result?.error || "message delete failed");
+            if (!result?.success) {
+              throw withSyncErrorContext(
+                result?.error || "message delete failed",
+                {
+                  code: "SYNC_DELETE_FAILED",
+                  stage: "messages",
+                  failedTopicIds: [safeTopicId],
+                },
+              );
+            }
             logger.logOperation("websocket", "delete_notify", safeId, "success", "type=message");
           } else if (dataType === "avatar") {
             const result = await deleteEntity({
@@ -297,11 +319,29 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
               deletedAt,
               appDataPath,
             });
-            if (!result?.success) throw new Error(result?.error || "avatar delete failed");
+            if (!result?.success) {
+              throw withSyncErrorContext(
+                result?.error || "avatar delete failed",
+                { code: "SYNC_DELETE_FAILED", stage: "owner_metadata" },
+              );
+            }
             logger.logOperation("websocket", "delete_notify", rawId, "success", "type=avatar");
           } else {
             const result = await deleteEntity({ id: safeId, type: dataType, deletedAt, appDataPath });
-            if (!result?.success) throw new Error(result?.error || "entity delete failed");
+            if (!result?.success) {
+              throw withSyncErrorContext(
+                result?.error || "entity delete failed",
+                {
+                  code: "SYNC_DELETE_FAILED",
+                  stage: ["topic", "agent_topic", "group_topic"].includes(dataType)
+                    ? "topic_metadata"
+                    : "owner_metadata",
+                  failedTopicIds: ["topic", "agent_topic", "group_topic"].includes(dataType)
+                    ? [safeId]
+                    : [],
+                },
+              );
+            }
             logger.logOperation("websocket", "delete_notify", safeId, "success", `type=${dataType}`);
           }
 

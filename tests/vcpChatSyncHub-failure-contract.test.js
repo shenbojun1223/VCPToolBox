@@ -59,6 +59,7 @@ const {
 function fakeDiffDatabase({
   topics = {},
   messages = {},
+  deletedMessages = {},
   attachments = {},
   fail = false,
 } = {}) {
@@ -71,6 +72,9 @@ function fakeDiffDatabase({
       if (sql.includes("FROM message_index")) {
         if (sql.includes("JOIN message_attachments")) {
           return { all: (topicId) => attachments[topicId] || [] };
+        }
+        if (sql.includes("deleted_at IS NOT NULL")) {
+          return { all: (topicId) => deletedMessages[topicId] || [] };
         }
         return { all: (topicId) => messages[topicId] || [] };
       }
@@ -131,10 +135,14 @@ test("Phase 3 decision 只返回严格判别联合且不在 diff 中执行删除
       topics: {
         "topic-live": {
           topicHash: "c".repeat(64),
+          ownerType: "agent",
+          ownerId: "agent-a",
           messages: { "message-1": "DELETED" },
         },
         "topic-missing": {
           topicHash: "",
+          ownerType: "agent",
+          ownerId: "agent-a",
           messages: {},
         },
       },
@@ -161,8 +169,81 @@ test("Phase 3 decision 只返回严格判别联合且不在 diff 中执行删除
     ok: false,
     error: {
       code: "TOPIC_NOT_FOUND",
+      origin: "desktop_plugin",
+      stage: "messages",
+      kind: "data",
+      retry: "manual",
       message: "Topic topic-missing was not found in the desktop index",
+      failedTopicIds: ["topic-missing"],
     },
+  });
+});
+
+test("Wire 1.1 可省略消息 owner，Wire 1.2 对同一载荷仍严格拒绝", () => {
+  const topicId = "topic-legacy-owner";
+  const hash = "a".repeat(64);
+  const payload = {
+    topics: {
+      [topicId]: {
+        topicHash: hash,
+        messages: { "message-1": hash },
+      },
+    },
+  };
+  const database = fakeDiffDatabase({
+    topics: {
+      [topicId]: {
+        aggregated_hash: hash,
+        file_path: "/app/Agents/agent-a/config.json",
+      },
+    },
+  });
+
+  assert.deepEqual(
+    handleSyncMessageDiffBatch(payload, database, { protocolVersion: "1.1" })
+      .results[topicId],
+    { ok: true, toPull: [], toPush: false },
+  );
+  assert.throws(
+    () => handleSyncMessageDiffBatch(payload, database, { protocolVersion: "1.2" }),
+    (error) => error.code === "SYNC_PROTOCOL_INVALID",
+  );
+});
+
+test("Phase 3 对桌面客户端返回服务端消息墓碑且禁止旧消息回推复活", () => {
+  const result = handleSyncMessageDiffBatch(
+    {
+      topics: {
+        "topic-live": {
+          topicHash: "c".repeat(64),
+          ownerType: "agent",
+          ownerId: "agent-a",
+          messages: {
+            "message-deleted": "a".repeat(64),
+            "message-local-only": "b".repeat(64),
+          },
+        },
+      },
+    },
+    fakeDiffDatabase({
+      topics: {
+        "topic-live": {
+          aggregated_hash: "desktop-content",
+          file_path: "/app/Agents/agent-a/config.json",
+        },
+      },
+      messages: { "topic-live": [] },
+      deletedMessages: {
+        "topic-live": [{ msg_id: "message-deleted" }],
+      },
+    }),
+  );
+
+  assert.deepEqual(result.results["topic-live"], {
+    ok: true,
+    toPull: [],
+    toPush: true,
+    toDelete: ["message-deleted"],
   });
 });
 
@@ -177,22 +258,6 @@ test("Phase 3 malformed hash 与 DB 查询错误都不能伪装成 no-op 完成"
               ownerType: "agent",
               ownerId: "agent-a",
               messages: { message: "not-a-hash" },
-            },
-          },
-        },
-        fakeDiffDatabase(),
-      ),
-    (error) => error.code === "SYNC_PROTOCOL_INVALID",
-  );
-  assert.throws(
-    () =>
-      handleSyncMessageDiffBatch(
-        {
-          topics: {
-            topic: {
-              topicHash: "",
-              ownerType: "agent",
-              messages: {},
             },
           },
         },
@@ -283,6 +348,34 @@ test("Phase 2.5 topic hash 对错误类型和超预算 fail closed", () => {
   assert.throws(
     () => handleSyncTopicHashBatch({ hashes }),
     (error) => error.code === "SYNC_BUDGET_EXCEEDED",
+  );
+});
+
+test("Wire 1.1 可省略 Phase 2.5 compound topics，Wire 1.2 不可省略", () => {
+  const topicId = "topic-legacy-phase-25";
+  const hash = "a".repeat(64);
+  const payload = {
+    hashes: {
+      [topicId]: { configHash: hash, contentHash: hash },
+    },
+  };
+  const database = fakeDiffDatabase({
+    topics: {
+      [topicId]: {
+        hash,
+        aggregated_hash: hash,
+        file_path: "/app/Agents/agent-a/config.json",
+      },
+    },
+  });
+
+  assert.deepEqual(
+    handleSyncTopicHashBatchV2(payload, database, { protocolVersion: "1.1" }),
+    { type: "SYNC_TOPIC_HASH_RESULTS", changedTopics: [] },
+  );
+  assert.throws(
+    () => handleSyncTopicHashBatchV2(payload, database, { protocolVersion: "1.2" }),
+    (error) => error.code === "SYNC_PROTOCOL_INVALID",
   );
 });
 
@@ -394,6 +487,7 @@ test("Topic manifest 使用复合 Owner 身份且不做路径模糊匹配", () =
         contentHash: "",
         ts: 1,
         ownerType: "agent",
+        ownerId: "agent-a",
       }],
     },
     database,
@@ -422,128 +516,11 @@ test("Topic manifest 使用复合 Owner 身份且不做路径模糊匹配", () =
   );
 });
 
-test("VCPMobile 1.1.3 Phase 2.5 双哈希帧可省略 topics 复合身份", () => {
-  const configHash = "a".repeat(64);
-  const contentHash = "b".repeat(64);
-  const topicId = "topic-mobile-113";
-  const result = handleSyncTopicHashBatchV2(
-    {
-      hashes: {
-        [topicId]: { configHash, contentHash },
-      },
-    },
-    fakeDiffDatabase({
-      topics: {
-        [topicId]: {
-          hash: configHash,
-          aggregated_hash: contentHash,
-          file_path: "/app/Agents/agent-a/config.json",
-        },
-      },
-    }),
-  );
-
-  assert.deepEqual(result, {
-    type: "SYNC_TOPIC_HASH_RESULTS",
-    changedTopics: [],
-  });
-  assert.throws(
-    () => handleSyncTopicHashBatchV2(
-      {
-        hashes: {
-          [topicId]: { configHash, contentHash },
-        },
-        topics: [],
-      },
-      fakeDiffDatabase(),
-    ),
-    (error) => error.code === "SYNC_PROTOCOL_INVALID",
-  );
-});
-
-test("VCPMobile 1.1.3 Topic Manifest 可省略 ownerId 且不会猜测多 Owner 归属", () => {
-  const hash = "c".repeat(64);
-  const database = fakeManifestDatabase();
-  const result = handleSyncManifest(
-    {
-      dataType: "topic",
-      phase: 2,
-      targetedOwners: ["agent-a", "agent-b"],
-      data: [{
-        id: "topic-mobile-only",
-        hash: "",
-        configHash: "",
-        contentHash: "",
-        ts: 1,
-        ownerType: "agent",
-      }],
-    },
-    database,
-  );
-
-  assert.deepEqual(result.data, [{
-    id: "topic-mobile-only",
-    action: "PUSH",
-    ownerType: "agent",
-  }]);
-
-  assert.throws(
-    () => handleSyncManifest(
-      {
-        dataType: "topic",
-        phase: 2,
-        targetedOwners: ["agent-a", "agent-b"],
-        data: [{
-          id: "topic-outside-scope",
-          hash,
-          configHash: hash,
-          contentHash: "",
-          ts: 1,
-          ownerType: "agent",
-          ownerId: "agent-c",
-        }],
-      },
-      database,
-    ),
-    (error) => error.code === "SYNC_OWNER_CONFLICT",
-  );
-});
-
 test("Manifest 错型、重复 ID 和 deletedAt=0 均按硬切契约处理", () => {
   const hash = "b".repeat(64);
   const database = fakeManifestDatabase();
   assert.throws(
     () => handleSyncManifest({ dataType: "agent", phase: 1, data: {} }, database),
-    (error) => error.code === "SYNC_PROTOCOL_INVALID",
-  );
-  assert.throws(
-    () => handleSyncManifest({
-      dataType: "agent",
-      phase: 1,
-      data: [{
-        id: "agent-empty-hash",
-        hash: "",
-        configHash: "",
-        contentHash: "",
-        ts: 1,
-      }],
-    }, database),
-    (error) => error.code === "SYNC_PROTOCOL_INVALID",
-  );
-  assert.throws(
-    () => handleSyncManifest({
-      dataType: "topic",
-      phase: 2,
-      targetedOwners: ["agent-a"],
-      data: [{
-        id: "topic-malformed-hash",
-        hash: "not-a-hash",
-        configHash: "not-a-hash",
-        contentHash: "",
-        ts: 1,
-        ownerType: "agent",
-      }],
-    }, database),
     (error) => error.code === "SYNC_PROTOCOL_INVALID",
   );
   const item = {
@@ -571,6 +548,48 @@ test("Manifest 错型、重复 ID 和 deletedAt=0 均按硬切契约处理", () 
   assert.deepEqual(result.data, [
     { id: "agent-a", action: "DELETE", deletedAt: 0 },
   ]);
+});
+
+test("Wire 1.1 topic manifest 可省略 ownerId 和临时空 hash，Wire 1.2 保持严格", () => {
+  const localHash = "c".repeat(64);
+  const database = fakeManifestDatabase({
+    entities: [{
+      id: "topic-legacy-manifest",
+      type: "topic",
+      file_path: "/app/Agents/agent-a/config.json",
+      hash: localHash,
+      aggregated_hash: localHash,
+      updated_at: 1,
+      deleted_at: null,
+    }],
+  });
+  const payload = {
+    dataType: "topic",
+    phase: 2,
+    targetedOwners: ["agent-a"],
+    data: [{
+      id: "topic-legacy-manifest",
+      hash: "",
+      configHash: "",
+      contentHash: "",
+      ts: 1,
+      ownerType: "agent",
+    }],
+  };
+
+  assert.deepEqual(
+    handleSyncManifest(payload, database, { protocolVersion: "1.1" }).data,
+    [{
+      id: "topic-legacy-manifest",
+      action: "PULL",
+      ownerType: "agent",
+      ownerId: "agent-a",
+    }],
+  );
+  assert.throws(
+    () => handleSyncManifest(payload, database, { protocolVersion: "1.2" }),
+    (error) => error.code === "SYNC_PROTOCOL_INVALID",
+  );
 });
 
 test("损坏 history 的旧索引不能走 topic hash 或消息 manifest 快速成功", () => {

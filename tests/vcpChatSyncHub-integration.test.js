@@ -82,7 +82,17 @@ function exchange(port, token, firstFrame, expectedType) {
   });
 }
 
-function exchangeAfterVersion(port, token, businessFrame, expectedType) {
+function exchangeAfterVersion(
+  port,
+  token,
+  businessFrame,
+  expectedType,
+  versionFrame = {
+    type: "VERSION_CHECK",
+    mobileVersion: "1.1.4",
+    protocolVersion: "1.2",
+  },
+) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(
       `ws://127.0.0.1:${port}/ws-sync?token=${encodeURIComponent(token)}`,
@@ -92,11 +102,7 @@ function exchangeAfterVersion(port, token, businessFrame, expectedType) {
       reject(new Error(`Timed out waiting for ${expectedType}`));
     }, 10_000);
 
-    socket.once("open", () => {
-      socket.send(
-        JSON.stringify({ type: "VERSION_CHECK", mobileVersion: "1.1.3" }),
-      );
-    });
+    socket.once("open", () => socket.send(JSON.stringify(versionFrame)));
     socket.on("message", (data) => {
       const message = JSON.parse(data.toString("utf8"));
       if (message.type === "VERSION_ACK") {
@@ -115,7 +121,7 @@ function exchangeAfterVersion(port, token, businessFrame, expectedType) {
   });
 }
 
-test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { timeout: 15_000 }, async (t) => {
+test("SyncHub negotiates Wire 1.1/1.2 and keeps authenticated desktop routes", { timeout: 15_000 }, async (t) => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vcp-sync-hub-"));
   const appDataPath = path.join(tempRoot, "AppData");
   const wsPort = await reservePort();
@@ -123,6 +129,7 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   const ownerId = "agent-existing-history";
   const topicId = "topic-existing-history";
   const deletableTopicId = "topic-mobile-delete";
+  const legacyDeletableTopicId = "topic-mobile-legacy-delete";
   await fs.mkdir(path.join(appDataPath, "Agents", ownerId), { recursive: true });
   await fs.mkdir(
     path.join(appDataPath, "UserData", ownerId, "topics", topicId),
@@ -130,6 +137,10 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   );
   await fs.mkdir(
     path.join(appDataPath, "UserData", ownerId, "topics", deletableTopicId),
+    { recursive: true },
+  );
+  await fs.mkdir(
+    path.join(appDataPath, "UserData", ownerId, "topics", legacyDeletableTopicId),
     { recursive: true },
   );
   await fs.writeFile(
@@ -140,6 +151,7 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
       topics: [
         { id: topicId, name: "Existing Topic", createdAt: 1 },
         { id: deletableTopicId, name: "Mobile Delete Topic", createdAt: 2 },
+        { id: legacyDeletableTopicId, name: "Legacy Mobile Delete Topic", createdAt: 3 },
       ],
     }),
   );
@@ -166,6 +178,19 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
     ),
     JSON.stringify([
       { id: "message-deleted-topic", role: "user", content: "preserved", timestamp: 2 },
+    ]),
+  );
+  await fs.writeFile(
+    path.join(
+      appDataPath,
+      "UserData",
+      ownerId,
+      "topics",
+      legacyDeletableTopicId,
+      "history.json",
+    ),
+    JSON.stringify([
+      { id: "message-legacy-deleted-topic", role: "user", content: "preserved", timestamp: 3 },
     ]),
   );
   const app = express();
@@ -200,15 +225,15 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
     {
       type: "VERSION_CHECK",
       mobileVersion: "integration-test",
-      protocolVersion: "1.1",
+      protocolVersion: "1.2",
     },
     "VERSION_ACK",
   );
   assert.deepEqual(versionAck, {
     type: "VERSION_ACK",
-    version: "1.0.0",
-    pluginVersion: "1.1.0",
-    protocolVersion: "1.1",
+    version: "1.2.0",
+    pluginVersion: "1.2.0",
+    protocolVersion: "1.2",
   });
 
   const mobileVersionAck = await exchange(
@@ -265,7 +290,12 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
       "x-sync-token": token,
     },
     body: JSON.stringify({
-      requests: [{ topicId, msgIds: ["message-existing"] }],
+      requests: [{
+        topicId,
+        ownerType: "agent",
+        ownerId,
+        msgIds: ["message-existing"],
+      }],
     }),
   });
   const mobileMessagePullText = await mobileMessagePull.text();
@@ -276,6 +306,27 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   assert.equal(mobileMessageFrame.ownerId, ownerId);
   assert.deepEqual(
     mobileMessageFrame.messages.map((message) => message.id),
+    ["message-existing"],
+  );
+
+  const legacyMessagePull = await fetch(`${baseUrl}/download-messages-stream`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-sync-token": token,
+    },
+    body: JSON.stringify({
+      requests: [{ topicId, msgIds: ["message-existing"] }],
+    }),
+  });
+  const legacyMessagePullFrame = JSON.parse(
+    (await legacyMessagePull.text()).trim(),
+  );
+  assert.equal(legacyMessagePull.status, 200);
+  assert.equal(legacyMessagePullFrame.ownerType, "agent");
+  assert.equal(legacyMessagePullFrame.ownerId, ownerId);
+  assert.deepEqual(
+    legacyMessagePullFrame.messages.map((message) => message.id),
     ["message-existing"],
   );
 
@@ -297,7 +348,10 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   const conflictingMessageFrame = JSON.parse(
     (await conflictingMessagePull.text()).trim(),
   );
-  assert.match(conflictingMessageFrame._error, /owner identity conflicts/);
+  assert.match(
+    conflictingMessageFrame._error.message,
+    /owner identity conflicts/,
+  );
 
   const mobileMessagePush = await fetch(`${baseUrl}/upload-messages-batch`, {
     method: "POST",
@@ -307,6 +361,8 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
     },
     body: `${JSON.stringify({
       topicId,
+      ownerType: "agent",
+      ownerId,
       messages: [{
         id: "message-mobile-push",
         role: "user",
@@ -328,6 +384,22 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
     ["message-existing", "message-mobile-push"],
   );
 
+  const legacyMessagePush = await fetch(`${baseUrl}/upload-messages-batch`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-ndjson",
+      "x-sync-token": token,
+    },
+    body: `${JSON.stringify({ topicId, messages: [] })}\n`,
+  });
+  const legacyMessagePushText = await legacyMessagePush.text();
+  assert.equal(legacyMessagePush.status, 200, legacyMessagePushText);
+  assert.deepEqual(JSON.parse(legacyMessagePushText.trim()), {
+    topicId,
+    success: true,
+    neededAttachmentHashes: [],
+  });
+
   const conflictingMessagePush = await fetch(`${baseUrl}/upload-messages-batch`, {
     method: "POST",
     headers: {
@@ -345,7 +417,46 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
     (await conflictingMessagePush.text()).trim(),
   );
   assert.equal(conflictingMessagePushFrame.success, false);
-  assert.match(conflictingMessagePushFrame.error, /owner identity conflicts/);
+  assert.match(
+    conflictingMessagePushFrame.error.message,
+    /owner identity conflicts/,
+  );
+
+  const messageDelete = await fetch(`${baseUrl}/delete-message`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-sync-token": token,
+    },
+    body: JSON.stringify({
+      topicId,
+      msgId: "message-mobile-push",
+      deletedAt: Date.now(),
+    }),
+  });
+  const messageDeleteBody = await messageDelete.json();
+  assert.equal(messageDelete.status, 200);
+  assert.deepEqual(messageDeleteBody, {
+    success: true,
+    topicId,
+    msgId: "message-mobile-push",
+  });
+  assert.deepEqual(
+    (JSON.parse(await fs.readFile(historyPath, "utf8"))).map(message => message.id),
+    ["message-existing"],
+  );
+
+  const strictDeleteError = await exchangeAfterVersion(
+    wsPort,
+    token,
+    {
+      type: "SYNC_ENTITY_DELETE",
+      id: deletableTopicId,
+      dataType: "topic",
+    },
+    "SYNC_ERROR",
+  );
+  assert.equal(strictDeleteError.error.code, "SYNC_DELETE_INVALID");
 
   const mobileDeleteAck = await exchangeAfterVersion(
     wsPort,
@@ -354,12 +465,31 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
       type: "SYNC_ENTITY_DELETE",
       id: deletableTopicId,
       dataType: "topic",
+      deletedAt: Date.now(),
     },
     "SYNC_ACK",
   );
   assert.deepEqual(mobileDeleteAck, {
     type: "SYNC_ACK",
     id: deletableTopicId,
+  });
+  const legacyMobileDeleteAck = await exchangeAfterVersion(
+    wsPort,
+    token,
+    {
+      type: "SYNC_ENTITY_DELETE",
+      id: legacyDeletableTopicId,
+      dataType: "topic",
+    },
+    "SYNC_ACK",
+    {
+      type: "VERSION_CHECK",
+      mobileVersion: "1.1.3",
+    },
+  );
+  assert.deepEqual(legacyMobileDeleteAck, {
+    type: "SYNC_ACK",
+    id: legacyDeletableTopicId,
   });
   const configAfterMobileDelete = JSON.parse(
     await fs.readFile(
@@ -389,8 +519,12 @@ test("SyncHub serves protocol 1.1 and keeps authenticated desktop routes", { tim
   const restartVersionAck = await exchange(
     wsPort,
     token,
-    { type: "VERSION_CHECK", mobileVersion: "1.1.3" },
+    {
+      type: "VERSION_CHECK",
+      mobileVersion: "1.1.4",
+      protocolVersion: "1.2",
+    },
     "VERSION_ACK",
   );
-  assert.equal(restartVersionAck.protocolVersion, "1.1");
+  assert.equal(restartVersionAck.protocolVersion, "1.2");
 });

@@ -22,6 +22,12 @@ const { parseJsonWithoutDuplicateKeys } = require("../protocol");
 const { canonicalizeHistory } = require("./canonical");
 const { projectMobileTopic } = require("./projection");
 const {
+  createHttpErrorBody,
+  createStreamErrorFrame,
+  createSyncError,
+  normalizeSyncError,
+} = require("../error-contract");
+const {
   MAX_NDJSON_MESSAGES,
   MAX_NDJSON_TOPICS,
   NdjsonWriter,
@@ -147,7 +153,10 @@ async function downloadMessagesStreamRaw(requests, appDataPath, res) {
   const logger = getLogger();
   const db = getDb();
   if (!db) {
-    res.status(500).json({ error: "Database not initialized" });
+    res.status(500).json(createHttpErrorBody("Database not initialized", {
+      code: "SYNC_DB_UNAVAILABLE",
+      stage: "messages",
+    }));
     return;
   }
   if (
@@ -155,7 +164,11 @@ async function downloadMessagesStreamRaw(requests, appDataPath, res) {
     requests.length === 0 ||
     requests.some((request) => !request || typeof request !== "object")
   ) {
-    throw new Error("Message pull requires non-empty object requests");
+    throw createSyncError(
+      "SYNC_REQUEST_INVALID",
+      "Message pull requires non-empty object requests",
+      { stage: "messages" },
+    );
   }
 
   res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
@@ -169,25 +182,42 @@ async function downloadMessagesStreamRaw(requests, appDataPath, res) {
   const seenTopics = new Set();
   let requestedMessages = 0;
   if (requests.length > MAX_NDJSON_TOPICS) {
-    throw new Error("Message pull exceeds 10000 topics");
+    throw createSyncError(
+      "SYNC_BUDGET_EXCEEDED",
+      "Message pull exceeds 10000 topics",
+      { stage: "messages" },
+    );
   }
   for (const { topicId, ownerType, ownerId, msgIds = [] } of requests) {
     const safeTopicId = sanitizeId(topicId);
+    const hasOwnerType = ownerType !== undefined;
+    const hasOwnerId = ownerId !== undefined;
+    const legacyIdentity = !hasOwnerType && !hasOwnerId;
     try {
       if (!safeTopicId || safeTopicId !== topicId || seenTopics.has(safeTopicId)) {
-        throw new Error("Message pull topic IDs must be non-empty and unique");
+        throw createSyncError(
+          "SYNC_REQUEST_INVALID",
+          "Message pull topic IDs must be non-empty and unique",
+          { stage: "messages", failedTopicIds: [topicId] },
+        );
       }
       if (
         !Array.isArray(msgIds) ||
         new Set(msgIds).size !== msgIds.length ||
         msgIds.some((id) => typeof id !== "string" || id.length === 0)
       ) {
-        throw new Error("Message pull IDs must be non-empty strings and unique");
+        throw createSyncError(
+          "SYNC_REQUEST_INVALID",
+          "Message pull IDs must be non-empty strings and unique",
+          { stage: "messages", failedTopicIds: [safeTopicId] },
+        );
       }
-      const hasOwnerType = ownerType !== undefined;
-      const hasOwnerId = ownerId !== undefined;
       if (hasOwnerType !== hasOwnerId) {
-        throw new Error("Message pull requires ownerType and ownerId together");
+        throw createSyncError(
+          "SYNC_REQUEST_INVALID",
+          "Message pull requires ownerType and ownerId together",
+          { stage: "messages", failedTopicIds: [safeTopicId] },
+        );
       }
       if (
         hasOwnerType &&
@@ -197,17 +227,37 @@ async function downloadMessagesStreamRaw(requests, appDataPath, res) {
           ownerId.length === 0
         )
       ) {
-        throw new Error("Message pull owner identity is invalid");
+        throw createSyncError(
+          "SYNC_REQUEST_INVALID",
+          "Message pull owner identity is invalid",
+          { stage: "messages", failedTopicIds: [safeTopicId] },
+        );
       }
       seenTopics.add(safeTopicId);
       assertHistoryTopicHealthy(safeTopicId);
       requestedMessages += msgIds.length;
       if (msgIds.length > 10_000 || requestedMessages > MAX_NDJSON_MESSAGES) {
-        throw new Error("Message pull exceeds message count budget");
+        throw createSyncError(
+          "SYNC_BUDGET_EXCEEDED",
+          "Message pull exceeds message count budget",
+          { stage: "messages", failedTopicIds: [safeTopicId] },
+        );
       }
       const row = getEntityIndex(safeTopicId, "topic");
       if (!row) {
-        await writer.write({ topicId, ownerType, ownerId, messages: [], _error: "topic not found" });
+        await writer.write({
+          topicId,
+          ownerType,
+          ownerId,
+          messages: [],
+          _error: legacyIdentity
+            ? "topic not found"
+            : normalizeSyncError("topic not found", {
+              code: "TOPIC_NOT_FOUND",
+              stage: "messages",
+              failedTopicIds: [safeTopicId],
+            }),
+        });
         errorCount++;
         continue;
       }
@@ -220,7 +270,11 @@ async function downloadMessagesStreamRaw(requests, appDataPath, res) {
         hasOwnerType &&
         (ownerType !== actualOwnerType || ownerId !== parentId)
       ) {
-        throw new Error("topic owner identity conflicts with desktop index");
+        throw createSyncError(
+          "SYNC_OWNER_CONFLICT",
+          "topic owner identity conflicts with desktop index",
+          { stage: "messages", failedTopicIds: [safeTopicId] },
+        );
       }
       const historyPath = path.join(
         appDataPath,
@@ -240,7 +294,11 @@ async function downloadMessagesStreamRaw(requests, appDataPath, res) {
       if (wanted.size > 0) {
         const actual = new Set(messages.map((message) => message.id));
         if (actual.size !== wanted.size || [...wanted].some((id) => !actual.has(id))) {
-          throw new Error("requested message set is incomplete");
+          throw createSyncError(
+            "SYNC_MESSAGE_READ_FAILED",
+            "requested message set is incomplete",
+            { stage: "messages", failedTopicIds: [safeTopicId] },
+          );
         }
       }
       await writer.write({
@@ -267,7 +325,19 @@ async function downloadMessagesStreamRaw(requests, appDataPath, res) {
       successCount++;
     } catch (e) {
       // 单 topic 失败写错误帧，不中断流
-      await writer.write({ topicId, ownerType, ownerId, messages: [], _error: e.message });
+      await writer.write({
+        topicId,
+        ownerType,
+        ownerId,
+        messages: [],
+        _error: legacyIdentity
+          ? e.message
+          : normalizeSyncError(e, {
+            code: "SYNC_MESSAGE_READ_FAILED",
+            stage: "messages",
+            failedTopicIds: [safeTopicId],
+          }),
+      });
       errorCount++;
     }
   }
@@ -349,7 +419,10 @@ async function uploadMessagesBatchRaw(req, appDataPath, res) {
   const logger = getLogger();
   const db = getDb();
   if (!db) {
-    res.status(500).json({ error: "Database not initialized" });
+    res.status(500).json(createHttpErrorBody("Database not initialized", {
+      code: "SYNC_DB_UNAVAILABLE",
+      stage: "messages",
+    }));
     return;
   }
 
@@ -364,25 +437,42 @@ async function uploadMessagesBatchRaw(req, appDataPath, res) {
   const seenTopics = new Set();
   let topicCount = 0;
   let messageCount = 0;
+  let sawLegacyFrame = false;
 
   try {
     for await (const line of readNdjsonLines(req)) {
       let topicId = null;
+      let streamFatal = false;
+      let legacyIdentity = false;
       try {
         const frame = parseJsonWithoutDuplicateKeys(decodeNdjsonLine(line));
         topicId = frame.topicId;
         const { messages, ownerType, ownerId } = frame;
-        const safeTopicId = sanitizeId(topicId);
-        if (!safeTopicId || safeTopicId !== topicId) {
-          throw new Error("topicId is missing or contains unsupported characters");
-        }
-        if (!Array.isArray(messages)) {
-          throw new Error("messages must be an array");
-        }
         const hasOwnerType = ownerType !== undefined;
         const hasOwnerId = ownerId !== undefined;
+        legacyIdentity = !hasOwnerType && !hasOwnerId;
+        sawLegacyFrame ||= legacyIdentity;
+        const safeTopicId = sanitizeId(topicId);
+        if (!safeTopicId || safeTopicId !== topicId) {
+          throw createSyncError(
+            "SYNC_REQUEST_INVALID",
+            "topicId is missing or contains unsupported characters",
+            { stage: "messages" },
+          );
+        }
+        if (!Array.isArray(messages)) {
+          throw createSyncError(
+            "SYNC_REQUEST_INVALID",
+            "messages must be an array",
+            { stage: "messages", failedTopicIds: [safeTopicId] },
+          );
+        }
         if (hasOwnerType !== hasOwnerId) {
-          throw new Error("Message push requires ownerType and ownerId together");
+          throw createSyncError(
+            "SYNC_REQUEST_INVALID",
+            "Message push requires ownerType and ownerId together",
+            { stage: "messages", failedTopicIds: [safeTopicId] },
+          );
         }
         if (
           hasOwnerType &&
@@ -392,7 +482,11 @@ async function uploadMessagesBatchRaw(req, appDataPath, res) {
             ownerId.length === 0
           )
         ) {
-          throw new Error("Message push owner identity is invalid");
+          throw createSyncError(
+            "SYNC_REQUEST_INVALID",
+            "Message push owner identity is invalid",
+            { stage: "messages", failedTopicIds: [safeTopicId] },
+          );
         }
         topicCount += 1;
         messageCount += messages.length;
@@ -401,10 +495,20 @@ async function uploadMessagesBatchRaw(req, appDataPath, res) {
           messages.length > 10_000 ||
           messageCount > MAX_NDJSON_MESSAGES
         ) {
-          throw new Error("Message push exceeds topic or message count budget");
+          streamFatal = true;
+          throw createSyncError(
+            "SYNC_BUDGET_EXCEEDED",
+            "Message push exceeds topic or message count budget",
+            { stage: "messages", failedTopicIds: [safeTopicId] },
+          );
         }
         if (seenTopics.has(safeTopicId)) {
-          throw new Error("Message push contains a duplicate topic identity");
+          streamFatal = true;
+          throw createSyncError(
+            "SYNC_REQUEST_INVALID",
+            "Message push contains a duplicate topic identity",
+            { stage: "messages", failedTopicIds: [safeTopicId] },
+          );
         }
         seenTopics.add(safeTopicId);
 
@@ -414,7 +518,13 @@ async function uploadMessagesBatchRaw(req, appDataPath, res) {
             topicId,
             success: false,
             neededAttachmentHashes: [],
-            error: "topic not found",
+            error: legacyIdentity
+              ? "topic not found"
+              : normalizeSyncError("topic not found", {
+                code: "TOPIC_NOT_FOUND",
+                stage: "messages",
+                failedTopicIds: [safeTopicId],
+              }),
           });
           errorCount++;
           continue;
@@ -427,7 +537,11 @@ async function uploadMessagesBatchRaw(req, appDataPath, res) {
           hasOwnerType &&
           (ownerType !== actualOwnerType || ownerId !== actualOwnerId)
         ) {
-          throw new Error("topic owner identity conflicts with desktop index");
+          throw createSyncError(
+            "SYNC_OWNER_CONFLICT",
+            "topic owner identity conflicts with desktop index",
+            { stage: "messages", failedTopicIds: [safeTopicId] },
+          );
         }
 
         writeIntentLock.add(safeTopicId);
@@ -442,12 +556,19 @@ async function uploadMessagesBatchRaw(req, appDataPath, res) {
         successCount++;
       } catch (e) {
         logger.logOperation("messages", "upload_batch_stream", "line_parse", "error", e.message);
+        if (streamFatal) throw e;
         if (typeof topicId === "string" && topicId.length > 0) {
           await writer.write({
             topicId,
             success: false,
             neededAttachmentHashes: [],
-            error: e.message,
+            error: legacyIdentity
+              ? e.message
+              : normalizeSyncError(e, {
+                code: "SYNC_MESSAGE_WRITE_FAILED",
+                stage: "messages",
+                failedTopicIds: [topicId],
+              }),
           });
         } else {
           throw e;
@@ -461,7 +582,13 @@ async function uploadMessagesBatchRaw(req, appDataPath, res) {
   } catch (e) {
     logger.logOperation("messages", "upload_messages_batch_stream", "global", "error", e.message);
     if (!res.writableEnded) {
-      await writer.write({ _stream_error: e.message }).catch(() => {});
+      const frame = sawLegacyFrame
+        ? { _stream_error: e.message }
+        : createStreamErrorFrame(e, {
+          code: "SYNC_STREAM_FAILED",
+          stage: "messages",
+        });
+      await writer.write(frame).catch(() => {});
     }
   } finally {
     res.end();

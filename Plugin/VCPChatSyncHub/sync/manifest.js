@@ -4,6 +4,7 @@
 
 const { getDb } = require("../core/db");
 const { getLogger } = require("../core/logger");
+const { LEGACY_WIRE_PROTOCOL_VERSION } = require("../protocol");
 const { assertHistoryTopicHealthy } = require("./message");
 
 const MAX_MANIFEST_ITEMS = 10_000;
@@ -197,19 +198,18 @@ function getLocalManifest(dataType, targetedOwners = null, database = getDb()) {
  * @param {object} payload - 消息载荷
  * @returns {object} 差异结果
  */
-function normalizeRemoteManifestItem(item, dataType, index) {
+function normalizeRemoteManifestItem(item, dataType, index, options = {}) {
   if (!item || typeof item !== "object" || Array.isArray(item)) {
     throw syncContractError(`Manifest item ${index} must be an object`);
   }
   const id = requireNonEmptyString(item.id, `Manifest item ${index} id`);
-  // VCPMobile 1.1.3 can transiently persist an empty topic config hash after
-  // applying a pull. Treat that one topic-only state as "unknown" so the
-  // later diff phases can repair it; every non-empty hash remains strict.
-  const allowEmptyConfigHash = dataType === "topic";
+  const legacyTopic =
+    dataType === "topic" &&
+    options.protocolVersion === LEGACY_WIRE_PROTOCOL_VERSION;
   const normalized = {
     id,
     hash: requireHash(item.hash, `Manifest item ${id} hash`, {
-      allowEmpty: allowEmptyConfigHash,
+      allowEmpty: legacyTopic,
     }),
     ts: requireTimestamp(item.ts, `Manifest item ${id} timestamp`),
     deletedAt: requireOptionalTombstone(
@@ -226,7 +226,7 @@ function normalizeRemoteManifestItem(item, dataType, index) {
   normalized.configHash = requireHash(
     item.configHash,
     `Manifest item ${id} configHash`,
-    { allowEmpty: allowEmptyConfigHash },
+    { allowEmpty: legacyTopic },
   );
   normalized.contentHash = requireHash(
     item.contentHash,
@@ -238,11 +238,7 @@ function normalizeRemoteManifestItem(item, dataType, index) {
       throw syncContractError(`Topic manifest ${id} requires agent/group ownerType`);
     }
     normalized.ownerType = item.ownerType;
-    // VCPMobile 1.1.3's EntityState intentionally carries ownerType but not
-    // ownerId. Keep rejecting explicit null/empty values while accepting the
-    // genuinely omitted legacy field. Existing topics are resolved against
-    // the desktop index below; new topics upload a full DTO containing ownerId.
-    if (item.ownerId !== undefined) {
+    if (!legacyTopic || item.ownerId !== undefined) {
       normalized.ownerId = requireNonEmptyString(
         item.ownerId,
         `Topic manifest ${id} ownerId`,
@@ -256,21 +252,21 @@ function matchesTopicOwnerType(value) {
   return value === "agent" || value === "group";
 }
 
-function resolveTopicOwner(remote, local, ownerFilter) {
+function resolveTopicOwner(remote, local, ownerFilter, { legacy = false } = {}) {
   if (remote.ownerId !== undefined && !ownerFilter.has(remote.ownerId)) {
     throw syncContractError(
       `Topic ${remote.id} owner is outside targetedOwners`,
       "SYNC_OWNER_CONFLICT",
     );
   }
-
   if (!local) {
-    // Do not guess ownership for a new legacy topic. Match the upstream 1.0
-    // desktop plugin and omit ownerId; VCPMobile reads the authoritative value
-    // from its own topic row before uploading the complete topic DTO.
+    if (!legacy && remote.ownerId === undefined) {
+      throw syncContractError(
+        `Topic manifest ${remote.id} requires ownerId`,
+      );
+    }
     return;
   }
-
   if (
     remote.ownerType !== local.ownerType ||
     (remote.ownerId !== undefined && remote.ownerId !== local.ownerId)
@@ -280,7 +276,7 @@ function resolveTopicOwner(remote, local, ownerFilter) {
       "SYNC_OWNER_CONFLICT",
     );
   }
-  remote.ownerId = local.ownerId;
+  if (remote.ownerId === undefined) remote.ownerId = local.ownerId;
 }
 
 function actionIdentity(item, dataType) {
@@ -290,7 +286,7 @@ function actionIdentity(item, dataType) {
   return identity;
 }
 
-function handleSyncManifest(payload, database = getDb()) {
+function handleSyncManifest(payload, database = getDb(), options = {}) {
   const { dataType, data: remoteItems, targetedOwners } = payload;
   const logger = getLogger();
   const phase = (dataType === "topic") ? "topic_metadata" : "owner_metadata";
@@ -328,7 +324,7 @@ function handleSyncManifest(payload, database = getDb()) {
     throw syncContractError("Non-empty topic manifest requires targetedOwners");
   }
   const normalizedRemoteItems = remoteItems.map((item, index) =>
-    normalizeRemoteManifestItem(item, dataType, index),
+    normalizeRemoteManifestItem(item, dataType, index, options),
   );
   const remoteById = new Map();
   for (const item of normalizedRemoteItems) {
@@ -358,7 +354,9 @@ function handleSyncManifest(payload, database = getDb()) {
         );
       }
       local = indexedLocal || local;
-      resolveTopicOwner(remote, local, ownerFilter);
+      resolveTopicOwner(remote, local, ownerFilter, {
+        legacy: options.protocolVersion === LEGACY_WIRE_PROTOCOL_VERSION,
+      });
     }
 
     if (remoteDeletedAt !== null) {
