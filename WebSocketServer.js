@@ -185,6 +185,7 @@ function initialize(httpServer, config) {
         const chromeControlPathRegex = /^\/vcp-chrome-control\/VCP_Key=(.+)$/;
         const chromeObserverPathRegex = /^\/vcp-chrome-observer\/VCP_Key=(.+)$/;
         const adminPanelPathRegex = /^\/vcp-admin-panel\/VCP_Key=(.+)$/; // 新增
+        const workerPanelPathRegex = /^\/vcp-worker-panel\/VCP_Key=(.+)$/; // 新增：AICodeWorker 任务面板
 
         const vcpMatch = pathname.match(vcpLogPathRegex);
         const vcpInfoMatch = pathname.match(vcpInfoPathRegex); // 新增匹配
@@ -192,6 +193,7 @@ function initialize(httpServer, config) {
         const chromeControlMatch = pathname.match(chromeControlPathRegex);
         const chromeObserverMatch = pathname.match(chromeObserverPathRegex);
         const adminPanelMatch = pathname.match(adminPanelPathRegex); // 新增
+        const workerPanelMatch = pathname.match(workerPanelPathRegex); // 新增
 
         let isAuthenticated = false;
         let clientType = null;
@@ -221,6 +223,12 @@ function initialize(httpServer, config) {
             clientType = 'AdminPanel';
             connectionKey = adminPanelMatch[1];
             writeLog(`Admin Panel client attempting to connect.`);
+        } else if (workerPanelMatch && workerPanelMatch[1]) {
+            // WorkerPanel 落入通用 clients Map，复用 broadcast(data, 'WorkerPanel') 过滤，
+            // 不新增独立 Map 或广播函数。
+            clientType = 'WorkerPanel';
+            connectionKey = workerPanelMatch[1];
+            writeLog(`Worker Panel client attempting to connect.`);
         } else {
             writeLog(`WebSocket upgrade request for unhandled path: ${pathname}. Ignoring.`);
             socket.destroy();

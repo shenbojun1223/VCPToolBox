@@ -1,0 +1,29 @@
+{
+  "name": "AICodeWorkerMonitor",
+  "displayName": "AICodeWorker 任务状态监听器",
+  "version": "1.0.0",
+  "description": "监听 AICodeWorker 任务 jobs/meta/*.json 文件变更，通过 WebSocket 广播任务状态给 WorkerPanel 前端客户端。对 AICodeWorker.js / runner.js 零侵入，纯文件监听。",
+  "author": "Lucy",
+  "pluginType": "service",
+  "entryPoint": {
+    "script": "AICodeWorkerMonitor.js"
+  },
+  "communication": {
+    "protocol": "direct"
+  },
+  "configSchema": {
+    "AICODEWORKER_JOBS_META_PATH": {
+      "type": "string",
+      "default": "",
+      "description": "可选：AICodeWorker jobs/meta 目录绝对路径。留空则自动推导为 <PROJECT_BASE_PATH>/Plugin/AICodeWorker/jobs/meta。"
+    },
+    "DebugMode": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "capabilities": {
+    "systemPromptPlaceholders": [],
+    "invocationCommands": []
+  }
+}
