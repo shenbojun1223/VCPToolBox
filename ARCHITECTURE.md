@@ -393,7 +393,7 @@ The master configuration file. Copy `config.env.example` to `config.env` and fil
 | **API Access** | `Key`, `API_Key`, `API_URL` | Inbound auth key, upstream LLM API key, upstream LLM base URL |
 | **Specialised Keys** | `Image_Key`, `File_Key`, `VCP_Key`, `AdminPassword` | Auth for image/file endpoints, WebSocket, admin panel |
 | **Server** | `Port` (default 6005) | Listening port |
-| **Tool Loop** | `MaxVCPLoopStream`, `MaxVCPLoopNonStream` | Max tool-call iterations (default 5 each) |
+| **Tool Loop** | `MaxVCPLoopStream`, `MaxVCPLoopNonStream` | Max tool-call iterations (default 12 each) |
 | **Role Divider** | `EnableRoleDivider`, `RoleDividerSystem` | Enable context branching, marker text |
 | **Knowledge Base** | `KNOWLEDGEBASE_ROOT_PATH`, `VECTORDB_DIMENSION` | Diary root path, embedding vector dimension (default 3072) |
 | **RAG Tuning** | `RAG_BETA_DynamicInflation`, EPA weights | Live-tunable retrieval parameters |
@@ -913,7 +913,7 @@ Plugin.js 检查插件 manifest
 | **API 访问** | `Key`、`API_Key`、`API_URL` | 入站认证密钥、上游 LLM API 密钥、上游 LLM 基础 URL |
 | **专用密钥** | `Image_Key`、`File_Key`、`VCP_Key`、`AdminPassword` | 图像/文件端点、WebSocket、管理面板的认证 |
 | **服务器** | `Port`（默认 6005）| 监听端口 |
-| **工具循环** | `MaxVCPLoopStream`、`MaxVCPLoopNonStream` | 最大工具调用迭代次数（各默认 5）|
+| **工具循环** | `MaxVCPLoopStream`、`MaxVCPLoopNonStream` | 最大工具调用迭代次数（各默认 12）|
 | **角色分割器** | `EnableRoleDivider`、`RoleDividerSystem` | 启用上下文分支、标记文本 |
 | **知识库** | `KNOWLEDGEBASE_ROOT_PATH`、`VECTORDB_DIMENSION` | 日记根路径、嵌入向量维度（默认 3072）|
 | **RAG 调优** | `RAG_BETA_DynamicInflation`、EPA 权重 | 实时可调检索参数 |
