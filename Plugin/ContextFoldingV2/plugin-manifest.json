@@ -13,25 +13,19 @@
     },
     "requiresContextBridge": true,
     "configSchema": {
-        "FOLDING_SUMMARY_MODEL": {
-            "type": "string",
-            "description": "用于生成折叠摘要的模型名称",
-            "default": "gemini-2.0-flash-lite"
-        },
-        "FOLDING_MIN_DEPTH": {
-            "type": "integer",
-            "description": "最低折叠触发深度（从最新AI回复往上数，此值之后的AI输出才可能被折叠）",
-            "default": 3
-        },
-        "FOLDING_SIMILARITY_LOW": {
-            "type": "number",
-            "description": "折叠触发的相似度下限（低于此值判定为无关）",
-            "default": 0.3
-        },
-        "FOLDING_SIMILARITY_HIGH": {
-            "type": "number",
-            "description": "折叠触发的相似度上限（动态K公式摇摆范围）",
-            "default": 0.5
-        }
+        "FOLDING_SUMMARY_MODEL": "string",
+        "FOLDING_SUMMARY_SYSTEM_PROMPT": "string",
+        "FOLDING_SUMMARY_USER_PROMPT": "string",
+        "FOLDING_MIN_DEPTH": "integer",
+        "FOLDING_MAX_RETRIES": "integer",
+        "FOLDING_SUMMARY_MAX_CONCURRENT": "integer"
+    },
+    "configSchemaDescriptions": {
+        "FOLDING_SUMMARY_MODEL": "用于生成折叠摘要的模型名称",
+        "FOLDING_SUMMARY_SYSTEM_PROMPT": "摘要模型使用的系统提示词；可用 \\n 表示换行",
+        "FOLDING_SUMMARY_USER_PROMPT": "摘要模型使用的用户提示词模板；必须包含 {CONTENT}；可用 \\n 表示换行",
+        "FOLDING_MIN_DEPTH": "最低折叠触发深度；系统强制最低为 2",
+        "FOLDING_MAX_RETRIES": "摘要生成失败后的最大重试次数",
+        "FOLDING_SUMMARY_MAX_CONCURRENT": "同时生成折叠摘要的最大并发数"
     }
 }

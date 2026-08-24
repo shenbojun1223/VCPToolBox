@@ -2,26 +2,43 @@
 const { tavily } = require('@tavily/core'); // Using the official Node.js client
 const stdin = require('process').stdin;
 
+const DIRECT_MAX_RESULTS = 3;
+const DIRECT_MAX_SUBQUERIES = 1;
+const MAX_SNIPPET_CHARS = 1200;
+const MAX_OUTPUT_CHARS = 10000;
+
+function truncateText(value, maxChars, label = '内容') {
+    const text = String(value || '');
+    if (text.length <= maxChars) return text;
+    return `${text.slice(0, maxChars)}\n\n...[${label}已截断；原始长度 ${text.length} 字符]`;
+}
+
 /**
  * 将 Tavily 搜索结果格式化为 Markdown
  */
 function formatTavilyResults(response) {
     let md = '';
     if (response.answer) {
-        md += `### 直接回答\n${response.answer}\n\n`;
+        md += `### 直接回答\n${truncateText(response.answer, 1500, '直接回答')}\n\n`;
     }
-    if (response.results && response.results.length > 0) {
+
+    const results = Array.isArray(response.results)
+        ? response.results.slice(0, DIRECT_MAX_RESULTS)
+        : [];
+
+    if (results.length > 0) {
         md += `### 搜索结果\n`;
-        response.results.forEach((item, index) => {
+        results.forEach((item, index) => {
             md += `${index + 1}. **[${item.title}](${item.url})**\n`;
             if (item.content) {
-                md += `   ${item.content}\n\n`;
+                md += `   ${truncateText(item.content, MAX_SNIPPET_CHARS, '单条搜索摘要')}\n\n`;
             }
         });
     } else {
         md += `未找到相关搜索结果。\n`;
     }
-    return md;
+
+    return truncateText(md, MAX_OUTPUT_CHARS, 'TavilySearch 直连输出');
 }
 
 async function main() {
@@ -43,27 +60,32 @@ async function main() {
             const data = JSON.parse(inputData);
 
             const query = data.query;
-            const topic = data.topic || 'general'; // Default to 'general'
-            const searchDepth = data.search_depth || 'basic'; // Default to 'basic'
-            let maxResults = data.max_results || 10; // Default to 10
+            const directTavily = data.direct_tavily === true || data.direct_tavily === 'true';
+            const allowRawContent = data.allow_raw_content === true || data.allow_raw_content === 'true';
+            const topic = data.topic || 'general';
+            const searchDepth = data.search_depth || 'basic';
+            let maxResults = data.max_results ?? DIRECT_MAX_RESULTS;
             const includeRawContent = data.include_raw_content;
             const country = data.country?.trim().toLowerCase(); // 新增国家来源参数
             const startDate = data.start_date;
             const endDate = data.end_date;
             const time_range = data.time_range;
 
+            if (!directTavily) {
+                throw new Error("TavilySearch 是受限直连工具。普通联网检索请使用 VSearch；确需直连时必须显式传 direct_tavily=true。");
+            }
+
             if (!query) {
                 throw new Error("Missing required argument: query");
             }
 
-            // Validate max_results
+            // Validate and hard-cap max_results
             try {
                 maxResults = parseInt(maxResults, 10);
-                if (isNaN(maxResults) || maxResults < 5 || maxResults > 100) {
-                    maxResults = 10; // Default to 10 if invalid or out of range
-                }
+                if (isNaN(maxResults)) maxResults = DIRECT_MAX_RESULTS;
+                maxResults = Math.min(Math.max(maxResults, 1), DIRECT_MAX_RESULTS);
             } catch (e) {
-                maxResults = 10; // Default if parsing fails
+                maxResults = DIRECT_MAX_RESULTS;
             }
 
             let apiKey = process.env.TavilyKey; // Use the correct environment variable name
@@ -94,6 +116,12 @@ async function main() {
             };
 
             if (includeRawContent === "text" || includeRawContent === "markdown") {
+                if (!allowRawContent) {
+                    throw new Error("直连原文抓取默认关闭。确有必要时需同时传 allow_raw_content=true，并将 max_results 设为 1。");
+                }
+                if (maxResults !== 1) {
+                    throw new Error("启用 include_raw_content 时 max_results 必须为 1。");
+                }
                 searchOptions.include_raw_content = includeRawContent;
             }
 
@@ -154,6 +182,9 @@ async function main() {
 
             if (subQueries.length === 0) {
                 throw new Error("No valid search query after splitting by '|'");
+            }
+            if (subQueries.length > DIRECT_MAX_SUBQUERIES) {
+                throw new Error("TavilySearch 直连仅允许单一查询；多关键词并发检索请使用 VSearch。");
             }
 
             if (subQueries.length > 1) {

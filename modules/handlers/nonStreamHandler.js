@@ -298,7 +298,10 @@ class NonStreamHandler {
     }
 
     let recursionDepth = 0;
-    const maxRecursion = maxVCPLoopNonStream || 5;
+    const parsedMaxRecursion = Number.parseInt(maxVCPLoopNonStream, 10);
+    const maxRecursion = Number.isFinite(parsedMaxRecursion) && parsedMaxRecursion > 0
+      ? parsedMaxRecursion
+      : 12;
     let conversationHistoryForClient = [];
     let currentAIContentForLoop = fullContentFromAI;
     let currentMessagesForNonStreamLoop = originalBody.messages ? JSON.parse(JSON.stringify(originalBody.messages)) : [];
@@ -551,7 +554,29 @@ class NonStreamHandler {
       recursionDepth++;
     } while (recursionDepth < maxRecursion && !(abortController && abortController.signal.aborted));
 
+    const loopEndedAtLimit = recursionDepth >= maxRecursion
+      && !(abortController && abortController.signal.aborted);
+    let pendingToolCallsAtLimit = [];
+    if (loopEndedAtLimit && !vcpToolUseForbidden) {
+      try {
+        pendingToolCallsAtLimit = ToolCallParser.parse(currentAIContentForLoop);
+      } catch (parseError) {
+        console.error('[VCP NonStream Loop] Failed to inspect pending tool calls at loop limit:', parseError);
+      }
+    }
+
+    const hasPendingToolCallsAtLimit = pendingToolCallsAtLimit.length > 0;
+    if (loopEndedAtLimit && currentAIContentForClient && currentAIContentForClient.trim()) {
+      conversationHistoryForClient.push(currentAIContentForClient);
+    }
+    if (hasPendingToolCallsAtLimit) {
+      const notice = '\n\n> [!WARNING]\n> **VCP 工具循环已暂停**：本轮已达到 ' + maxRecursion + ' 次工具递归上限，最后生成的 ' + pendingToolCallsAtLimit.length + ' 个工具请求尚未执行。任务尚未完成；请发送“继续”恢复。为避免重复副作用，系统不会自动重放。\n';
+      conversationHistoryForClient.push(notice);
+      oneRingAssistantTurnParts.push(notice);
+    }
+
     const finalContentForClient = conversationHistoryForClient.join('');
+    const finalFinishReason = hasPendingToolCallsAtLimit ? 'length' : 'stop';
     let finalJsonResponse;
     try {
       finalJsonResponse = JSON.parse(aiResponseText);
@@ -564,10 +589,19 @@ class NonStreamHandler {
           removeReasoningFields(finalJsonResponse.choices[0]);
         }
       }
-      finalJsonResponse.choices[0].finish_reason = recursionDepth >= maxRecursion ? 'length' : 'stop';
+      finalJsonResponse.choices[0].finish_reason = finalFinishReason;
     } catch (e) {
       finalJsonResponse = {
-        choices: [{ index: 0, message: { role: 'assistant', content: finalContentForClient }, finish_reason: recursionDepth >= maxRecursion ? 'length' : 'stop' }]
+        choices: [{ index: 0, message: { role: 'assistant', content: finalContentForClient }, finish_reason: finalFinishReason }]
+      };
+    }
+
+    if (hasPendingToolCallsAtLimit) {
+      finalJsonResponse.vcp_status = {
+        code: 'VCP_TOOL_LOOP_LIMIT',
+        current: recursionDepth,
+        max: maxRecursion,
+        pendingToolCalls: pendingToolCallsAtLimit.length,
       };
     }
 

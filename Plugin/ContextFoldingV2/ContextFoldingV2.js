@@ -4,7 +4,6 @@
 const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
-const dotenv = require('dotenv');
 const chokidar = require('chokidar');
 const { findLastRealUserMessage } = require('../../modules/messageProcessor.js');
 
@@ -59,16 +58,15 @@ class ContextFoldingV2 {
      * 插件初始化入口（由 PluginManager 调用）
      */
     async initialize(config, dependencies) {
-        // 1. 加载插件独立 config.env
-        const envPath = path.join(__dirname, 'config.env');
-        dotenv.config({ path: envPath });
-
-        this.summaryModel = process.env.FOLDING_SUMMARY_MODEL || 'gemini-3.1-flash-lite-preview';
-        this.summarySystemPrompt = (process.env.FOLDING_SUMMARY_SYSTEM_PROMPT || '').replace(/\\n/g, '\n');
-        this.summaryUserPrompt = (process.env.FOLDING_SUMMARY_USER_PROMPT || '').replace(/\\n/g, '\n');
-        this.minDepth = Math.max(2, parseInt(process.env.FOLDING_MIN_DEPTH) || 3);
-        this.maxRetries = parseInt(process.env.FOLDING_MAX_RETRIES) || 3;
-        this.maxConcurrentSummaries = Math.max(1, parseInt(process.env.FOLDING_SUMMARY_MAX_CONCURRENT, 10) || 5);
+        // 1. 使用 PluginManager 已按“插件 config.env > 全局环境变量”解析的配置。
+        //    不再二次加载 dotenv，避免根配置或 PM2 遗留 process.env 覆盖插件独立配置。
+        const pluginConfig = config || {};
+        this.summaryModel = pluginConfig.FOLDING_SUMMARY_MODEL || 'gemini-3.1-flash-lite-preview';
+        this.summarySystemPrompt = String(pluginConfig.FOLDING_SUMMARY_SYSTEM_PROMPT || '').replace(/\\n/g, '\n');
+        this.summaryUserPrompt = String(pluginConfig.FOLDING_SUMMARY_USER_PROMPT || '').replace(/\\n/g, '\n');
+        this.minDepth = Math.max(2, parseInt(pluginConfig.FOLDING_MIN_DEPTH, 10) || 3);
+        this.maxRetries = parseInt(pluginConfig.FOLDING_MAX_RETRIES, 10) || 3;
+        this.maxConcurrentSummaries = Math.max(1, parseInt(pluginConfig.FOLDING_SUMMARY_MAX_CONCURRENT, 10) || 5);
 
         // 🌟 保存 PROJECT_BASE_PATH 到实例，供 _loadHotParams / _startHotParamsWatcher 使用
         this._projectBasePath = (config && config.PROJECT_BASE_PATH) || process.env.PROJECT_BASE_PATH || path.join(__dirname, '../../');

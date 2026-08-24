@@ -1,7 +1,7 @@
 
 # AICodeWorker - AI 代码工程 Worker
 
-让 VCP Agent 可以安全调度服务器本地的 [opencode](https://opencode.ai)（及可选的 antigravity/agy），作为下游代码分析、patch 生成、文件修改 Worker。核心理念：**把耗 Token 的代码读写任务交给免费的本地工具执行，VCP 模型只管下命令和看结果**。
+让 VCP Agent 可以安全调度服务器本地的 [opencode](https://opencode.ai)、OpenAI Codex CLI（及可选的 antigravity/agy），作为下游代码分析、patch 生成、文件修改 Worker。核心理念：**把耗 Token 的代码读写任务交给免费的本地工具执行，VCP 模型只管下命令和看结果**。
 
 ## 最快上手：`run_and_wait` + 7 个预设（低算力模型直接抄）
 
@@ -78,7 +78,7 @@ PROJECT_CONTEXT=
 # 大文件预检阈值(KB)，任务涉及文件超过此大小会在 warnings 里提醒缩小范围/分段处理（默认 200）
 FILE_SIZE_WARN_KB=200
 
-# ⚠️ 全局并发上限(opencode和antigravity共用同一计数)，默认1。超限的run/run_and_wait直接被拒绝
+# ⚠️ 全局并发上限(opencode、codex和antigravity共用同一计数)，默认1。超限的run/run_and_wait直接被拒绝
 # (零资源开销，不spawn任何进程)。2026-06-27崩服务器事故后加的硬保险，不建议调大。
 MAX_CONCURRENT_JOBS=1
 
@@ -108,6 +108,106 @@ ALLOW_DANGEROUS_SKIP_PERMISSIONS=false
 # 脱敏输出中的密钥/Token（默认 true）
 REDACT_SECRETS=true
 ```
+
+## Codex CLI Worker
+
+Codex 适合作为“VCP 外层大脑 + Codex 下层执行器”架构中的代码执行层：
+
+- `worker=codex`
+- `analyze` / `patch` → Codex `read-only` 沙箱
+- `write` → Codex `workspace-write` 沙箱
+- 不绕过 Codex 原生沙箱
+- 默认 `--ephemeral`，长期记忆仍由 VCP RAG/DailyNote 管理
+- Windows 使用 Job PID + `taskkill /T` 清理当前任务进程树，不全局杀 Codex
+- Codex 登录态必须对运行 VCP/PM2 的同一系统用户有效
+- 已实测 Codex CLI 0.144.5 的 Windows `workspace-write` 沙箱会保护工作目录中的 `.git` 与 `.agents`；目录不存在时可能创建空占位目录并写入拒绝沙箱写入的 ACL。这不是模型越权修改。write 模式应优先把 `projectPath` 指向真实仓库根目录，插件不得自动删除这两个目录
+
+配置示例：
+
+```env
+ENABLE_CODEX=true
+CODEX_BIN=C:\VCP\path\to\codex.exe
+CODEX_MODEL=
+CODEX_PROFILE=
+ALLOWED_PROJECT_ROOTS=C:\VCP\VCPToolBox
+JOB_ROOT=C:\VCP\VCPToolBox\Plugin\AICodeWorker\jobs
+```
+
+调用示例：
+
+```text
+command: run_and_wait
+worker: codex
+projectPath: C:\VCP\VCPToolBox
+task: 请只读分析指定模块，给出文件依据与验证结论，不修改文件。
+mode: analyze
+```
+
+
+## Codex 逐任务推理强度
+
+`reasoningEffort` 按本次实际 Codex 模型动态校验，不再由插件固定成三档。
+
+当前 `gpt-5.6-sol` 支持：
+
+| reasoningEffort | 建议场景 |
+|---|---|
+| `low` | 快速检查、小范围机械任务 |
+| `medium` | 常规开发、调试、测试与审查 |
+| `high` | 复杂问题与跨模块分析 |
+| `xhigh` | 需要额外推理深度的困难任务 |
+| `max` | 最困难问题的最大推理深度 |
+| `ultra` | 最大推理并自动委托子任务；使用量可能显著增加 |
+
+当前模型自身默认是 `low`；本机 Codex 配置显式设为 `medium`，因此不传时当前有效默认值为 `medium`。
+
+插件会按以下优先级确定实际模型：
+1. 单次调用的 `model`
+2. AICodeWorker 的 `CODEX_MODEL`
+3. Codex Profile 配置
+4. Codex 基础 `config.toml`
+
+随后从 `models_cache.json` 读取该模型的 `supported_reasoning_levels`。未知模型或无法验证时会拒绝覆盖，不会盲传。
+
+```text
+command: run_and_wait
+worker: codex
+mode: analyze
+reasoningEffort: xhigh
+projectPath: C:\VCP\VCPToolBox
+task: 调查复杂调用链，给出文件与行号依据，不修改文件。
+```
+
+只开放模型声明支持的档位，不开放任意 Codex `rawArgs` 或 `-c` 参数；沙箱、白名单、并发和 `--ephemeral` 仍由插件强制控制。
+
+## 执行轨迹与可见性
+
+AICodeWorker 默认仍只返回最终报告。需要查看 Codex 的执行过程时，可传：
+
+| traceMode | 返回内容 |
+|---|---|
+| `summary` | 默认；仅最终报告 |
+| `events` | 整理后的阶段说明、命令、命令输出、文件变更、工具结果与 Token 用量 |
+| `raw` | 脱敏、限长的原始 JSONL；内部推理字段始终排除 |
+
+即时查看运行中任务：
+
+```text
+command: trace
+jobId: job_xxx
+traceMode: events
+```
+
+也可使用：
+
+```text
+command: query
+jobId: job_xxx
+wait: false
+traceMode: events
+```
+
+这不是可插话的第二个终端。VCP Agent 仍负责审查轨迹、判断是否返工，并发起下一份任务书。
 
 ## 进阶：异步工作流（run + query，不等结果立即返回）
 
@@ -141,9 +241,10 @@ state 含义：`running` 进行中 / `completed` 成功 / `failed` 失败 / `tim
 
 | 命令 | 说明 | 关键参数 |
 |------|------|---------|
-| `capabilities` | 查询 opencode 可用状态 | 无 |
-| `run` | 提交任务，立即返回 jobId | `worker` `projectPath` `task` `mode` `timeoutSec` |
-| `query` | 查询任务结果 | `jobId` |
+| `capabilities` | 查询 opencode / Codex / antigravity 可用状态 | 无 |
+| `run` | 提交任务，立即返回 jobId | `worker` `projectPath` `task` `mode` `timeoutSec` `traceMode` `reasoningEffort` |
+| `query` | 查询任务结果；`wait=false` 可即时返回 | `jobId` `wait` `traceMode` |
+| `trace` | 即时读取已有执行轨迹 | `jobId` `traceMode` |
 | `listJobs` | 列出历史任务 | `limit`（默认10） |
 | `cancel` | 取消进行中任务 | `jobId` |
 
@@ -175,6 +276,7 @@ state 含义：`running` 进行中 / `completed` 成功 / `failed` 失败 / `tim
 | worker | 底层模型 | 成本 | 适用 |
 |--------|---------|------|------|
 | `opencode`（默认） | 自带免费 zen 模型 | 免费、基本无限 | 常规/批量/简单代码活 |
+| `codex` | Codex CLI 当前登录配置 | 按 Codex 账户/API 计费 | 严谨开发、改码、测试、审查 |
 | `antigravity`（即 agy） | Gemini 3.x / Claude 4.6 等 | 吃 Gemini Pro 配额(约1500/天,60/分钟) | 复杂、需严谨设计、点名 agy 的任务 |
 
 - 需 `config.env` 设 `ENABLE_ANTIGRAVITY=true` 才有 antigravity；未开启则只用 opencode（行为同以前）。

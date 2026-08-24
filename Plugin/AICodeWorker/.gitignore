@@ -1,0 +1,7 @@
+# AICodeWorker 本机运行态
+config.env
+jobs/
+
+# 本地开发与回滚材料
+backup-before-*/
+codex-adapter-smoke-test/

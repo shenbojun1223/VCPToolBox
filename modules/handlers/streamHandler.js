@@ -66,7 +66,10 @@ class StreamHandler {
 
     let currentMessagesForLoop = originalBody.messages ? JSON.parse(JSON.stringify(originalBody.messages)) : [];
     let recursionDepth = 0;
-    const maxRecursion = maxVCPLoopStream || 5;
+    const parsedMaxRecursion = Number.parseInt(maxVCPLoopStream, 10);
+    const maxRecursion = Number.isFinite(parsedMaxRecursion) && parsedMaxRecursion > 0
+      ? parsedMaxRecursion
+      : 12;
     let currentAIContentForLoop = '';
     let chatLogs = [];
     let oneRingAssistantTurnParts = [];
@@ -725,12 +728,45 @@ class StreamHandler {
     recordOneRingAIResponse(oneRingAssistantTurnParts.join('\n'), 'final_turn');
 
     if (recursionDepth >= maxRecursion && !res.writableEnded && !res.destroyed) {
+      let pendingToolCallsAtLimit = [];
+      if (!vcpToolUseForbidden) {
+        try {
+          pendingToolCallsAtLimit = ToolCallParser.parse(currentAIContentForLoop);
+        } catch (parseError) {
+          console.error('[VCP Stream Loop] Failed to inspect pending tool calls at loop limit:', parseError);
+        }
+      }
+
+      const hasPendingToolCallsAtLimit = pendingToolCallsAtLimit.length > 0;
+      const finalFinishReason = hasPendingToolCallsAtLimit ? 'length' : 'stop';
+      const status = hasPendingToolCallsAtLimit ? {
+        code: 'VCP_TOOL_LOOP_LIMIT',
+        current: recursionDepth,
+        max: maxRecursion,
+        pendingToolCalls: pendingToolCallsAtLimit.length,
+      } : null;
+
       try {
-        res.write(`data: ${JSON.stringify({
-          id: `chatcmpl-VCP-final-length-${Date.now()}`,
+        if (hasPendingToolCallsAtLimit) {
+          const notice = '\n\n> [!WARNING]\n> **VCP 工具循环已暂停**：本轮已达到 ' + maxRecursion + ' 次工具递归上限，最后生成的 ' + pendingToolCallsAtLimit.length + ' 个工具请求尚未执行。任务尚未完成；请发送“继续”恢复。为避免重复副作用，系统不会自动重放。\n';
+          const noticePayload = {
+            id: 'chatcmpl-VCP-tool-loop-limit-notice-' + Date.now(),
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: originalBody.model,
+            choices: [{ index: 0, delta: { content: notice }, finish_reason: null }],
+            vcp_status: status,
+          };
+          res.write('data: ' + JSON.stringify(noticePayload) + '\n\n');
+        }
+
+        const finalChunkPayload = {
+          id: 'chatcmpl-VCP-final-' + finalFinishReason + '-' + Date.now(),
           object: 'chat.completion.chunk',
-          choices: [{ index: 0, delta: {}, finish_reason: 'length' }],
-        })}\n\n`);
+          choices: [{ index: 0, delta: {}, finish_reason: finalFinishReason }],
+        };
+        if (status) finalChunkPayload.vcp_status = status;
+        res.write('data: ' + JSON.stringify(finalChunkPayload) + '\n\n');
         res.write('data: [DONE]\n\n', () => {
           try { res.end(); } catch (e) { }
         });

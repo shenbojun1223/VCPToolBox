@@ -216,8 +216,11 @@ function loadAgentsFromLocalConfig() {
         }
     }
 
-    if (DEBUG_MODE) {
-        console.error(`[AgentAssistant Service] Config reloaded: ${Object.keys(AGENTS).length} agents loaded.`);
+    const loadedAgentCount = Object.keys(AGENTS).length;
+    if (loadedAgentCount === 0) {
+        console.warn('[AgentAssistant Service] No agents loaded. Configure Plugin/AgentAssistant/config.json or use the admin panel before calling this tool.');
+    } else if (DEBUG_MODE) {
+        console.error(`[AgentAssistant Service] Config reloaded: ${loadedAgentCount} agents loaded.`);
     }
 }
 
@@ -816,7 +819,9 @@ async function processToolCall(args) {
     }
 
     // Handle immediate chat
-    const useContext = !temporary_contact; // Check if temporary_contact is provided and truthy
+    // Only the explicit boolean/string value true enables temporary mode.
+    // In particular, the string "false" must not be treated as truthy.
+    const useContext = String(temporary_contact ?? '').trim().toLowerCase() !== 'true';
     const userSessionId = args.session_id || `agent_${agentConfig.baseName}_default_user_session`;
 
     // 占线检查：仅对持久对话生效
@@ -1211,7 +1216,12 @@ async function archiveDelegationReport(delegationId, agentName, status, report, 
             fs.mkdirSync(docDir, { recursive: true });
         }
 
-        const fileName = `${agentName}_${delegationId}.md`;
+        // baseName is user-configurable. Keep it inside the archive directory even
+        // if a malformed config bypasses the admin UI.
+        const safeAgentName = String(agentName || 'Agent')
+            .replace(/[^a-zA-Z0-9_-]/g, '_')
+            .slice(0, 64) || 'Agent';
+        const fileName = `${safeAgentName}_${delegationId}.md`;
         const filePath = path.join(docDir, fileName);
 
         const now = new Date();

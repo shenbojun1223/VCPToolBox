@@ -118,6 +118,8 @@ class PluginManager extends EventEmitter {
     constructor() {
         super();
         this.plugins = new Map(); // 存储所有插件（本地和分布式）
+        // toolName -> Map<serverId, manifest>。同名分布式工具可由多台设备同时提供。
+        this.distributedToolProviders = new Map();
         this.staticPlaceholderValues = new Map();
         this.scheduledJobs = new Map();
         this.messagePreprocessors = new Map();
@@ -1323,8 +1325,22 @@ class PluginManager extends EventEmitter {
                 if (!this.webSocketServer) {
                     throw new Error('[PluginManager] WebSocketServer is not initialized. Cannot call distributed tool.');
                 }
-                if (this.debugMode) console.log(`[PluginManager] Processing distributed tool call for: ${toolName} on server ${plugin.serverId}`);
-                resultFromPlugin = await this.webSocketServer.executeDistributedTool(plugin.serverId, toolName, pluginSpecificArgs);
+
+                let targetServerId = plugin.serverId;
+                let routeInfo = null;
+                if (typeof this.webSocketServer.resolveDistributedToolServer === 'function') {
+                    routeInfo = this.webSocketServer.resolveDistributedToolServer(toolName, requestIp, plugin.serverId);
+                    targetServerId = typeof routeInfo === 'string' ? routeInfo : routeInfo?.serverId;
+                }
+                if (!targetServerId) {
+                    throw new Error(`[DISTRIBUTED_TOOL_NO_TARGET] No target server resolved for distributed tool "${toolName}".`);
+                }
+
+                if (this.debugMode) {
+                    const reason = routeInfo?.reason || "legacy_manifest";
+                    console.log(`[PluginManager] Processing distributed tool call for: ${toolName} on server ${targetServerId} (route=${reason}, requestIp=${requestIp || "unknown"})`);
+                }
+                resultFromPlugin = await this.webSocketServer.executeDistributedTool(targetServerId, toolName, pluginSpecificArgs);
                 // 分布式工具的返回结果应该已经是JS对象了
             } else if (toolName === 'ChromeControl' && plugin.communication?.protocol === 'direct') {
                 // --- ChromeControl 特殊处理逻辑 ---
@@ -1923,61 +1939,190 @@ class PluginManager extends EventEmitter {
     // --- 新增分布式插件管理方法 ---
     registerDistributedTools(serverId, tools) {
         if (this.debugMode) console.log(`[PluginManager] Registering ${tools.length} tools from distributed server: ${serverId}`);
-        for (const toolManifest of tools) {
-            if (!toolManifest.name || !toolManifest.pluginType || !toolManifest.entryPoint) {
-                if (this.debugMode) console.warn(`[PluginManager] Invalid manifest from ${serverId} for tool '${toolManifest.name}'. Skipping.`);
+        let registeredCount = 0;
+        let additionalProviderCount = 0;
+
+        for (const incomingManifest of tools) {
+            if (!incomingManifest.name || !incomingManifest.pluginType || !incomingManifest.entryPoint) {
+                if (this.debugMode) console.warn(`[PluginManager] Invalid manifest from ${serverId} for tool '${incomingManifest.name}'. Skipping.`);
                 continue;
             }
-            if (this.plugins.has(toolManifest.name)) {
-                if (this.debugMode) console.warn(`[PluginManager] Distributed tool '${toolManifest.name}' from ${serverId} conflicts with an existing tool. Skipping.`);
+
+            const toolName = incomingManifest.name;
+            const existing = this.plugins.get(toolName);
+            if (existing && !existing.isDistributed) {
+                if (this.debugMode) {
+                    console.warn(`[PluginManager] Distributed tool '${toolName}' from ${serverId} conflicts with a local tool. Skipping provider.`);
+                }
                 continue;
             }
 
-            // 标记为分布式插件并存储其来源服务器ID
-            toolManifest.isDistributed = true;
-            toolManifest.serverId = serverId;
+            const plainDisplayName = String(incomingManifest.displayName || toolName)
+                .replace(/^\[云端\]\s*/, '');
+            const normalizedManifest = {
+                ...incomingManifest,
+                isDistributed: true,
+                serverId,
+                displayName: `[云端] ${plainDisplayName}`
+            };
 
-            // 在显示名称前加上[云端]前缀
-            toolManifest.displayName = `[云端] ${toolManifest.displayName || toolManifest.name}`;
+            let providers = this.distributedToolProviders.get(toolName);
+            if (!providers) {
+                providers = new Map();
+                this.distributedToolProviders.set(toolName, providers);
+            }
+            providers.set(serverId, normalizedManifest);
 
-            this.plugins.set(toolManifest.name, toolManifest);
-            console.log(`[PluginManager] Registered distributed tool: ${toolManifest.displayName} (${toolManifest.name}) from ${serverId}`);
+            if (!existing) {
+                normalizedManifest.providerServerIds = Array.from(providers.keys());
+                this.plugins.set(toolName, normalizedManifest);
+                registeredCount++;
+                console.log(`[PluginManager] Registered distributed tool: ${normalizedManifest.displayName} (${toolName}) from ${serverId}`);
+            } else {
+                existing.providerServerIds = Array.from(providers.keys());
+                if (existing.serverId === serverId) {
+                    this.plugins.set(toolName, {
+                        ...normalizedManifest,
+                        providerServerIds: Array.from(providers.keys())
+                    });
+                }
+                additionalProviderCount++;
+                console.log(`[PluginManager] Registered additional provider for distributed tool '${toolName}' from ${serverId}. Providers: ${Array.from(providers.keys()).join(', ')}`);
+            }
         }
-        // 注册后重建描述，以包含新插件
-        this.buildVCPDescription();
-        this.emit('tools_changed', { reason: 'distributed_register', serverId });
+
+        if (registeredCount > 0) {
+            this.buildVCPDescription();
+        }
+        this.emit('tools_changed', {
+            reason: 'distributed_register',
+            serverId,
+            registeredCount,
+            additionalProviderCount
+        });
     }
 
     unregisterAllDistributedTools(serverId) {
         if (this.debugMode) console.log(`[PluginManager] Unregistering all tools from distributed server: ${serverId}`);
-        let unregisteredCount = 0;
-        const unregisteredPluginNames = [];
-        const unregisteredManifests = [];
-        for (const [name, manifest] of this.plugins.entries()) {
-            if (manifest.isDistributed && manifest.serverId === serverId) {
-                unregisteredPluginNames.push(name);
-                unregisteredManifests.push(JSON.parse(JSON.stringify(manifest)));
+
+        const offlinePluginNames = [];
+        const offlineManifests = [];
+        const failovers = [];
+        const deletedPluginNames = [];
+        const handledToolNames = new Set();
+
+        let snapshots = [];
+        try {
+            snapshots = this.webSocketServer?.getDistributedServerSnapshot?.() || [];
+        } catch (error) {
+            console.warn('[PluginManager] Failed to read distributed server snapshot during unregister:', error.message);
+        }
+        const snapshotById = new Map(snapshots.map(server => [server.serverId, server]));
+
+        for (const [toolName, providers] of this.distributedToolProviders.entries()) {
+            const removedManifest = providers.get(serverId);
+            if (!removedManifest) continue;
+
+            handledToolNames.add(toolName);
+            providers.delete(serverId);
+            offlinePluginNames.push(toolName);
+            offlineManifests.push(JSON.parse(JSON.stringify(removedManifest)));
+
+            if (providers.size === 0) {
+                this.distributedToolProviders.delete(toolName);
             }
-        }
-        if (unregisteredPluginNames.length > 0) {
-            this.emit('distributed_tools_offline', { serverId, pluginNames: unregisteredPluginNames, manifests: unregisteredManifests });
-        }
-        for (const name of unregisteredPluginNames) {
-            if (this.plugins.delete(name)) {
-                unregisteredCount++;
-                if (this.debugMode) console.log(`  - Unregistered: ${name}`);
+
+            const current = this.plugins.get(toolName);
+            if (!current?.isDistributed) continue;
+
+            if (current.serverId !== serverId) {
+                current.providerServerIds = Array.from(providers.keys());
+                continue;
             }
-        }
-        if (unregisteredCount > 0) {
-            console.log(`[PluginManager] Unregistered ${unregisteredCount} tools from server ${serverId}.`);
-            // 注销后重建描述
-            this.buildVCPDescription();
+
+            let replacement = null;
+            for (const [candidateServerId, candidateManifest] of providers.entries()) {
+                const snapshot = snapshotById.get(candidateServerId);
+                if (snapshot?.connected) {
+                    replacement = [candidateServerId, candidateManifest];
+                    break;
+                }
+            }
+            if (!replacement && providers.size > 0) {
+                replacement = providers.entries().next().value;
+            }
+
+            if (replacement) {
+                const [replacementServerId, replacementManifest] = replacement;
+                this.plugins.set(toolName, {
+                    ...replacementManifest,
+                    serverId: replacementServerId,
+                    providerServerIds: Array.from(providers.keys())
+                });
+                failovers.push({
+                    toolName,
+                    fromServerId: serverId,
+                    toServerId: replacementServerId
+                });
+                console.log(`[PluginManager] Distributed tool '${toolName}' failed over from ${serverId} to ${replacementServerId}.`);
+            } else if (this.plugins.delete(toolName)) {
+                deletedPluginNames.push(toolName);
+                console.log(`[PluginManager] Unregistered distributed tool '${toolName}'; no providers remain.`);
+            }
         }
 
-        // 新增：清理分布式静态占位符
-        if (unregisteredCount > 0) {
-            this.emit('tools_changed', { reason: 'distributed_unregister', serverId, pluginNames: unregisteredPluginNames });
+        // 兼容补丁加载前建立的旧注册状态：若 provider Map 尚未包含该工具，
+        // 仍尝试从在线节点快照中寻找同名替代提供者。
+        for (const [toolName, manifest] of Array.from(this.plugins.entries())) {
+            if (!manifest.isDistributed || manifest.serverId !== serverId || handledToolNames.has(toolName)) {
+                continue;
+            }
+
+            offlinePluginNames.push(toolName);
+            offlineManifests.push(JSON.parse(JSON.stringify(manifest)));
+            const replacementSnapshot = snapshots.find(server =>
+                server.serverId !== serverId &&
+                server.connected &&
+                Array.isArray(server.tools) &&
+                server.tools.includes(toolName)
+            );
+
+            if (replacementSnapshot) {
+                this.plugins.set(toolName, {
+                    ...manifest,
+                    serverId: replacementSnapshot.serverId,
+                    providerServerIds: [replacementSnapshot.serverId]
+                });
+                failovers.push({
+                    toolName,
+                    fromServerId: serverId,
+                    toServerId: replacementSnapshot.serverId
+                });
+            } else if (this.plugins.delete(toolName)) {
+                deletedPluginNames.push(toolName);
+            }
         }
+
+        const uniqueOfflineNames = Array.from(new Set(offlinePluginNames));
+        if (uniqueOfflineNames.length > 0) {
+            this.emit('distributed_tools_offline', {
+                serverId,
+                pluginNames: uniqueOfflineNames,
+                manifests: offlineManifests
+            });
+        }
+
+        if (failovers.length > 0 || deletedPluginNames.length > 0) {
+            this.buildVCPDescription();
+            this.emit('tools_changed', {
+                reason: 'distributed_unregister',
+                serverId,
+                pluginNames: uniqueOfflineNames,
+                failovers,
+                deletedPluginNames
+            });
+        }
+
         this.clearDistributedStaticPlaceholders(serverId);
     }
 

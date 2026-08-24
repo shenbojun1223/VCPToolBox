@@ -32,9 +32,27 @@ const {
 
 const CONCURRENCY = parseInt(MAX_CONCURRENT, 10) || 5;
 const TOKENS = parseInt(MAX_TOKENS, 10) || 50000;
+const SUMMARY_TOKENS = Math.min(Math.max(parseInt(process.env.SummaryMaxToken, 10) || 2200, 512), 6000);
+const SUMMARY_TARGET_CHARS = Math.min(Math.max(parseInt(process.env.SummaryTargetChars, 10) || 2400, 800), 8000);
+const SUMMARY_HARD_MAX_CHARS = Math.min(Math.max(parseInt(process.env.SummaryHardMaxChars, 10) || 5000, 1500), 12000);
+const TAVILY_MAX_RESULTS = Math.min(Math.max(parseInt(process.env.TavilyMaxResults, 10) || 5, 1), 10);
+const RAW_FALLBACK_MAX_CHARS = Math.min(Math.max(parseInt(process.env.RawFallbackMaxChars, 10) || 12000, 2000), 30000);
 const KIMI_MAX_RESULTS = Math.min(Math.max(parseInt(KIMI_SEARCH_MAX_RESULTS, 10) || 5, 1), 20);
 const KIMI_INCLUDE_CONTENT = KIMI_SEARCH_INCLUDE_CONTENT === 'true';
 const DEFAULT_PLUGIN_TIMEOUT_MS = 300000;
+
+const truncateWithNotice = (text, maxChars, label) => {
+    const value = String(text || '');
+    if (value.length <= maxChars) return value;
+    const head = value.slice(0, maxChars);
+    const paragraphBreak = head.lastIndexOf('\n\n');
+    const sentenceBreak = head.lastIndexOf('。');
+    const breakAt = Math.max(paragraphBreak, sentenceBreak);
+    const clipped = breakAt >= Math.floor(maxChars * 0.7)
+        ? head.slice(0, breakAt + 1)
+        : head;
+    return `${clipped}\n\n...[${label}已截断；原始长度 ${value.length} 字符]`;
+};
 const MIN_SAFE_REPLY_MARGIN_MS = 5000;
 const MAX_SAFE_REPLY_MARGIN_MS = 15000;
 const GROK_MAX_RETRIES = 3;
@@ -496,7 +514,7 @@ const callTavilySearch = async (query, tavilyKeyStr) => {
     const response = await tvly.search(query, {
         search_depth: 'advanced',
         topic: 'general',
-        max_results: 10,
+        max_results: TAVILY_MAX_RESULTS,
         include_answer: false,
         include_images: false,
     });
@@ -519,7 +537,7 @@ const callTavilySearch = async (query, tavilyKeyStr) => {
 /**
  * Tavily 模式 (直接调用 Tavily SDK 并发搜索 + 单次整体总结)
  */
-const callTavilyMode = async (topic, keywordList, tavilyKeyStr) => {
+const callTavilyMode = async (topic, keywordList, tavilyKeyStr, showURL = false) => {
     // === 阶段1: 并发搜索 ===
     let combinedResults = '';
     try {
@@ -561,11 +579,11 @@ const callTavilyMode = async (topic, keywordList, tavilyKeyStr) => {
             messages: [
                 {
                     role: 'system',
-                    content: `你是一个顶级信息整合专家。你会收到一份关于多个关键词的原始搜索结果汇总。\n你的任务是结合【研究主题：${topic}】，将这些零散的信息提炼成一份高质量、结构化、具有深度洞察的研究报告。\n请保留重要的 URL 链接，并确保报告逻辑严密。`
+                    content: `你是一个严谨、克制的信息整合专家。请围绕【研究主题：${topic}】把多组搜索结果整合成可直接交付的紧凑报告。\n正文目标不超过 ${SUMMARY_TARGET_CHARS} 个中文字符。优先输出明确结论、关键证据、重要分歧与限制；禁止逐条复述结果、重复背景、资料堆砌或讨论本次搜索流程。\n${showURL ? '最多保留 5 个最重要的来源 URL。' : '不要展示完整 URL；必要时仅写来源名称。'}`
                 },
                 { role: 'user', content: `原始搜索结果汇总如下：\n\n${combinedResults}` }
             ],
-            max_tokens: TOKENS
+            max_tokens: SUMMARY_TOKENS
         };
 
         const summaryAxiosConfig = {
@@ -577,21 +595,25 @@ const callTavilyMode = async (topic, keywordList, tavilyKeyStr) => {
         const summaryResponse = await axios.post(summaryUrl, summaryPayload, summaryAxiosConfig);
 
         log(`[Tavily] 阶段2/2 完成: 总结成功`);
-        return summaryResponse.data.choices[0].message.content;
+        const summaryText = summaryResponse.data?.choices?.[0]?.message?.content || '';
+        if (!summaryText.trim()) {
+            throw new Error('总结模型返回空内容');
+        }
+        return truncateWithNotice(summaryText, SUMMARY_HARD_MAX_CHARS, '二阶总结');
     } catch (summaryError) {
         const statusCode = summaryError.response?.status || 'N/A';
         const errorDetail = summaryError.response?.data ? JSON.stringify(summaryError.response.data).substring(0, 500) : summaryError.message;
         log(`[Tavily] 阶段2 总结失败 (HTTP ${statusCode}): ${errorDetail}`);
 
         // 总结失败时，回退返回原始搜索结果而不是完全失败
-        return `[总结阶段失败 (HTTP ${statusCode}): ${summaryError.message}]\n\n**以下为原始搜索结果（未经整合）：**\n\n${combinedResults}`;
+        return `[总结阶段失败 (HTTP ${statusCode}): ${summaryError.message}]\n\n**以下为受长度保护的原始搜索结果（未经整合）：**\n\n${truncateWithNotice(combinedResults, RAW_FALLBACK_MAX_CHARS, '原始搜索结果')}`;
     }
 };
 
 /**
  * 单次调用 Kimi Search API
  */
-const callKimiSearch = async (query, apiKey, baseUrl, maxResults, includeContent) => {
+const callKimiSearch = async (query, apiKey, baseUrl, maxResults, includeContent, showURL = false) => {
     const url = baseUrl.endsWith('/search') ? baseUrl : `${baseUrl.replace(/\/$/, '')}/search`;
     try {
         log(`[KimiSearch] 正在搜索: "${query}"...`);
@@ -618,7 +640,7 @@ const callKimiSearch = async (query, apiKey, baseUrl, maxResults, includeContent
         let markdown = '';
         results.forEach((item, index) => {
             markdown += `${index + 1}. **${item.title}**\n`;
-            markdown += `   URL: ${item.url}\n`;
+            if (showURL && item.url) markdown += `   URL: ${item.url}\n`;
             if (item.date) markdown += `   Date: ${item.date}\n`;
             if (item.site_name) markdown += `   Source: ${item.site_name}\n`;
             markdown += `   Summary: ${item.snippet}\n`;
@@ -638,13 +660,13 @@ const callKimiSearch = async (query, apiKey, baseUrl, maxResults, includeContent
 /**
  * KimiSearch 模式 (并发搜索 + 可选 LLM 总结)
  */
-const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResults, includeContent) => {
+const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResults, includeContent, showURL = false) => {
     // === 阶段1: 并发搜索 ===
     let combinedResults = '';
     try {
         log(`[KimiSearch] 阶段1/2: 正在并发获取 ${keywordList.length} 个关键词的搜索结果...`);
         const searchPromises = keywordList.map(async (kw) => {
-            const result = await callKimiSearch(kw, apiKey, baseUrl, maxResults, includeContent);
+            const result = await callKimiSearch(kw, apiKey, baseUrl, maxResults, includeContent, showURL);
             log(`[KimiSearch] 关键词 "${kw}" 搜索完成`);
             return `### 关键词: ${kw}\n${result}`;
         });
@@ -662,8 +684,8 @@ const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResult
     const summaryModel = SUMMARY_MODEL || MODEL || "claude-sonnet-4-6";
 
     if (!summaryKey || !summaryUrl) {
-        log(`[KimiSearch] 未配置总结用 LLM API（SummaryKey/SummaryUrl 或 VSearchKey/VSearchUrl），跳过总结阶段，直接返回原始结果`);
-        return combinedResults;
+        log(`[KimiSearch] 未配置总结用 LLM API（SummaryKey/SummaryUrl 或 VSearchKey/VSearchUrl），返回受长度保护的原始结果`);
+        return truncateWithNotice(combinedResults, RAW_FALLBACK_MAX_CHARS, 'KimiSearch 原始结果');
     }
 
     try {
@@ -673,11 +695,11 @@ const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResult
             messages: [
                 {
                     role: 'system',
-                    content: `你是一个顶级信息整合专家。你会收到一份关于多个关键词的原始搜索结果汇总。\n你的任务是结合【研究主题：${topic}】，将这些零散的信息提炼成一份高质量、结构化、具有深度洞察的研究报告。\n请保留重要的 URL 链接，并确保报告逻辑严密。`
+                    content: `你是一个严谨、克制的信息整合专家。请围绕【研究主题：${topic}】把多组 KimiSearch 结果整合成可直接交付的紧凑报告。\n正文目标不超过 ${SUMMARY_TARGET_CHARS} 个中文字符。优先输出明确结论、关键证据、重要分歧与限制；禁止逐条复述结果、重复背景、资料堆砌或讨论搜索流程。\n${showURL ? '最多保留 5 个最重要的来源 URL。' : '不要展示完整 URL；必要时仅写来源名称。'}`
                 },
                 { role: 'user', content: `原始搜索结果汇总如下：\n\n${combinedResults}` }
             ],
-            max_tokens: TOKENS
+            max_tokens: SUMMARY_TOKENS
         };
 
         const summaryResponse = await axios.post(summaryUrl, summaryPayload, {
@@ -687,12 +709,16 @@ const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResult
         });
 
         log(`[KimiSearch] 阶段2/2 完成: 总结成功`);
-        return summaryResponse.data.choices[0].message.content;
+        const summaryText = summaryResponse.data?.choices?.[0]?.message?.content || '';
+        if (!summaryText.trim()) {
+            throw new Error('KimiSearch 总结模型返回空内容');
+        }
+        return truncateWithNotice(summaryText, SUMMARY_HARD_MAX_CHARS, 'KimiSearch 二阶总结');
     } catch (summaryError) {
         const statusCode = summaryError.response?.status || 'N/A';
         const errorDetail = summaryError.response?.data ? JSON.stringify(summaryError.response.data).substring(0, 500) : summaryError.message;
         log(`[KimiSearch] 阶段2 总结失败 (HTTP ${statusCode}): ${errorDetail}`);
-        return `[总结阶段失败 (HTTP ${statusCode}): ${summaryError.message}]\n\n**以下为原始搜索结果（未经整合）：**\n\n${combinedResults}`;
+        return `[总结阶段失败 (HTTP ${statusCode}): ${summaryError.message}]\n\n**以下为受长度保护的 KimiSearch 原始结果（未经整合）：**\n\n${truncateWithNotice(combinedResults, RAW_FALLBACK_MAX_CHARS, 'KimiSearch 原始结果')}`;
     }
 };
 
@@ -740,7 +766,7 @@ async function main(request) {
         if (!tavilyKeyStr) {
             return sendResponse({ status: "error", error: "Tavily 模式需要在根目录 config.env 中配置 TavilyKey。" });
         }
-        const result = await callTavilyMode(SearchTopic, keywordList, tavilyKeyStr);
+        const result = await callTavilyMode(SearchTopic, keywordList, tavilyKeyStr, showURL);
         const reportText = `## VSearch 检索报告 [模式: Tavily]\n\n**研究主题**: ${SearchTopic}\n\n${result}`;
         return sendResponse({ status: "success", result: buildAiFriendlyResult(reportText) });
     }
@@ -753,7 +779,7 @@ async function main(request) {
         if (!KIMI_SEARCH_URL) {
             return sendResponse({ status: "error", error: "KimiSearch 模式需要在 config.env 中配置 KimiSearchUrl。" });
         }
-        const result = await callKimiSearchMode(SearchTopic, keywordList, KIMI_SEARCH_KEY, KIMI_SEARCH_URL, KIMI_MAX_RESULTS, KIMI_INCLUDE_CONTENT);
+        const result = await callKimiSearchMode(SearchTopic, keywordList, KIMI_SEARCH_KEY, KIMI_SEARCH_URL, KIMI_MAX_RESULTS, KIMI_INCLUDE_CONTENT, showURL);
         const reportText = `## VSearch 检索报告 [模式: KimiSearch]\n\n**研究主题**: ${SearchTopic}\n\n${result}`;
         return sendResponse({ status: "success", result: buildAiFriendlyResult(reportText) });
     }

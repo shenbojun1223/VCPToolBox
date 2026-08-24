@@ -1,6 +1,6 @@
 "use strict";
-// AICodeWorker - VCP 插件主入口 v1.6.0
-// 让 VCP Agent 可以安全调度本地 opencode 执行代码分析和 patch 生成。
+// AICodeWorker - VCP 插件主入口 v1.11.0
+// 让 VCP Agent 可以安全调度本地 opencode、Codex 或 antigravity 执行代码任务。
 // 插件类型: synchronous / stdio。
 //
 // v1.5 核心升级：规范化报告输出
@@ -8,14 +8,17 @@
 //   - buildResult 优先提取 【执行结果摘要】 锚点，新增 fileReadList 字段
 //   - opencode 工作质量与上报质量双保证
 
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 const BACKOFF_RUN_WAIT = [2, 3, 5, 10, 15, 20, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30];
 const BACKOFF_QUERY    = [5, 10, 15, 20, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30];
+const TRACE_MODES = new Set(["summary", "events", "raw"]);
+const CODEX_MODELS_CACHE_FILE = "models_cache.json";
 
 // ─── 配置加载 ─────────────────────────────────────────────────────────────────
 
@@ -42,6 +45,14 @@ function loadConfig() {
         // 避免无意中把宿主的 key 注入、误用付费通道。
         opencodeApiKey:   raw.OPENCODE_API_KEY   || "",
         opencodeModel:    raw.OPENCODE_MODEL      || "",
+        enableCodex:      (raw.ENABLE_CODEX        || "false") !== "false",
+        codexBin:          raw.CODEX_BIN            || "codex",
+        codexModel:        raw.CODEX_MODEL          || "",
+        codexProfile:      raw.CODEX_PROFILE        || "",
+        codexHome:         raw.CODEX_HOME           ||
+                           process.env.CODEX_HOME    ||
+                           path.join(os.homedir(), ".codex"),
+        codexModelsCache:  raw.CODEX_MODELS_CACHE   || "",
         enableAntigravity:(raw.ENABLE_ANTIGRAVITY || "false") !== "false",
         agyBin:           raw.AGY_BIN             || "agy",
         agyModel:         raw.AGY_MODEL           || "",
@@ -55,6 +66,12 @@ function loadConfig() {
         redactSecrets:    (raw.REDACT_SECRETS    || "true")  !== "false",
         projectContext:   raw.PROJECT_CONTEXT ? raw.PROJECT_CONTEXT.replace(/\\n/g, "\n") : "",
         fileSizeWarnKB:   parseInt(raw.FILE_SIZE_WARN_KB || "200", 10),
+        defaultTraceMode: TRACE_MODES.has(String(raw.DEFAULT_TRACE_MODE || "summary").trim().toLowerCase())
+                              ? String(raw.DEFAULT_TRACE_MODE || "summary").trim().toLowerCase()
+                              : "summary",
+        traceMaxEvents:   Math.max(1, parseInt(raw.TRACE_MAX_EVENTS || "60", 10)),
+        traceEventTextChars: Math.max(100, parseInt(raw.TRACE_EVENT_TEXT_CHARS || "800", 10)),
+        traceRawMaxChars: Math.max(1000, parseInt(raw.TRACE_RAW_MAX_CHARS || "16000", 10)),
         // 2026-06-27崩服务器事故后加的硬保险：opencode/antigravity 共用同一并发上限(不是各自1个)，
         // 默认1=任何时刻全服务器只允许1个 worker 实例在跑。之前只在文档写"严禁并发"靠自觉，没有代码强制。
         maxConcurrentJobs: parseInt(raw.MAX_CONCURRENT_JOBS || "1", 10),
@@ -63,6 +80,304 @@ function loadConfig() {
 
 const CFG = loadConfig();
 let _ocVersionCache = null;
+let _codexVersionCache = null;
+
+
+function parseTomlStringValue(rawValue) {
+    let value = String(rawValue || "").trim();
+    if (!value) return "";
+
+    let quote = null;
+    let output = "";
+
+    for (let index = 0; index < value.length; index++) {
+        const char = value[index];
+
+        if ((char === '"' || char === "'") && value[index - 1] !== "\\") {
+            if (quote === char) quote = null;
+            else if (!quote) quote = char;
+        }
+
+        if (char === "#" && !quote) break;
+        output += char;
+    }
+
+    value = output.trim();
+
+    if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+    ) {
+        return value.slice(1, -1);
+    }
+
+    return value;
+}
+
+function readCodexTopLevelConfig(filePath) {
+    const result = {
+        path: filePath,
+        exists: false,
+        model: "",
+        modelReasoningEffort: ""
+    };
+
+    if (!filePath || !fs.existsSync(filePath)) return result;
+    result.exists = true;
+
+    let insideTable = false;
+    const content = fs.readFileSync(filePath, "utf8");
+
+    for (const line of content.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+
+        if (/^\[.*\]$/.test(trimmed)) {
+            insideTable = true;
+            continue;
+        }
+
+        if (insideTable) continue;
+
+        const match = trimmed.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
+        if (!match) continue;
+
+        const key = match[1];
+        const value = parseTomlStringValue(match[2]);
+
+        if (key === "model") result.model = value;
+        if (key === "model_reasoning_effort") {
+            result.modelReasoningEffort = value.toLowerCase();
+        }
+    }
+
+    return result;
+}
+
+function normalizeReasoningLevelEntry(entry) {
+    if (typeof entry === "string") {
+        const effort = entry.trim().toLowerCase();
+        return effort ? { effort, description: "" } : null;
+    }
+
+    if (!entry || typeof entry !== "object") return null;
+
+    const effort = String(
+        entry.effort ??
+        entry.value ??
+        entry.id ??
+        entry.name ??
+        entry.slug ??
+        ""
+    ).trim().toLowerCase();
+
+    if (!effort) return null;
+
+    return {
+        effort,
+        description: String(entry.description || "").trim()
+    };
+}
+
+function readCodexModelsCache() {
+    const cachePath = CFG.codexModelsCache ||
+        path.join(CFG.codexHome, CODEX_MODELS_CACHE_FILE);
+
+    const result = {
+        path: cachePath,
+        exists: false,
+        error: "",
+        fetchedAt: null,
+        clientVersion: null,
+        models: []
+    };
+
+    if (!fs.existsSync(cachePath)) return result;
+    result.exists = true;
+
+    try {
+        const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+        result.fetchedAt = parsed?.fetched_at || null;
+        result.clientVersion = parsed?.client_version || null;
+        result.models = Array.isArray(parsed?.models)
+            ? parsed.models
+            : Array.isArray(parsed)
+                ? parsed
+                : [];
+    } catch (error) {
+        result.error = error.message || "models_cache.json parse failed";
+    }
+
+    return result;
+}
+
+function findCodexModelEntry(models, modelName) {
+    const target = String(modelName || "").trim().toLowerCase();
+    if (!target) return null;
+
+    return (models || []).find(model => {
+        for (const key of [
+            "slug",
+            "id",
+            "model",
+            "model_id",
+            "name"
+        ]) {
+            if (
+                typeof model?.[key] === "string" &&
+                model[key].trim().toLowerCase() === target
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }) || null;
+}
+
+function resolveCodexModelCapabilities(taskModel = "") {
+    const baseConfigPath = path.join(CFG.codexHome, "config.toml");
+    const baseConfig = readCodexTopLevelConfig(baseConfigPath);
+
+    const profileConfigPath = CFG.codexProfile
+        ? path.join(CFG.codexHome, `${CFG.codexProfile}.config.toml`)
+        : "";
+    const profileConfig = readCodexTopLevelConfig(profileConfigPath);
+
+    const taskModelValue =
+        typeof taskModel === "string" ? taskModel.trim() : "";
+
+    let model = "";
+    let modelSource = "unknown";
+
+    if (taskModelValue) {
+        model = taskModelValue;
+        modelSource = "task_override";
+    } else if (CFG.codexModel) {
+        model = CFG.codexModel;
+        modelSource = "plugin_config";
+    } else if (profileConfig.model) {
+        model = profileConfig.model;
+        modelSource = "profile_config";
+    } else if (baseConfig.model) {
+        model = baseConfig.model;
+        modelSource = "codex_config";
+    }
+
+    const cache = readCodexModelsCache();
+    const modelEntry = findCodexModelEntry(cache.models, model);
+
+    const supportedReasoningLevels = Array.isArray(
+        modelEntry?.supported_reasoning_levels
+    )
+        ? modelEntry.supported_reasoning_levels
+            .map(normalizeReasoningLevelEntry)
+            .filter(Boolean)
+        : [];
+
+    const seen = new Set();
+    const uniqueReasoningLevels = supportedReasoningLevels.filter(level => {
+        if (seen.has(level.effort)) return false;
+        seen.add(level.effort);
+        return true;
+    });
+
+    const modelDefaultReasoningEffort = String(
+        modelEntry?.default_reasoning_level || ""
+    ).trim().toLowerCase();
+
+    const configuredReasoningEffort = String(
+        profileConfig.modelReasoningEffort ||
+        baseConfig.modelReasoningEffort ||
+        ""
+    ).trim().toLowerCase();
+
+    let effectiveReasoningEffort = "";
+    let effectiveReasoningEffortSource = "unknown";
+
+    if (configuredReasoningEffort) {
+        effectiveReasoningEffort = configuredReasoningEffort;
+        effectiveReasoningEffortSource =
+            profileConfig.modelReasoningEffort
+                ? "profile_config"
+                : "codex_config";
+    } else if (modelDefaultReasoningEffort) {
+        effectiveReasoningEffort = modelDefaultReasoningEffort;
+        effectiveReasoningEffortSource = "model_default";
+    }
+
+    return {
+        model: model || null,
+        modelSource,
+        displayName: modelEntry?.display_name || null,
+        description: modelEntry?.description || null,
+        reasoningCapabilitiesVerified:
+            Boolean(modelEntry) &&
+            uniqueReasoningLevels.length > 0,
+        supportedReasoningLevels: uniqueReasoningLevels,
+        supportedReasoningEfforts:
+            uniqueReasoningLevels.map(level => level.effort),
+        modelDefaultReasoningEffort:
+            modelDefaultReasoningEffort || null,
+        configuredReasoningEffort:
+            configuredReasoningEffort || null,
+        effectiveReasoningEffort:
+            effectiveReasoningEffort || null,
+        effectiveReasoningEffortSource,
+        cache: {
+            exists: cache.exists,
+            error: cache.error || null,
+            fetchedAt: cache.fetchedAt,
+            clientVersion: cache.clientVersion
+        },
+        config: {
+            baseConfigExists: baseConfig.exists,
+            profile: CFG.codexProfile || null,
+            profileConfigExists: profileConfig.exists
+        }
+    };
+}
+
+function buildReasoningMetadata(
+    normWorker,
+    normalizedReasoningEffort,
+    codexCapabilities
+) {
+    if (normWorker !== "codex") {
+        return {
+            codexModel: null,
+            codexModelSource: null,
+            reasoningEffort: null,
+            reasoningEffortEffective: null,
+            reasoningEffortSource: null,
+            reasoningEffortSupported: [],
+            modelDefaultReasoningEffort: null,
+            configuredReasoningEffort: null
+        };
+    }
+
+    return {
+        codexModel: codexCapabilities?.model || null,
+        codexModelSource:
+            codexCapabilities?.modelSource || "unknown",
+        reasoningEffort:
+            normalizedReasoningEffort || null,
+        reasoningEffortEffective:
+            normalizedReasoningEffort ||
+            codexCapabilities?.effectiveReasoningEffort ||
+            null,
+        reasoningEffortSource:
+            normalizedReasoningEffort
+                ? "task_override"
+                : codexCapabilities?.effectiveReasoningEffortSource ||
+                  "unknown",
+        reasoningEffortSupported:
+            codexCapabilities?.supportedReasoningEfforts || [],
+        modelDefaultReasoningEffort:
+            codexCapabilities?.modelDefaultReasoningEffort || null,
+        configuredReasoningEffort:
+            codexCapabilities?.configuredReasoningEffort || null
+    };
+}
 
 // ─── Job 路径 ─────────────────────────────────────────────────────────────────
 
@@ -72,7 +387,8 @@ function jobPaths(jobId) {
         log:    path.join(CFG.jobRoot, "logs",    `${jobId}.log`),
         patch:  path.join(CFG.jobRoot, "patches", `${jobId}.patch`),
         meta:   path.join(CFG.jobRoot, "meta",    `${jobId}.json`),
-        args:   path.join(CFG.jobRoot, "meta",    `${jobId}.args.json`),
+        args:        path.join(CFG.jobRoot, "meta",   `${jobId}.args.json`),
+        codexOutput: path.join(CFG.jobRoot, "output", `${jobId}.codex-last.txt`),
     };
 }
 
@@ -103,6 +419,40 @@ function saveMeta(jobId, meta) {
 function isProcessRunning(pid) {
     if (!pid) return false;
     try { process.kill(Number(pid), 0); return true; } catch { return false; }
+}
+
+function sleepSync(ms) {
+    try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    } catch {}
+}
+
+function killProcessTreeSync(pid, force = false) {
+    const target = Number(pid);
+    if (!Number.isInteger(target) || target <= 0) return false;
+
+    if (process.platform === "win32") {
+        const args = ["/PID", String(target), "/T"];
+        if (force) args.push("/F");
+        const result = spawnSync("taskkill", args, {
+            stdio: "ignore",
+            windowsHide: true
+        });
+        return result.status === 0;
+    }
+
+    const signal = force ? "SIGKILL" : "SIGTERM";
+    try {
+        process.kill(-target, signal);
+        return true;
+    } catch {
+        try {
+            process.kill(target, signal);
+            return true;
+        } catch {
+            return false;
+        }
+    }
 }
 
 /** 启动前强制清理残留 opencode 进程，防止僵尸堆积 */
@@ -235,7 +585,7 @@ const PRESETS = {
         generate: (p) =>
             `请修改 ${p.targetPath}，将 ${p.key} 的值改为 ${p.value}。\n` +
             `约束：只改这一处，禁止修改其他内容或其他文件。\n` +
-            `验证：修改后用 grep 搜索 "${p.key}" 并在报告中附输出。`,
+            `验证：修改后重新读取包含 "${p.key}" 的相关行并在报告中附输出。`,
     },
     append: {
         mode: "write",
@@ -245,7 +595,7 @@ const PRESETS = {
             `请在 ${p.targetPath} 的${p.position || "末尾"}追加以下内容：\n` +
             `${p.content}\n` +
             `约束：只追加，禁止修改已有内容，禁止操作其他文件。\n` +
-            `验证：追加后读取文件末尾 20 行并在报告中附输出。`,
+            `验证：追加后读取文件末尾 20 行并在报告中附输出（使用当前系统可用命令）。`,
     },
     create: {
         mode: "write",
@@ -335,7 +685,7 @@ const REPORT_FOOTER_WRITE = `
 
 【报告输出规范 - 必须严格遵守，这是最后输出的内容】
 ① 每次修改文件前说明：修改哪个文件、改了什么、为什么
-② 修改完成后必须读取文件确认写入成功（ls -la 或 cat 关键行）
+② 修改完成后必须重新读取文件确认写入成功（使用当前系统可用的文件读取命令或工具）
 ③ 发现与预期不符时立即停止并说明，不要强行继续
 ④ 报告最后必须输出以下三行（格式固定，不得省略）：
 【读取文件清单】已读：<列表> | 已修改：<列表> | 已新增：<列表> | 已删除：<列表，无则写"无">
@@ -376,17 +726,17 @@ const PREFIX_WRITE = `【VCP AICodeWorker - write 模式，安全约束必须严
 // ─── 任务书预检 ───────────────────────────────────────────────────────────────
 
 const VAGUE_VERBS    = /看一下|处理一下|优化一下|整理一下|随便|帮我看看|感觉|好像|试试|弄一下|搞一下|清理一下(?!.{0,30}\/)/;
-const HAS_ABS_PATH   = /\/[a-zA-Z0-9_一-龥]/;
+const HAS_ABS_PATH   = /(?:\/[a-zA-Z0-9_一-龥])|(?:\b[A-Za-z]:[\\/])/;
 const HAS_CONSTRAINT = /禁止|只改|不要|仅|只有|排除|不能|不得|不允许/;
-const HAS_VERIFY     = /验证|ls |ls$|cat |check|确认|ENOENT|\$\?/;
-const DANGER_OPS     = /\brm\b|删除|清空|移动|\bmv\b|truncate|unlink/;
+const HAS_VERIFY     = /验证|ls |ls$|cat |check|确认|ENOENT|Test-Path|Get-Item|Get-Content|dir |type |\$\?/i;
+const DANGER_OPS     = /\brm\b|删除|清空|移动|\bmv\b|truncate|unlink|Remove-Item|\bdel\b|\berase\b|\brmdir\b/i;
 
 function preflightCheck(task, mode) {
     const warnings = [];
     if (VAGUE_VERBS.test(task))
         warnings.push({ level: "warn",  message: "任务描述含模糊动词（看一下/处理一下等），opencode 可能偏离意图；建议改为明确动作动词。" });
     if ((mode === "write" || mode === "patch") && !HAS_ABS_PATH.test(task))
-        warnings.push({ level: "error", message: "write/patch 模式未检测到绝对路径（/开头），建议改用绝对路径防止工作目录歧义。" });
+        warnings.push({ level: "error", message: "write/patch 模式未检测到绝对路径（支持 /path 或 C:\\path），建议改用绝对路径防止工作目录歧义。" });
     if (mode === "write" && !HAS_CONSTRAINT.test(task))
         warnings.push({ level: "warn",  message: "write 模式未包含操作约束（禁止/只改/不要等），opencode 可能顺手修改无关文件。" });
     if (mode === "write" && DANGER_OPS.test(task) && !HAS_VERIFY.test(task))
@@ -396,7 +746,7 @@ function preflightCheck(task, mode) {
 
 // ─── 大文件预检 ───────────────────────────────────────────────────────────────
 
-const FILE_PATH_RE = /(?:^|[\s"'`(（])(\/[^\s"'`)\n）]{3,})/gm;
+const FILE_PATH_RE = /(?:^|[\s"'`(（])((?:[A-Za-z]:[\\/]|\/)[^\s"'`)\n）]{3,})/gim;
 
 function checkFileSizes(task) {
     const warnings = [];
@@ -430,9 +780,9 @@ const DANGER_VERIFY_PATCH = `
 
 【AICodeWorker 安全补丁 - 自动注入】
 检测到删除/移动操作，强制执行三步验证协议：
-① 操作前：ls -la <目标路径> 确认目标存在
+① 操作前：使用当前系统可用的路径检查命令确认目标存在
 ② 执行操作
-③ 操作后：ls -la <目标路径> 验证结果（删除则确认 ENOENT/No such file）
+③ 操作后：再次检查目标路径并验证结果（删除则确认目标不存在）
 最终报告必须包含每步的实际命令输出，不允许只写"已完成"。`;
 
 // ─── 任务包装（注入前缀 + 项目上下文 + 报告规范尾部）────────────────────────
@@ -454,12 +804,297 @@ function wrapTask(task, mode) {
 // ─── 结果构建 ─────────────────────────────────────────────────────────────────
 // v1.5：新增 fileReadList 字段；summary 优先提取【执行结果摘要】固定锚点
 
-function buildResult(jobId, meta) {
+
+function normalizeTraceMode(value, fallback = "summary") {
+    const normalized = String(value ?? fallback ?? "summary").trim().toLowerCase();
+    return TRACE_MODES.has(normalized) ? normalized : null;
+}
+
+function clipTraceText(value, maxChars = CFG.traceEventTextChars) {
+    const text = redact(String(value ?? "")).replace(/\r\n/g, "\n").trim();
+    if (!text) return "";
+    if (text.length <= maxChars) return text;
+    return text.slice(0, maxChars) + "\n…[截断 " + (text.length - maxChars) + " 字符]";
+}
+
+function stripReasoningFields(value) {
+    if (Array.isArray(value)) return value.map(stripReasoningFields);
+    if (!value || typeof value !== "object") return value;
+
+    const result = {};
+    for (const [key, child] of Object.entries(value)) {
+        const normalizedKey = key.toLowerCase();
+        if (["reasoning", "reasoning_content", "encrypted_content", "thought", "thoughts"].includes(normalizedKey)) {
+            continue;
+        }
+        result[key] = stripReasoningFields(child);
+    }
+    return result;
+}
+
+function isHiddenReasoningEvent(event) {
+    const types = [event?.type, event?.item?.type]
+        .filter(Boolean)
+        .map(value => String(value).toLowerCase());
+    return types.some(type => type.includes("reasoning") || type.includes("thought"));
+}
+
+function readCodexJsonlEvents(filePath) {
+    if (!fs.existsSync(filePath)) return [];
+    const events = [];
+    for (const line of fs.readFileSync(filePath, "utf8").split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("{")) continue;
+        try {
+            const event = JSON.parse(trimmed);
+            if (!event || typeof event !== "object" || isHiddenReasoningEvent(event)) continue;
+            events.push(event);
+        } catch {}
+    }
+    return events;
+}
+
+function capTraceEvents(events) {
+    const max = CFG.traceMaxEvents;
+    if (events.length <= max) return events;
+
+    const headCount = Math.min(5, Math.floor(max / 3));
+    const tailCount = Math.max(1, max - headCount - 1);
+    return [
+        ...events.slice(0, headCount),
+        {
+            type: "omitted",
+            count: events.length - headCount - tailCount,
+            text: "中间轨迹已省略"
+        },
+        ...events.slice(-tailCount)
+    ];
+}
+
+function parseCodexExecutionTrace(filePath) {
+    const sourceEvents = readCodexJsonlEvents(filePath);
+    const trace = [];
+    const itemIndexes = new Map();
+
+    const add = entry => {
+        entry.sequence = trace.length + 1;
+        trace.push(entry);
+        return trace.length - 1;
+    };
+
+    const upsertItem = (id, entry) => {
+        if (id && itemIndexes.has(id)) {
+            const index = itemIndexes.get(id);
+            trace[index] = { ...trace[index], ...entry, sequence: trace[index].sequence };
+            return;
+        }
+        const index = add(entry);
+        if (id) itemIndexes.set(id, index);
+    };
+
+    for (const event of sourceEvents) {
+        const eventType = String(event.type || "");
+
+        if (eventType === "thread.started") {
+            add({ type: "thread", threadId: event.thread_id || "" });
+            continue;
+        }
+
+        if (eventType === "turn.started") {
+            add({ type: "turn", status: "started" });
+            continue;
+        }
+
+        if (eventType === "turn.completed") {
+            add({
+                type: "usage",
+                status: "completed",
+                usage: stripReasoningFields(event.usage || {})
+            });
+            continue;
+        }
+
+        if (eventType === "turn.failed" || eventType === "error") {
+            add({
+                type: "error",
+                status: "failed",
+                text: clipTraceText(event.error?.message || event.message || JSON.stringify(stripReasoningFields(event)))
+            });
+            continue;
+        }
+
+        const item = event.item;
+        if (!item || typeof item !== "object") continue;
+
+        const itemType = String(item.type || "unknown");
+        const itemId = item.id || "";
+        const status = item.status ||
+            (eventType.endsWith(".completed") ? "completed" :
+             eventType.endsWith(".started") ? "in_progress" : "");
+
+        if (itemType === "agent_message") {
+            if (!eventType.endsWith(".completed")) continue;
+            add({
+                type: "message",
+                itemId,
+                status: status || "completed",
+                text: clipTraceText(item.text || item.content || "")
+            });
+            continue;
+        }
+
+        if (itemType === "command_execution") {
+            upsertItem(itemId, {
+                type: "command",
+                itemId,
+                status,
+                command: clipTraceText(item.command || ""),
+                exitCode: Number.isInteger(item.exit_code) ? item.exit_code : null,
+                output: clipTraceText(item.aggregated_output || "")
+            });
+            continue;
+        }
+
+        if (itemType === "file_change") {
+            upsertItem(itemId, {
+                type: "file_change",
+                itemId,
+                status,
+                changes: Array.isArray(item.changes)
+                    ? item.changes.map(change => ({
+                        path: clipTraceText(change?.path || "", 500),
+                        kind: String(change?.kind || "unknown")
+                    }))
+                    : []
+            });
+            continue;
+        }
+
+        if (itemType === "mcp_tool_call" || itemType === "tool_call" || itemType === "web_search") {
+            upsertItem(itemId, {
+                type: "tool",
+                itemId,
+                status,
+                name: clipTraceText(item.name || item.tool_name || itemType, 200),
+                input: clipTraceText(item.arguments || item.input || item.query || ""),
+                output: clipTraceText(item.result || item.output || "")
+            });
+            continue;
+        }
+
+        if (eventType.endsWith(".completed")) {
+            add({
+                type: "event",
+                itemId,
+                itemType,
+                status,
+                text: clipTraceText(item.text || item.message || "")
+            });
+        }
+    }
+
+    return capTraceEvents(trace);
+}
+
+function indentTraceText(value) {
+    return String(value || "").split("\n").map(line => "  " + line).join("\n");
+}
+
+function formatExecutionTrace(events) {
+    const lines = [];
+    for (const event of events) {
+        if (event.type === "thread") {
+            lines.push("[会话] " + (event.threadId || "Codex thread started"));
+        } else if (event.type === "turn") {
+            lines.push("[阶段] Codex 回合开始");
+        } else if (event.type === "message") {
+            lines.push("[说明] " + (event.text || ""));
+        } else if (event.type === "command") {
+            const exit = event.exitCode === null ? "" : " exit=" + event.exitCode;
+            lines.push("[命令:" + (event.status || "unknown") + exit + "] " + (event.command || ""));
+            if (event.output) lines.push("[命令输出]\n" + indentTraceText(event.output));
+        } else if (event.type === "file_change") {
+            const changes = (event.changes || [])
+                .map(change => change.kind + ": " + change.path)
+                .join("; ");
+            lines.push("[文件变更:" + (event.status || "unknown") + "] " + changes);
+        } else if (event.type === "tool") {
+            lines.push("[工具:" + (event.status || "unknown") + "] " + (event.name || ""));
+            if (event.input) lines.push("[工具输入]\n" + indentTraceText(event.input));
+            if (event.output) lines.push("[工具输出]\n" + indentTraceText(event.output));
+        } else if (event.type === "usage") {
+            const usage = event.usage || {};
+            lines.push(
+                "[用量] input=" + (usage.input_tokens ?? "?") +
+                " cached=" + (usage.cached_input_tokens ?? "?") +
+                " output=" + (usage.output_tokens ?? "?")
+            );
+        } else if (event.type === "error") {
+            lines.push("[错误] " + (event.text || ""));
+        } else if (event.type === "omitted") {
+            lines.push("[省略] " + event.count + " 条中间轨迹");
+        } else {
+            lines.push("[事件:" + (event.itemType || event.type || "unknown") + "] " + (event.text || ""));
+        }
+    }
+    return lines.join("\n");
+}
+
+function buildRawCodexTrace(filePath) {
+    const lines = readCodexJsonlEvents(filePath)
+        .map(event => JSON.stringify(stripReasoningFields(event)));
+    let raw = redact(lines.join("\n"));
+    if (raw.length > CFG.traceRawMaxChars) {
+        raw = "[原始轨迹已截断，仅显示最后 " + CFG.traceRawMaxChars + " 字符]\n" +
+            raw.slice(-CFG.traceRawMaxChars);
+    }
+    return raw;
+}
+
+function buildTracePayload(jobId, meta, overrideMode = null) {
+    const traceMode = normalizeTraceMode(overrideMode, meta?.traceMode || CFG.defaultTraceMode) || "summary";
+    const payload = { traceMode };
+
+    if (traceMode === "summary") return payload;
+
+    if (meta?.worker !== "codex") {
+        return {
+            ...payload,
+            traceNote: "结构化执行轨迹目前仅支持 Codex JSONL Worker。"
+        };
+    }
+
+    const p = jobPaths(jobId);
+    if (traceMode === "raw") {
+        return {
+            ...payload,
+            rawTrace: buildRawCodexTrace(p.output),
+            traceNote: "raw 轨迹已脱敏、限长，并排除模型内部推理字段。"
+        };
+    }
+
+    const executionTrace = parseCodexExecutionTrace(p.output);
+    return {
+        ...payload,
+        executionTrace,
+        traceText: formatExecutionTrace(executionTrace),
+        traceNote: "events 轨迹仅包含阶段说明、命令、文件变更、工具结果和用量，不包含模型内部推理。"
+    };
+}
+
+function buildResult(jobId, meta, traceModeOverride = null) {
     const p = jobPaths(jobId);
 
     let output = "";
-    if (fs.existsSync(p.output)) {
-        const raw = fs.readFileSync(p.output, "utf8");
+    // Codex 的 stdout 是 JSONL 事件流，直接从中提取报告会混入转义符和事件外壳。
+    // 对 Codex 优先使用 --output-last-message 生成的纯文本最终报告；
+    // 原始 JSONL 仍保留在 outputFile 中，供故障排查与完整审计。
+    const preferredOutputPath =
+        meta?.worker === "codex" && fs.existsSync(p.codexOutput)
+            ? p.codexOutput
+            : p.output;
+    if (fs.existsSync(preferredOutputPath)) {
+        const raw = fs.readFileSync(preferredOutputPath, "utf8");
         const masked = redact(raw);
         output = masked.length > 50000
             ? "[输出已截断，仅显示最后 50000 字符]\n" + masked.slice(-50000)
@@ -503,6 +1138,8 @@ function buildResult(jobId, meta) {
         }
     }
 
+    const tracePayload = buildTracePayload(jobId, meta, traceModeOverride);
+
     return {
         status:      "success",
         jobId,
@@ -512,21 +1149,42 @@ function buildResult(jobId, meta) {
         completedAt: meta.completedAt,
         projectPath: meta.projectPath,
         mode:        meta.mode,
+        codexModel: meta.codexModel || null,
+        codexModelSource:
+            meta.codexModelSource || null,
+        reasoningEffort: meta.reasoningEffort || null,
+        reasoningEffortEffective:
+            meta.reasoningEffortEffective ||
+            meta.reasoningEffort ||
+            null,
+        reasoningEffortSource:
+            meta.reasoningEffortSource ||
+            (meta.worker === "codex"
+                ? "legacy_unknown"
+                : null),
+        reasoningEffortSupported:
+            meta.reasoningEffortSupported || [],
+        modelDefaultReasoningEffort:
+            meta.modelDefaultReasoningEffort || null,
+        configuredReasoningEffort:
+            meta.configuredReasoningEffort || null,
         fileReadList, // v1.5 新增：opencode 读了哪些文件
         summary,      // 优先锚点提取，比 v1.4 更准确
         output,
         logSummary,
         outputFile: p.output,
         logFile:    p.log,
-        patchFile:  fs.existsSync(p.patch) ? p.patch : null,
+        patchFile:       fs.existsSync(p.patch) ? p.patch : null,
+        codexOutputFile: fs.existsSync(p.codexOutput) ? p.codexOutput : null,
+        ...tracePayload,
     };
 }
 
 function checkAndMarkDead(meta, jobId, source) {
     if (meta.state === "running" && meta.pid && !isProcessRunning(meta.pid)) {
-        // runner 已死，检查 opencode 是否还活着（孤儿进程）
-        if (meta.opencodePid && isProcessRunning(meta.opencodePid)) {
-            try { process.kill(Number(meta.opencodePid), "SIGKILL"); } catch {}
+        const workerPid = meta.workerPid || meta.opencodePid;
+        if (workerPid && isProcessRunning(workerPid)) {
+            killProcessTreeSync(workerPid, true);
         }
         meta.state = "failed";
         meta.completedAt = new Date().toISOString();
@@ -581,7 +1239,7 @@ function cleanupOldJobs(retainDays = 7, maxClean = 50) {
             if (jobTime > cutoff) continue;
             // 删 meta、args、output、log、patch 五个关联文件
             const p = jobPaths(m.jobId);
-            for (const fp of [metaPath, p.args, p.output, p.log, p.patch]) {
+            for (const fp of [metaPath, p.args, p.output, p.log, p.patch, p.codexOutput]) {
                 try { if (fp && fs.existsSync(fp)) fs.unlinkSync(fp); } catch {}
             }
             cleaned++;
@@ -607,6 +1265,24 @@ async function checkOcVersion() {
     return _ocVersionCache;
 }
 
+async function checkCodexVersion() {
+    if (_codexVersionCache && (Date.now() - _codexVersionCache.ts) < 300000)
+        return _codexVersionCache;
+    const result = await new Promise(resolve => {
+        const p = spawn(CFG.codexBin, ["--version"], {
+            env: process.env,
+            stdio: ["ignore", "pipe", "ignore"],
+            windowsHide: true
+        });
+        let ver = "";
+        p.stdout.on("data", d => { ver += d.toString(); });
+        p.on("close", code => resolve({ ok: code === 0, ver: ver.trim() }));
+        p.on("error", () => resolve({ ok: false, ver: "" }));
+    });
+    _codexVersionCache = { ...result, ts: Date.now() };
+    return _codexVersionCache;
+}
+
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 let _agyVersionCache = null;
@@ -627,9 +1303,24 @@ async function checkAgyVersion() {
     return _agyVersionCache;
 }
 
-async function cmdCapabilities() {
-    const ocOk = await checkOcVersion();
-    const agyOk = CFG.enableAntigravity ? await checkAgyVersion() : { ok: false, ver: "" };
+async function cmdCapabilities(input = {}) {
+    const ocOk = CFG.enableOpencode
+        ? await checkOcVersion()
+        : { ok: false, ver: "" };
+    const codexOk = CFG.enableCodex
+        ? await checkCodexVersion()
+        : { ok: false, ver: "" };
+    const agyOk = CFG.enableAntigravity
+        ? await checkAgyVersion()
+        : { ok: false, ver: "" };
+
+    const requestedModel =
+        typeof input?.model === "string"
+            ? input.model.trim()
+            : "";
+    const codexCapabilities =
+        resolveCodexModelCapabilities(requestedModel);
+
     return {
         status: "success",
         workers: [
@@ -637,20 +1328,72 @@ async function cmdCapabilities() {
                 name: "opencode",
                 available: CFG.enableOpencode && ocOk.ok,
                 version: ocOk.ver || "unknown",
-                supportsRun: true, supportsJson: true,
-                supportsSession: true, supportsAttachments: true,
+                supportsRun: true,
+                supportsJson: true,
+                supportsSession: true,
+                supportsAttachments: true,
                 dangerousSkipEnabled: true,
                 note: "auto-approve 恒启用(三种模式都加--dangerously-skip-permissions)：AICodeWorker是无人值守后台进程，没有交互通道，不加此参数遇到权限提示会卡死到超时。安全边界靠mode=write门槛+ALLOWED_PROJECT_ROOTS白名单把住，与此参数无关。"
             },
             {
+                name: "codex",
+                available: CFG.enableCodex && codexOk.ok,
+                version: codexOk.ver || "unknown",
+                supportsRun: true,
+                supportsJson: true,
+                supportsSession: false,
+                supportsAttachments: true,
+                supportsPerTaskModel: true,
+                sandboxModes: [
+                    "read-only",
+                    "workspace-write"
+                ],
+                model: codexCapabilities.model,
+                modelSource: codexCapabilities.modelSource,
+                modelDisplayName:
+                    codexCapabilities.displayName,
+                reasoningCapabilitiesVerified:
+                    codexCapabilities.reasoningCapabilitiesVerified,
+                reasoningEfforts:
+                    codexCapabilities.supportedReasoningEfforts,
+                reasoningEffortDetails:
+                    codexCapabilities.supportedReasoningLevels,
+                modelDefaultReasoningEffort:
+                    codexCapabilities.modelDefaultReasoningEffort,
+                configuredReasoningEffort:
+                    codexCapabilities.configuredReasoningEffort,
+                reasoningEffortDefault:
+                    codexCapabilities.effectiveReasoningEffort,
+                reasoningEffortDefaultSource:
+                    codexCapabilities.effectiveReasoningEffortSource,
+                reasoningCapabilitiesSource:
+                    "Codex models_cache.json",
+                modelsCacheClientVersion:
+                    codexCapabilities.cache.clientVersion,
+                modelsCacheFetchedAt:
+                    codexCapabilities.cache.fetchedAt,
+                note: CFG.enableCodex
+                    ? (
+                        "Codex CLI：推理档位按实际模型从 models_cache.json 动态读取；" +
+                        "analyze/patch 使用 read-only，write 使用 workspace-write；" +
+                        "不会绕过原生沙箱。ultra 可能启用自动任务委托并显著增加使用量。"
+                    )
+                    : "未启用（ENABLE_CODEX=false）。"
+            },
+            {
                 name: "antigravity",
-                available: CFG.enableAntigravity && agyOk.ok,
+                available:
+                    CFG.enableAntigravity && agyOk.ok,
                 version: agyOk.ver || "unknown",
                 note: CFG.enableAntigravity
                     ? "复杂/严谨任务专用 · Gemini Pro 配额(约1500/天) · worker:antigravity 调用"
                     : "未启用(ENABLE_ANTIGRAVITY=false),复杂任务需在 config.env 开启"
             },
-            { name: "mimocode", available: false, note: "adapter 预留，暂未实现" }
+            {
+                name: "mimocode",
+                available: false,
+                note: "adapter 预留，暂未实现"
+            }
         ]
     };
 }
@@ -664,22 +1407,87 @@ async function cmdRun(input) {
     }
 
     const { worker = "opencode", projectPath, task, mode = "analyze",
-            sessionId, attachments = [], timeoutSec, summaryHint, model } = input;
+            sessionId, attachments = [], timeoutSec, summaryHint, model,
+            traceMode, reasoningEffort } = input;
 
     if (!task)
         return { status: "error", error: "task 是必填参数。若要快速上手可使用 preset 参数，例如：preset=index, targetPath=/path/to/file.js" };
     if (task.length > CFG.maxTaskChars)
         return { status: "error", error: `task 超出最大长度 ${CFG.maxTaskChars} 字符。` };
 
+    const normalizedTraceMode = normalizeTraceMode(traceMode, CFG.defaultTraceMode);
+    if (!normalizedTraceMode)
+        return { status: "error", error: "traceMode 不支持。可用: summary, events, raw" };
+
     const pathErr = validatePath(projectPath);
     if (pathErr) return { status: "error", error: pathErr };
 
-    const normWorker = (worker === "agy") ? "antigravity" : worker;
-    if (normWorker !== "opencode" && normWorker !== "antigravity")
-        return { status: "error", error: `worker "${worker}" 不支持。可用: opencode, antigravity` };
+    const requestedWorker = String(worker || "opencode").trim().toLowerCase();
+    const normWorker = requestedWorker === "agy" ? "antigravity" : requestedWorker;
+    if (!["opencode", "codex", "antigravity"].includes(normWorker))
+        return { status: "error", error: `worker "${worker}" 不支持。可用: opencode, codex, antigravity` };
 
-    // 启动前清理残留：防止上次崩溃遗留的 opencode 继续吃内存
-    killResidualOpencode();
+    const reasoningEffortProvided =
+        reasoningEffort !== undefined &&
+        reasoningEffort !== null &&
+        String(reasoningEffort).trim() !== "";
+    const normalizedReasoningEffort = reasoningEffortProvided
+        ? String(reasoningEffort).trim().toLowerCase()
+        : null;
+
+    if (normalizedReasoningEffort && normWorker !== "codex") {
+        return {
+            status: "error",
+            error: "reasoningEffort 仅支持 worker=codex；其他 Worker 请移除此参数。"
+        };
+    }
+
+    const codexCapabilities = normWorker === "codex"
+        ? resolveCodexModelCapabilities(model)
+        : null;
+
+    if (normalizedReasoningEffort) {
+        if (!codexCapabilities?.model) {
+            return {
+                status: "error",
+                error: "无法确定本次 Codex 实际模型，不能安全覆盖 reasoningEffort。请指定 model，或检查 Codex 配置。"
+            };
+        }
+
+        if (!codexCapabilities.reasoningCapabilitiesVerified) {
+            return {
+                status: "error",
+                error:
+                    `无法从 Codex models_cache.json 验证模型 "${codexCapabilities.model}" 的推理档位，已拒绝盲传 reasoningEffort。请先刷新 Codex 模型缓存，或移除此参数。`
+            };
+        }
+
+        if (
+            !codexCapabilities.supportedReasoningEfforts.includes(
+                normalizedReasoningEffort
+            )
+        ) {
+            return {
+                status: "error",
+                error:
+                    `模型 "${codexCapabilities.model}" 不支持 reasoningEffort="${normalizedReasoningEffort}"。可用: ${codexCapabilities.supportedReasoningEfforts.join(", ")}`
+            };
+        }
+    }
+
+    const reasoningMetadata = buildReasoningMetadata(
+        normWorker,
+        normalizedReasoningEffort,
+        codexCapabilities
+    );
+
+    // 只对 opencode 执行历史兼容的残留清理。禁止全局杀 Codex，避免误伤 VS Code/其他会话。
+    if (normWorker === "opencode") killResidualOpencode();
+
+    // 首次运行时 JOB_ROOT 可能尚不存在。必须在创建锁文件前初始化目录，
+    // 否则 fs.openSync(LOCK_FILE, "wx") 会因父目录不存在而被误报为“系统正忙”。
+    ensureJobDirs();
+
     // 顺手清理超龄 job 文件（非阻塞，最多清50条）
     cleanupOldJobs();
 
@@ -693,7 +1501,7 @@ async function cmdRun(input) {
     const activeCount = countActiveJobs();
     if (activeCount >= CFG.maxConcurrentJobs) {
         releaseJobLock();
-        return { status: "error", error: `已有 ${activeCount} 个任务在运行(上限 ${CFG.maxConcurrentJobs})。本服务器内存有限，严禁同时跑多个 opencode/antigravity 实例——2026-06-27 曾因并发任务堆积僵尸进程拖垮整机。请用 listJobs 查看进度，等当前任务完成(或先 cancel)后再提交新任务。` };
+        return { status: "error", error: `已有 ${activeCount} 个任务在运行(上限 ${CFG.maxConcurrentJobs})。本服务器内存有限，严禁同时跑多个 opencode/antigravity/codex 实例——2026-06-27 曾因并发任务堆积僵尸进程拖垮整机。请用 listJobs 查看进度，等当前任务完成(或先 cancel)后再提交新任务。` };
     }
 
     ensureJobDirs();
@@ -719,8 +1527,8 @@ async function cmdRun(input) {
             return { status: "error", error: `找不到 opencode（OPENCODE_BIN=${CFG.opencodeBin}），请确认已安装。` };
         }
         const ocArgs = ["run", "--format", "json"];
-        if (CFG.opencodeModel)  ocArgs.push("-m", CFG.opencodeModel);
-        if (sessionId)          ocArgs.push("--session", String(sessionId));
+        if (CFG.opencodeModel) ocArgs.push("-m", CFG.opencodeModel);
+        if (sessionId) ocArgs.push("--session", String(sessionId));
         for (const f of attachments) {
             if (typeof f === "string" && f.trim()) ocArgs.push("-f", f.trim());
         }
@@ -734,10 +1542,83 @@ async function cmdRun(input) {
             timeoutSec: timeoutS,
             redactSecrets: CFG.redactSecrets,
         };
+    } else if (normWorker === "codex") {
+        if (!CFG.enableCodex) {
+            releaseJobLock();
+            return { status: "error", error: "Codex 已被禁用（ENABLE_CODEX=false）。" };
+        }
+        const codexOk = await checkCodexVersion();
+        if (!codexOk.ok) {
+            releaseJobLock();
+            return { status: "error", error: `找不到 Codex（CODEX_BIN=${CFG.codexBin}），请检查可执行文件路径。` };
+        }
+        if (sessionId) {
+            releaseJobLock();
+            return { status: "error", error: "Codex Adapter 第一版使用 --ephemeral 隔离会话，不接受 sessionId；长期上下文应由 VCP/RAG 注入任务书。" };
+        }
+
+        const codexSandbox = mode === "write"
+            ? "workspace-write"
+            : "read-only";
+        const codexModelOverride =
+            typeof model === "string" && model.trim()
+                ? model.trim()
+                : CFG.codexModel;
+        const codexArgs = [
+            "exec",
+            "--json",
+            "--color", "never",
+            "--sandbox", codexSandbox,
+            "--cd", path.resolve(projectPath),
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--output-last-message", p.codexOutput
+        ];
+        if (CFG.codexProfile) {
+            codexArgs.push("--profile", CFG.codexProfile);
+        }
+        if (codexModelOverride) {
+            codexArgs.push("--model", codexModelOverride);
+        }
+        if (normalizedReasoningEffort) {
+            codexArgs.push(
+                "-c",
+                `model_reasoning_effort="${normalizedReasoningEffort}"`
+            );
+        }
+        for (const f of attachments) {
+            if (typeof f === "string" && f.trim()) codexArgs.push("--image", f.trim());
+        }
+        codexArgs.push(finalTask);
+
+        runnerArgs = {
+            jobId, jobRoot: CFG.jobRoot, worker: "codex",
+            codexBin: CFG.codexBin,
+            codexArgs,
+            codexModel: reasoningMetadata.codexModel,
+            codexModelSource:
+                reasoningMetadata.codexModelSource,
+            reasoningEffort:
+                reasoningMetadata.reasoningEffort,
+            reasoningEffortEffective:
+                reasoningMetadata.reasoningEffortEffective,
+            reasoningEffortSource:
+                reasoningMetadata.reasoningEffortSource,
+            reasoningEffortSupported:
+                reasoningMetadata.reasoningEffortSupported,
+            modelDefaultReasoningEffort:
+                reasoningMetadata.modelDefaultReasoningEffort,
+            configuredReasoningEffort:
+                reasoningMetadata.configuredReasoningEffort,
+            codexOutputFile: p.codexOutput,
+            projectPath: path.resolve(projectPath),
+            timeoutSec: timeoutS,
+            redactSecrets: CFG.redactSecrets,
+        };
     } else {
         if (!CFG.enableAntigravity) {
             releaseJobLock();
-            return { status: "error", error: "Antigravity 未启用（ENABLE_ANTIGRAVITY=false）。请用 worker=opencode 或在 config.env 开启。" };
+            return { status: "error", error: "Antigravity 未启用（ENABLE_ANTIGRAVITY=false）。请改用 worker=opencode/codex 或在 config.env 开启。" };
         }
         const agyOk = await checkAgyVersion();
         if (!agyOk.ok) {
@@ -762,10 +1643,26 @@ async function cmdRun(input) {
     const warnings = [...preflightCheck(task, mode), ...checkFileSizes(task)];
 
     const meta = {
-        jobId, worker, mode,
+        jobId, worker: normWorker, mode,
         projectPath:  path.resolve(projectPath),
         sessionId:    sessionId || null,
         summaryHint:  summaryHint || null,
+        traceMode:    normalizedTraceMode,
+        codexModel: reasoningMetadata.codexModel,
+        codexModelSource:
+            reasoningMetadata.codexModelSource,
+        reasoningEffort:
+            reasoningMetadata.reasoningEffort,
+        reasoningEffortEffective:
+            reasoningMetadata.reasoningEffortEffective,
+        reasoningEffortSource:
+            reasoningMetadata.reasoningEffortSource,
+        reasoningEffortSupported:
+            reasoningMetadata.reasoningEffortSupported,
+        modelDefaultReasoningEffort:
+            reasoningMetadata.modelDefaultReasoningEffort,
+        configuredReasoningEffort:
+            reasoningMetadata.configuredReasoningEffort,
         startedAt:    new Date().toISOString(),
         state: "running",
         pid: null, exitCode: null, completedAt: null,
@@ -777,9 +1674,19 @@ async function cmdRun(input) {
     fs.writeFileSync(p.output, [
         "=== AICodeWorker Job ===",
         `Job ID   : ${jobId}`,
-        `Worker   : ${worker}`,
+        `Worker   : ${normWorker}`,
         `Project  : ${meta.projectPath}`,
         `Mode     : ${mode}`,
+        `Model    : ${reasoningMetadata.codexModel || "n/a"}`,
+        `Reasoning: ${normWorker === "codex"
+            ? (
+                reasoningMetadata.reasoningEffortEffective ||
+                "unknown"
+            ) + " (" +
+              (reasoningMetadata.reasoningEffortSource ||
+               "unknown") + ")"
+            : "n/a"}`,
+        `Trace    : ${normalizedTraceMode}`,
         `Started  : ${meta.startedAt}`,
         "==================="
     ].join("\n") + "\n\n", "utf8");
@@ -794,6 +1701,22 @@ async function cmdRun(input) {
     releaseJobLock();
     return {
         status: "success", jobId, state: "running", pid: runner.pid,
+        traceMode: normalizedTraceMode,
+        codexModel: reasoningMetadata.codexModel,
+        codexModelSource:
+            reasoningMetadata.codexModelSource,
+        reasoningEffort:
+            reasoningMetadata.reasoningEffort,
+        reasoningEffortEffective:
+            reasoningMetadata.reasoningEffortEffective,
+        reasoningEffortSource:
+            reasoningMetadata.reasoningEffortSource,
+        reasoningEffortSupported:
+            reasoningMetadata.reasoningEffortSupported,
+        modelDefaultReasoningEffort:
+            reasoningMetadata.modelDefaultReasoningEffort,
+        configuredReasoningEffort:
+            reasoningMetadata.configuredReasoningEffort,
         warnings, outputFile: p.output, logFile: p.log, patchFile: p.patch,
         message: `任务已提交。使用 query 命令查询进度：command=query, jobId=${jobId}`
     };
@@ -824,7 +1747,8 @@ async function cmdRunAndWait(input) {
         status: "success", jobId, state: "timeout",
         warnings: meta2?.warnings || [],
         startedAt: meta2?.startedAt,
-        hint: `任务已超过内置等待时长，已自动取消（${cancelResult.status === "success" ? "进程已终止" : "取消时发生错误: " + cancelResult.error}）。如需重试请重新提交 run。`
+        hint: `任务已超过内置等待时长，已自动取消（${cancelResult.status === "success" ? "进程已终止" : "取消时发生错误: " + cancelResult.error}）。如需重试请重新提交 run。`,
+        ...buildTracePayload(jobId, meta2 || {}, input.traceMode)
     };
 }
 
@@ -832,28 +1756,88 @@ async function cmdQuery(input) {
     const { jobId } = input;
     if (!jobId) return { status: "error", error: "jobId 是必填参数。" };
 
+    const traceModeOverride = input.traceMode === undefined
+        ? null
+        : normalizeTraceMode(input.traceMode, CFG.defaultTraceMode);
+    if (input.traceMode !== undefined && !traceModeOverride)
+        return { status: "error", error: "traceMode 不支持。可用: summary, events, raw" };
+
     let meta = readMeta(jobId);
     if (!meta) return { status: "error", error: `Job "${jobId}" 不存在。` };
-    if (meta.state !== "running") return buildResult(jobId, meta);
+    if (meta.state !== "running") return buildResult(jobId, meta, traceModeOverride);
 
-    for (const sec of BACKOFF_QUERY) {
-        await sleep(sec * 1000);
-        meta = readMeta(jobId);
-        if (!meta) break;
-        meta = checkAndMarkDead(meta, jobId, "query");
-        if (meta.state !== "running") break;
+    const waitValue = String(input.wait ?? "true").trim().toLowerCase();
+    const shouldWait = !["false", "0", "no", "off"].includes(waitValue);
+
+    if (shouldWait) {
+        for (const sec of BACKOFF_QUERY) {
+            await sleep(sec * 1000);
+            meta = readMeta(jobId);
+            if (!meta) break;
+            meta = checkAndMarkDead(meta, jobId, "query");
+            if (meta.state !== "running") break;
+        }
+        meta = readMeta(jobId) || meta;
+    } else {
+        meta = checkAndMarkDead(meta, jobId, "query-nowait");
     }
-    meta = readMeta(jobId) || meta;
 
     if (meta.state === "running") {
         return {
             status: "success", jobId, state: "running",
             warnings: meta.warnings || [],
             startedAt: meta.startedAt, suggestedWaitSec: 0,
-            hint: "任务仍在运行，请再调用一次 query（query 会自动内部等待，无需频繁调用）"
+            hint: shouldWait
+                ? "任务仍在运行，请再调用一次 query；也可用 command=trace 即时查看已有执行轨迹。"
+                : "任务仍在运行。本次 wait=false，已立即返回当前状态与已有轨迹。",
+            ...buildTracePayload(jobId, meta, traceModeOverride)
         };
     }
-    return buildResult(jobId, meta);
+    return buildResult(jobId, meta, traceModeOverride);
+}
+
+async function cmdTrace(input) {
+    const { jobId } = input;
+    if (!jobId) return { status: "error", error: "jobId 是必填参数。" };
+
+    const requestedMode = input.traceMode === undefined ? "events" : input.traceMode;
+    const traceMode = normalizeTraceMode(requestedMode, "events");
+    if (!traceMode)
+        return { status: "error", error: "traceMode 不支持。可用: summary, events, raw" };
+
+    let meta = readMeta(jobId);
+    if (!meta) return { status: "error", error: `Job "${jobId}" 不存在。` };
+    meta = checkAndMarkDead(meta, jobId, "trace");
+
+    return {
+        status: "success",
+        jobId,
+        state: meta.state,
+        worker: meta.worker,
+        mode: meta.mode,
+        codexModel: meta.codexModel || null,
+        codexModelSource:
+            meta.codexModelSource || null,
+        reasoningEffort: meta.reasoningEffort || null,
+        reasoningEffortEffective:
+            meta.reasoningEffortEffective ||
+            meta.reasoningEffort ||
+            null,
+        reasoningEffortSource:
+            meta.reasoningEffortSource ||
+            (meta.worker === "codex"
+                ? "legacy_unknown"
+                : null),
+        reasoningEffortSupported:
+            meta.reasoningEffortSupported || [],
+        modelDefaultReasoningEffort:
+            meta.modelDefaultReasoningEffort || null,
+        configuredReasoningEffort:
+            meta.configuredReasoningEffort || null,
+        startedAt: meta.startedAt,
+        completedAt: meta.completedAt,
+        ...buildTracePayload(jobId, meta, traceMode)
+    };
 }
 
 async function cmdListJobs(input) {
@@ -872,7 +1856,24 @@ async function cmdListJobs(input) {
             jobs.push({
                 jobId: m.jobId, state: m.state, worker: m.worker,
                 mode: m.mode, projectPath: m.projectPath,
-                startedAt: m.startedAt, completedAt: m.completedAt, exitCode: m.exitCode
+                startedAt: m.startedAt, completedAt: m.completedAt, exitCode: m.exitCode,
+                traceMode: m.traceMode || CFG.defaultTraceMode,
+                codexModel: m.codexModel || null,
+                codexModelSource:
+                    m.codexModelSource || null,
+                reasoningEffort:
+                    m.reasoningEffort || null,
+                reasoningEffortEffective:
+                    m.reasoningEffortEffective ||
+                    m.reasoningEffort ||
+                    null,
+                reasoningEffortSource:
+                    m.reasoningEffortSource ||
+                    (m.worker === "codex"
+                        ? "legacy_unknown"
+                        : null),
+                reasoningEffortSupported:
+                    m.reasoningEffortSupported || []
             });
         } catch {}
     }
@@ -882,54 +1883,42 @@ async function cmdListJobs(input) {
 async function cmdCancel(input) {
     const { jobId } = input;
     if (!jobId) return { status: "error", error: "jobId 是必填参数。" };
+
     const meta = readMeta(jobId);
     if (!meta) return { status: "error", error: `Job "${jobId}" 不存在。` };
     if (meta.state !== "running")
         return { status: "error", error: `Job "${jobId}" 状态为 "${meta.state}"，不是运行中。` };
-    if (!meta.pid)
+
+    const workerPid = meta.workerPid || meta.opencodePid;
+    if (!meta.pid && !workerPid)
         return { status: "error", error: `Job "${jobId}" 无 PID 记录，无法取消。` };
-    // 杀进程组(连子孙)：opencode 在 runner 里以 detached 启动，自成进程组，杀负 pid 才能整组清掉。
-    // 旧代码只 SIGTERM meta.pid(runner进程)，runner一死它spawn的opencode立刻变孤儿继续跑 → 僵尸堆积。
-    const killGroup = (pid, sig) => {
-        if (!pid) return;
-        try { process.kill(-Number(pid), sig); }
-        catch { try { process.kill(Number(pid), sig); } catch {} } // 组杀失败兜底杀单进程
-    };
-    // 兜底：若 opencodePid 未记录，尝试通过 runner.pid 找到其子进程
-    if (!meta.opencodePid) {
-        try {
-            const { execSync } = require("child_process");
-            const childPids = execSync(`pgrep -P ${meta.pid} 2>/dev/null || true`, { encoding: "utf8" }).trim();
-            if (childPids) {
-                for (const cpid of childPids.split("\n")) {
-                    const pidNum = Number(cpid.trim());
-                    if (pidNum) {
-                        try { process.kill(-pidNum, "SIGKILL"); } catch {}
-                        try { process.kill(pidNum, "SIGKILL"); } catch {}
-                    }
-                }
-            }
-        } catch {}
-    }
+
     try {
-        // 先杀 opencode 进程组(真正吃资源的)，再杀 runner，确保整条链路清空
-        killGroup(meta.opencodePid, "SIGTERM");
-        killGroup(meta.pid, "SIGTERM");
-        // 同步等 1.5 秒后 SIGKILL 兜底(AICodeWorker是一次性stdio进程，不能用异步setTimeout——返回前进程就退出了，定时器不触发)
-        try { require("child_process").spawnSync("sleep", ["1.5"]); } catch {}
-        killGroup(meta.opencodePid, "SIGKILL");
-        killGroup(meta.pid, "SIGKILL");
+        // 先请求结束当前 Job 的 Worker 与 runner；只按 Job PID 操作，绝不全局杀同名进程。
+        if (workerPid) killProcessTreeSync(workerPid, false);
+        if (meta.pid) killProcessTreeSync(meta.pid, false);
+        sleepSync(1500);
+        if (workerPid) killProcessTreeSync(workerPid, true);
+        if (meta.pid) killProcessTreeSync(meta.pid, true);
+
         meta.state = "cancelled";
         meta.completedAt = new Date().toISOString();
         saveMeta(jobId, meta);
-        try { fs.appendFileSync(jobPaths(jobId).output, `\n=== 任务已手动取消 (${meta.completedAt}) ===\n`); } catch {}
-        return { status: "success", jobId, message: `Job "${jobId}" 已终止(opencode进程组+runner已清，含子进程)。` };
+        try {
+            fs.appendFileSync(jobPaths(jobId).output, `\n=== 任务已手动取消 (${meta.completedAt}) ===\n`);
+        } catch {}
+
+        return {
+            status: "success",
+            jobId,
+            message: `Job "${jobId}" 已终止（当前 Worker 进程树 + runner）。`
+        };
     } catch (err) {
         return { status: "error", error: `终止 Job "${jobId}" 失败: ${err.message}` };
     }
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Main// ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
     let raw = "";
@@ -946,14 +1935,15 @@ async function main() {
     let result;
     try {
         switch (cmd) {
-            case "capabilities":  result = await cmdCapabilities();   break;
+            case "capabilities":  result = await cmdCapabilities(input); break;
             case "run":           result = await cmdRun(input);        break;
             case "run_and_wait":  result = await cmdRunAndWait(input); break;
             case "query":         result = await cmdQuery(input);      break;
+            case "trace":         result = await cmdTrace(input);      break;
             case "listjobs":      result = await cmdListJobs(input);   break;
             case "cancel":        result = await cmdCancel(input);     break;
             default:
-                result = { status: "error", error: `未知命令 "${cmd}"。支持: capabilities, run, run_and_wait, query, listJobs, cancel` };
+                result = { status: "error", error: `未知命令 "${cmd}"。支持: capabilities, run, run_and_wait, query, trace, listJobs, cancel` };
         }
     } catch (err) {
         result = { status: "error", error: `插件内部错误: ${err.message}` };

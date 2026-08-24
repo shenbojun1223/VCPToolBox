@@ -1,57 +1,40 @@
-# AgentAssistant 插件
+# AgentAssistant
 
-`AgentAssistant` 是一个强大的同步插件，作为 VCP 系统中 Agent 之间进行标准化通信的核心协议。它允许一个 Agent 调用另一个 Agent，实现基于各自知识库的互助式连续交流、消息群发、任务分发等高级协作功能。
+AgentAssistant 通过本机 VCP `/v1/chat/completions` 调用已配置的协作 Agent，支持即时通讯、独立临时咨询、持久会话、未来通讯、异步委托、进度查询、合作式取消和单次工具注入。
 
-## 核心功能
+## 配置
 
-- **Agent 间对话**: 一个 Agent 可以向另一个指定名称的 Agent 发送消息 (`prompt`)，并获取对方基于其自身知识库和上下文的回复。
-- **上下文保持**: 插件内部为每个 Agent 的每个会话维护独立的上下文历史，确保连续对话的流畅性。
-- **标准化定时任务**: 支持安排在未来的特定时间点执行通讯任务，赋予 Agent 规划未来行动的能力。
+当前配置真相源是 `Plugin/AgentAssistant/config.json`，可在管理面板的 AgentAssistant 页面维护并热重载。运行配置可能包含私有系统提示词，已被 `.gitignore` 排除；仓库模板见 `config.json.example`。旧 `config.env` 仅在 `config.json` 不存在时用于一次性迁移。
 
-## VCP 调用指令
+每个 Agent 至少需要：
 
-### 1. 即时通讯
+- `baseName`：安全的 ASCII 标识，建议仅使用字母、数字、下划线和连字符。
+- `chineseName`：工具调用使用的准确名称，可以是任意语言，但必须唯一。
+- `modelId`：本地 VCP `/v1/models` 已可路由的模型 ID。
+- `systemPrompt`：可直接写提示词。若引用已注册主 Agent 的 `{{agent:Alias}}`，先确认其展开内容不包含密钥、私人变量或不必要的完整上下文。
 
-这是 `AgentAssistant` 的基础用法，用于立即向另一个 Agent 发送消息。
+AgentAssistant 固定调用本机 VCP 并复用主服务 `PORT` 与 `Key`，不需要在此为每个 Agent 重复填写 URL 或 API key。
 
-**VCP 指令格式:**
+## 即时通讯
 
-```
+```text
 <<<[TOOL_REQUEST]>>>
 tool_name:「始」AgentAssistant「末」,
-agent_name:「始」小克「末」,
-prompt:「始」你好，小克，请帮我查询一下今天关于“量子计算”的最新研究进展。「末」
+agent_name:「始」Nova「末」,
+maid:「始」赞妮「末」,
+session_id:「始」TASK-001「末」,
+prompt:「始」请审查这份方案并返回证据、结论和残余风险。「末」
 <<<[END_TOOL_REQUEST]>>>
 ```
 
-**参数说明:**
+同一任务复用 `session_id`。一次性、无需历史的咨询传 `temporary_contact: true`。
 
-- `tool_name`: **必须**是 `AgentAssistant`。
-- `agent_name`: (必需) 你想要通讯的目标 Agent 的名称。这个名称必须与插件 `config.env` 中定义的 `AGENT_..._CHINESE_NAME` 匹配。
-- `prompt`: (必需) 你想发送给目标 Agent 的消息内容。
+## 异步委托
 
-### 2. 定时通讯 (未来任务)
+增加 `task_delegation: true` 后，工具会立即返回 `delegationId` 和动态结果占位符。调用方必须原样保留实际占位符，之后可用 `query_delegation` 查询。`cancel_delegation` 仅设置取消请求，不会强制中断已经发出的模型 HTTP 请求。
 
-通过增加 `timely_contact` 参数，可以将一个即时通讯请求转变为一个未来执行的任务。
+异步轮数和预算来自 `config.json` 的 `delegationMaxRounds` 与 `delegationTimeout`。超时在轮次边界检查，已发出的单轮请求仍受 VCP 的通讯超时控制，因此它不是严格的墙钟中断。
 
-**VCP 指令格式:**
+## 未来通讯
 
-```
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AgentAssistant「末」,
-agent_name:「始」小娜「末」,
-prompt:「始」帮我下载半小时前已经推出的B站新番多罗罗的最新一集。「末」,
-timely_contact:「始」2025-06-29-15:00「末」
-<<<[END_TOOL_REQUEST]>>>
-```
-
-**参数说明:**
-
-- `timely_contact`: (可选) 指定任务执行的未来时间。
-  - **格式**: 必须是 `YYYY-MM-DD-HH:mm`。例如 `2025-06-29-15:00` 表示在 2025年6月29日 下午3点整 执行。
-  - **机制**: 当插件检测到此参数时，它不会立即执行通讯，而是会调用 VCP 主服务器的标准化任务调度 API (`/v1/schedule_task`)。
-  - **任务内容**: 插件会将原始的 `agent_name` 和 `prompt` 等参数打包成一个标准的 VCP Tool Call，作为未来任务的核心内容。
-  - **即时回执**: 任务创建成功后，`AgentAssistant` 插件会**立即**返回一条对用户友好的确认信息，例如：“您预定于 2025年6月29日 15:00 发给 小娜 的未来通讯已经被系统记录，届时会自动发送。”
-  - **执行通知**: 当预定时间到达，VCP 的中心化任务调度器会执行该任务（即调用 `AgentAssistant` 并传入原始参数），并将最终的执行结果通过 WebSocket 推送给所有 `VCPLog` 客户端，实现全域通知。
-
-这个功能使得 AI Agent 不再局限于即时响应，而是可以真正地为用户或自己安排“待办事项”，极大地扩展了其作为智能助手的应用场景。
+`timely_contact` 格式为 `YYYY-MM-DD-HH:mm`，按 VCP 服务器本地时区解释。调度只保存 `agent_name`、完整 `prompt` 与 `maid`；不会保留 `session_id`、`temporary_contact`、`task_delegation` 或 `inject_tools`。

@@ -978,13 +978,126 @@ async function executeDistributedTool(serverIdOrName, toolName, toolArgs, timeou
     });
 }
 
+function normalizeIpAddress(ip) {
+    if (ip === null || ip === undefined) return null;
+    let value = String(ip).trim();
+    if (!value) return null;
+
+    // X-Forwarded-For 风格值仅取最左侧原始来源。
+    if (value.includes(',')) {
+        value = value.split(',')[0].trim();
+    }
+    if (/^::ffff:/i.test(value)) {
+        value = value.substring(7);
+    }
+    if (value === '::1') {
+        value = '127.0.0.1';
+    }
+    const zoneIndex = value.indexOf('%');
+    if (zoneIndex > 0) {
+        value = value.substring(0, zoneIndex);
+    }
+    return value.toLowerCase();
+}
+
+function getDistributedServerAddressSet(server) {
+    const values = [
+        server.connectionIp,
+        server.publicIP,
+        ...(Array.isArray(server.localIPs) ? server.localIPs : [])
+    ];
+    return new Set(values.map(normalizeIpAddress).filter(Boolean));
+}
+
+function describeDistributedCandidates(candidates) {
+    return candidates.map(server => ({
+        serverId: server.serverId,
+        serverName: server.serverName,
+        connectionIp: server.connectionIp || null,
+        publicIP: server.publicIP || null,
+        localIPs: Array.isArray(server.localIPs) ? server.localIPs : []
+    }));
+}
+
+function createDistributedRoutingError(code, message, details) {
+    const error = new Error(`[${code}] ${message} Details: ${JSON.stringify(details)}`);
+    error.code = code;
+    error.details = details;
+    return error;
+}
+
+function resolveDistributedToolServer(toolName, requestIp, preferredServerId = null) {
+    const candidates = getDistributedServerSnapshot().filter(server =>
+        server.connected &&
+        Array.isArray(server.tools) &&
+        server.tools.includes(toolName)
+    );
+
+    if (candidates.length === 0) {
+        throw createDistributedRoutingError(
+            'DISTRIBUTED_TOOL_NO_PROVIDER',
+            `No connected distributed server provides tool "${toolName}".`,
+            { toolName, requestIp: normalizeIpAddress(requestIp), preferredServerId }
+        );
+    }
+
+    const normalizedRequestIp = normalizeIpAddress(requestIp);
+    if (normalizedRequestIp) {
+        const sourceMatches = candidates.filter(server =>
+            getDistributedServerAddressSet(server).has(normalizedRequestIp)
+        );
+
+        if (sourceMatches.length === 1) {
+            return {
+                ...sourceMatches[0],
+                reason: 'source_ip',
+                requestIp: normalizedRequestIp
+            };
+        }
+
+        if (sourceMatches.length > 1) {
+            throw createDistributedRoutingError(
+                'DISTRIBUTED_TOOL_TARGET_AMBIGUOUS',
+                `Request source IP matches multiple providers for tool "${toolName}". Refusing cross-device execution.`,
+                {
+                    toolName,
+                    requestIp: normalizedRequestIp,
+                    preferredServerId,
+                    candidates: describeDistributedCandidates(sourceMatches)
+                }
+            );
+        }
+    }
+
+    if (candidates.length === 1) {
+        return {
+            ...candidates[0],
+            reason: 'sole_provider',
+            requestIp: normalizedRequestIp
+        };
+    }
+
+    throw createDistributedRoutingError(
+        'DISTRIBUTED_TOOL_TARGET_AMBIGUOUS',
+        `Multiple devices provide tool "${toolName}", but request source could not be matched uniquely. Refusing cross-device execution.`,
+        {
+            toolName,
+            requestIp: normalizedRequestIp,
+            preferredServerId,
+            candidates: describeDistributedCandidates(candidates)
+        }
+    );
+}
+
 function findServerByIp(ip) {
-   for (const [serverId, ipInfo] of distributedServerIPs.entries()) {
-       if (ipInfo.publicIP === ip || (ipInfo.localIPs && ipInfo.localIPs.includes(ip))) {
-           return ipInfo.serverName || serverId;
-       }
-   }
-   return null;
+    const normalizedIp = normalizeIpAddress(ip);
+    if (!normalizedIp) return null;
+
+    const matches = getDistributedServerSnapshot().filter(server =>
+        server.connected &&
+        getDistributedServerAddressSet(server).has(normalizedIp)
+    );
+    return matches.length === 1 ? matches[0].serverId : null;
 }
 
 function getDistributedServerSnapshot() {
@@ -997,6 +1110,7 @@ function getDistributedServerSnapshot() {
         return {
             serverId,
             clientId: serverInfo.ws?.clientId || null,
+            connectionIp: serverInfo.ws?.clientIp || null,
             serverName: serverInfo.serverName || ipInfo.serverName || serverId,
             localIPs,
             publicIP: ipInfo.publicIP ?? serverInfo.ips?.publicIP ?? null,
@@ -1070,6 +1184,7 @@ module.exports = {
     sendMessageToClient,
     executeDistributedTool,
     handleDistributedServerMessage,
+    resolveDistributedToolServer,
     findServerByIp,
     getDistributedServerSnapshot,
     formatDistributedServerListForPrompt,

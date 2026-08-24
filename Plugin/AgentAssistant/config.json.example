@@ -1,0 +1,20 @@
+{
+  "maxHistoryRounds": 7,
+  "contextTtlHours": 24,
+  "globalSystemPrompt": "",
+  "delegationMaxRounds": 15,
+  "delegationTimeout": 300000,
+  "delegationSystemPrompt": "",
+  "delegationHeartbeatPrompt": "",
+  "agents": [
+    {
+      "baseName": "NOVA",
+      "chineseName": "Nova",
+      "modelId": "gpt-5.6-sol",
+      "systemPrompt": "你是 Nova，负责通用研究。先核对事实，再给出结论、证据与残余风险。",
+      "maxOutputTokens": 16000,
+      "temperature": 0.5,
+      "description": "示例配置。请把 modelId 替换为当前 VCP /v1/models 中真实可用的模型。"
+    }
+  ]
+}
