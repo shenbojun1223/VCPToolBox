@@ -46,14 +46,8 @@ function readMetaWithRetry(filePath, attempt = 0) {
     }
 }
 
-function broadcastJobStatus(meta, filePath) {
-    const wss = pluginManagerRef && pluginManagerRef.webSocketServer;
-    if (!wss || typeof wss.broadcast !== 'function') {
-        debugLog('WebSocketServer not yet available on pluginManager; skipping broadcast for', filePath);
-        return;
-    }
-
-    const payload = {
+function buildJobStatusPayload(meta, filePath) {
+    return {
         type: 'job_status_update',
         data: {
             jobId: meta.jobId || path.basename(filePath, '.json'),
@@ -68,13 +62,82 @@ function broadcastJobStatus(meta, filePath) {
             projectPath: meta.projectPath || null
         }
     };
+}
 
+function isJobMetaFile(filePath) {
+    const fileName = path.basename(filePath);
+    return fileName.endsWith('.json') && !fileName.endsWith('.args.json');
+}
+
+function normalizeSnapshotLimit(limit) {
+    const parsed = Number.parseInt(limit, 10);
+    return Math.max(1, Math.min(Number.isFinite(parsed) ? parsed : 20, 50));
+}
+
+async function readRecentJobSnapshot(limit = 20, requestIp = null) {
+    if (!pluginManagerRef || typeof pluginManagerRef.processToolCall !== 'function') {
+        throw new Error('PluginManager processToolCall is unavailable.');
+    }
+
+    const boundedLimit = normalizeSnapshotLimit(limit);
+    const result = await pluginManagerRef.processToolCall(
+        'AICodeWorker',
+        { command: 'listJobs', limit: boundedLimit },
+        requestIp,
+        'worker-panel-snapshot'
+    );
+    const jobs = Array.isArray(result && result.jobs) ? result.jobs : [];
+
+    return jobs.slice(0, boundedLimit).map(job => {
+        const fallbackPath = path.join(watchedMetaDir || '', `${job.jobId || 'unknown'}.json`);
+        return buildJobStatusPayload(job, fallbackPath).data;
+    });
+}
+
+async function sendSnapshot(ws, limit = 20) {
+    if (!ws || typeof ws.send !== 'function' || ws.readyState !== 1) return 0;
+
+    try {
+        const jobs = await readRecentJobSnapshot(limit, ws.clientIp || null);
+        if (ws.readyState !== 1) return 0;
+
+        ws.send(JSON.stringify({
+            type: 'job_status_snapshot',
+            data: { jobs }
+        }));
+        debugLog('Sent job_status_snapshot with', jobs.length, 'jobs to WorkerPanel client.');
+        return jobs.length;
+    } catch (error) {
+        debugLog('Failed to build/send WorkerPanel snapshot:', error.message);
+        if (ws.readyState === 1) {
+            try {
+                ws.send(JSON.stringify({
+                    type: 'job_status_snapshot',
+                    data: { jobs: [] },
+                    error: 'WorkerPanel snapshot unavailable.'
+                }));
+            } catch (_) {
+                // Connection closed between readyState check and send.
+            }
+        }
+        return 0;
+    }
+}
+
+function broadcastJobStatus(meta, filePath) {
+    const wss = pluginManagerRef && pluginManagerRef.webSocketServer;
+    if (!wss || typeof wss.broadcast !== 'function') {
+        debugLog('WebSocketServer not yet available on pluginManager; skipping broadcast for', filePath);
+        return;
+    }
+
+    const payload = buildJobStatusPayload(meta, filePath);
     wss.broadcast(payload, 'WorkerPanel');
     debugLog('Broadcasted job_status_update for', payload.data.jobId, 'state=', payload.data.state);
 }
 
 function handleMetaFileEvent(filePath) {
-    if (!filePath.endsWith('.json')) return;
+    if (!isJobMetaFile(filePath)) return;
 
     const maybePromise = readMetaWithRetry(filePath);
     if (maybePromise instanceof Promise) {
@@ -148,5 +211,12 @@ async function shutdown() {
 
 module.exports = {
     initialize,
-    shutdown
+    shutdown,
+    sendSnapshot,
+    __testing: {
+        buildJobStatusPayload,
+        isJobMetaFile,
+        normalizeSnapshotLimit,
+        readRecentJobSnapshot
+    }
 };

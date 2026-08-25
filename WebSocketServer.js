@@ -380,6 +380,89 @@ function initialize(httpServer, config) {
                 if (serverConfig.debugMode) {
                     console.log(`[WebSocketServer] Received message from ${ws.clientId} (${ws.clientType}): ${messageString.substring(0, 300)}...`);
                 }
+                if (ws.clientType === 'WorkerPanel') {
+                    if (parsedMessage.type === 'heartbeat') {
+                        ws.send(JSON.stringify({
+                            type: 'heartbeat_ack',
+                            timestamp: Date.now()
+                        }));
+                    } else if (parsedMessage.type === 'worker_panel_snapshot_request') {
+                        const monitorModule = pluginManager && typeof pluginManager.getServiceModule === 'function'
+                            ? pluginManager.getServiceModule('AICodeWorkerMonitor')
+                            : null;
+                        if (!monitorModule || typeof monitorModule.sendSnapshot !== 'function') {
+                            ws.send(JSON.stringify({
+                                type: 'job_status_snapshot',
+                                data: { jobs: [] },
+                                error: 'AICodeWorkerMonitor snapshot service unavailable.'
+                            }));
+                        } else if (!ws.workerPanelSnapshotPending) {
+                            ws.workerPanelSnapshotPending = true;
+                            Promise.resolve(monitorModule.sendSnapshot(ws, parsedMessage.limit))
+                                .catch(error => {
+                                    if (ws.readyState === WebSocket.OPEN) {
+                                        ws.send(JSON.stringify({
+                                            type: 'job_status_snapshot',
+                                            data: { jobs: [] },
+                                            error: 'WorkerPanel snapshot failed.'
+                                        }));
+                                    }
+                                    console.error('[WebSocketServer] WorkerPanel snapshot failed:', error.message);
+                                })
+                                .finally(() => {
+                                    ws.workerPanelSnapshotPending = false;
+                                });
+                        }
+                    } else if (parsedMessage.type === 'cancel_worker_job') {
+                        const jobId = typeof parsedMessage.jobId === 'string'
+                            ? parsedMessage.jobId.trim()
+                            : '';
+                        if (!/^job_[A-Za-z0-9_-]+$/.test(jobId)) {
+                            ws.send(JSON.stringify({
+                                type: 'worker_panel_action_result',
+                                data: {
+                                    action: 'cancel',
+                                    jobId,
+                                    success: false,
+                                    error: 'Invalid jobId.'
+                                }
+                            }));
+                        } else {
+                            Promise.resolve(pluginManager.processToolCall(
+                                'AICodeWorker',
+                                { command: 'cancel', jobId },
+                                ws.clientIp,
+                                'worker-panel'
+                            )).then(result => {
+                                if (ws.readyState === WebSocket.OPEN) {
+                                    ws.send(JSON.stringify({
+                                        type: 'worker_panel_action_result',
+                                        data: {
+                                            action: 'cancel',
+                                            jobId,
+                                            success: true,
+                                            result
+                                        }
+                                    }));
+                                }
+                            }).catch(error => {
+                                if (ws.readyState === WebSocket.OPEN) {
+                                    ws.send(JSON.stringify({
+                                        type: 'worker_panel_action_result',
+                                        data: {
+                                            action: 'cancel',
+                                            jobId,
+                                            success: false,
+                                            error: error.message
+                                        }
+                                    }));
+                                }
+                            });
+                        }
+                    }
+                    return;
+                }
+
                 if (ws.clientType === 'DistributedServer') {
                     module.exports.handleDistributedServerMessage(ws.serverId, parsedMessage);
                 } else if (ws.clientType === 'ChromeObserver') {
