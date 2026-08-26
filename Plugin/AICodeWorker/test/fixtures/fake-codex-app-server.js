@@ -105,6 +105,7 @@ function startTurn(request) {
         deltaAfterCompleted: has(text, "DELTA_AFTER_COMPLETED")
     };
     turns.set(turnId, turn);
+    if (has(text, "NO_TURN_RESPONSE")) return;
     if (has(text, "INVALID_JSON")) process.stdout.write("{not-json\n");
 
     const responseError = has(text, "TURN_RESPONSE_ERROR_AFTER_EVENTS");
@@ -187,7 +188,7 @@ function handle(request) {
     if (request.method === "turn/interrupt") {
         const turn = turns.get(request.params?.turnId);
         send({ jsonrpc: "2.0", id: request.id, result: { turn: { id: request.params?.turnId, status: "interrupted" } } });
-        if (turn) {
+        if (turn && !has(turn.text, "IGNORE_INTERRUPT")) {
             if (has(turn.text, "INTERRUPT_RACE_COMPLETE")) finishTurn(turn, "completed", turn.noJsonRpc);
             else finishTurn(turn, "interrupted", turn.noJsonRpc);
         }

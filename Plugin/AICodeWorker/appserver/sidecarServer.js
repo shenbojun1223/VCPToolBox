@@ -36,6 +36,7 @@ class SidecarServer extends EventEmitter {
         this.maxConcurrency = Math.max(1, Number(options.maxConcurrency || 2));
         this.requestTimeoutMs = Math.max(500, Number(options.requestTimeoutMs || 10000));
         this.cancelTimeoutMs = Math.max(250, Number(options.cancelTimeoutMs || 3000));
+        this.timeoutGraceMs = Math.max(250, Number(options.timeoutGraceMs || Math.min(this.cancelTimeoutMs, 1000)));
         this.drainTimeoutMs = Math.max(500, Number(options.drainTimeoutMs || 2500));
         this.testStartupDelayMs = Math.max(0, Number(options.testStartupDelayMs || 0));
         this.activeJobs = new Map();
@@ -236,6 +237,10 @@ class SidecarServer extends EventEmitter {
         if (this.activeJobs.size >= this.maxConcurrency) throw new SidecarError("CONCURRENCY_LIMIT", "Sidecar concurrency limit reached");
         const jobId = assertJobId(params.jobId);
         const projectPath = assertAbsolutePath(params.projectPath, "projectPath");
+        const timeoutSec = params.timeoutSec === undefined ? 600 : Number(params.timeoutSec);
+        if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutSec > 86400) {
+            throw new SidecarError("INVALID_TIMEOUT_SEC", "timeoutSec must be a finite number greater than 0 and at most 86400");
+        }
         const paths = validateJobPaths(this.jobRoot, jobId, params);
         if (!fs.existsSync(paths.metaPath)) throw new SidecarError("META_NOT_FOUND", "Job meta file does not exist");
         let meta;
@@ -249,6 +254,10 @@ class SidecarServer extends EventEmitter {
             projectPath,
             paths,
             outputBytes: 0,
+            timeoutSec,
+            timeoutTimer: null,
+            timeoutFinalizeTimer: null,
+            timeoutRequested: false,
             threadId: null,
             turnId: null,
             state: "starting",
@@ -262,22 +271,43 @@ class SidecarServer extends EventEmitter {
             turnBoundPromise: null,
             resolveTurnBound: null,
             interruptPromise: null,
-            interruptRequested: false
+            interruptRequested: false,
+            accepted: false
         };
         job.terminalPromise = new Promise(resolve => { job.resolveTerminal = resolve; });
         job.turnBoundPromise = new Promise(resolve => { job.resolveTurnBound = resolve; });
         this.activeJobs.set(jobId, job);
+        job.timeoutTimer = setTimeout(() => this._handleTimeout(job), timeoutSec * 1000);
+        job.timeoutTimer.unref?.();
         this.seenJobs.add(jobId);
         try {
-            const thread = await this.codex.startThread({ projectPath, model: params.model });
+            const threadOutcome = await this._awaitStartOrTerminal(
+                job,
+                this.codex.startThread({ projectPath, model: params.model })
+            );
+            if (threadOutcome.terminal) {
+                return this._terminalSubmissionResult(job, threadOutcome.terminal);
+            }
+            const thread = threadOutcome.value;
             job.threadId = thread.id;
             await this._updateMeta(job, metaValue => {
                 metaValue.sidecarInstanceId = this.state.instanceId;
+                metaValue.sidecarPid = this.state.pid;
                 metaValue.threadId = job.threadId;
                 metaValue.executionBackend = "codex-app-server";
+                if (Object.prototype.hasOwnProperty.call(metaValue, "submissionState") && metaValue.submissionState !== "accepted") {
+                    metaValue.submissionState = "submitting";
+                }
                 metaValue.state = "running";
             });
-            const turn = await this.codex.startTurn({ threadId: job.threadId, text: params.text, effort: params.effort });
+            const turnOutcome = await this._awaitStartOrTerminal(
+                job,
+                this.codex.startTurn({ threadId: job.threadId, text: params.text, effort: params.effort })
+            );
+            if (turnOutcome.terminal) {
+                return this._terminalSubmissionResult(job, turnOutcome.terminal);
+            }
+            const turn = turnOutcome.value;
             if (!turn?.id) throw new SidecarError("CODEX_INVALID_RESPONSE", "turn/start did not return turn.id");
             await job.eventChain;
             if (job.finalizationError) throw job.finalizationError;
@@ -305,7 +335,14 @@ class SidecarServer extends EventEmitter {
                     ...(job.terminal ? { terminalState: job.state } : {})
                 };
             }
-            await this._finishJob(job, "failed", 1, error.code === "CODEX_RPC_ERROR" ? "CODEX_TURN_START_FAILED" : (error.code || "CODEX_JOB_START_FAILED"));
+            const errorCode = error.code === "CODEX_RPC_ERROR"
+                ? "CODEX_TURN_START_FAILED"
+                : (error.code || "CODEX_JOB_START_FAILED");
+            if (job.timeoutRequested) {
+                await this._finishJob(job, "timeout", null, "JOB_TIMEOUT", "JOB_TIMEOUT");
+            } else {
+                await this._finishJob(job, "failed", 1, errorCode, errorCode);
+            }
             throw error instanceof SidecarError ? error : new SidecarError("CODEX_JOB_START_FAILED", "Job could not start");
         }
     }
@@ -319,15 +356,27 @@ class SidecarServer extends EventEmitter {
             throw new SidecarError("JOB_NOT_ACTIVE", "Job is not active");
         }
         if (job.terminal) return { cancelled: false, alreadyTerminal: true, state: job.state };
-        if (!job.threadId) throw new SidecarError("JOB_NOT_ACTIVE", "Job thread is not established");
         job.cancelRequested = true;
-        const boundOrTerminal = await Promise.race([job.turnBoundPromise, job.terminalPromise]);
+        let bindingTimer = null;
+        const bindingTimeout = new Promise(resolve => {
+            bindingTimer = setTimeout(() => resolve({ timeout: true }), this.cancelTimeoutMs);
+            bindingTimer.unref?.();
+            job.cancelTimeoutTimer = bindingTimer;
+        });
+        let boundOrTerminal;
+        try {
+            boundOrTerminal = await Promise.race([job.turnBoundPromise, job.terminalPromise, bindingTimeout]);
+        } finally {
+            if (bindingTimer) clearTimeout(bindingTimer);
+            if (job.cancelTimeoutTimer === bindingTimer) job.cancelTimeoutTimer = null;
+        }
         if (job.terminal) return { cancelled: false, alreadyTerminal: true, state: job.state };
         if (!job.turnId || boundOrTerminal?.timeout) throw new SidecarError("CANCEL_TIMEOUT", "Timed out waiting for turn binding");
         await this._requestInterruptOnce(job);
         let cancelTimer = null;
         const timeoutPromise = new Promise(resolve => {
             cancelTimer = setTimeout(() => resolve({ timeout: true }), this.cancelTimeoutMs);
+            cancelTimer.unref?.();
             job.cancelTimeoutTimer = cancelTimer;
         });
         try {
@@ -375,7 +424,8 @@ class SidecarServer extends EventEmitter {
             if (method === "turn/completed") {
                 this._recordJobEvent(job, method, params);
                 const status = params.turn?.status;
-                if (status === "completed") await this._finishJob(job, "completed", 0, null);
+                if (job.timeoutRequested) await this._finishJob(job, "timeout", null, "JOB_TIMEOUT", "JOB_TIMEOUT");
+                else if (status === "completed") await this._finishJob(job, "completed", 0, null);
                 else if (status === "interrupted" && job.cancelRequested) await this._finishJob(job, "cancelled", null, null);
                 else if (status === "interrupted") await this._finishJob(job, "failed", 1, "CODEX_TURN_INTERRUPTED");
                 else await this._finishJob(job, "failed", 1, "CODEX_TURN_FAILED");
@@ -409,10 +459,59 @@ class SidecarServer extends EventEmitter {
         if (job.turnId && job.turnId !== turnId) return false;
         if (job.turnId) return true;
         job.turnId = String(turnId);
+        job.accepted = true;
         job.resolveTurnBound(job.turnId);
-        job.eventChain = job.eventChain.then(() => this._updateMeta(job, meta => { meta.turnId = job.turnId; }));
-        if (job.cancelRequested) this._requestInterruptOnce(job).catch(() => {});
+        job.eventChain = job.eventChain.then(() => this._updateMeta(job, meta => {
+            meta.turnId = job.turnId;
+            meta.submissionState = "accepted";
+            if (!job.terminal) {
+                meta.state = "running";
+            }
+        }));
+        if (job.cancelRequested || job.timeoutRequested) {
+            this._requestInterruptOnce(job).catch(() => {});
+        }
         return true;
+    }
+
+    _handleTimeout(job) {
+        if (!job || job.terminal || job.timeoutRequested) return;
+        job.timeoutRequested = true;
+        this._scheduleTimeoutFinalize(job);
+        if (job.turnId) {
+            this._requestInterruptOnce(job).catch(() => {});
+        }
+    }
+
+    async _awaitStartOrTerminal(job, operation) {
+        const outcome = await Promise.race([
+            Promise.resolve(operation).then(
+                value => ({ value }),
+                error => ({ error })
+            ),
+            job.terminalPromise.then(terminal => ({ terminal }))
+        ]);
+        if (outcome.error) throw outcome.error;
+        return outcome;
+    }
+
+    _terminalSubmissionResult(job, terminal) {
+        return {
+            accepted: true,
+            jobId: job.jobId,
+            threadId: job.threadId,
+            turnId: job.turnId,
+            submissionConfirmedBy: "terminal",
+            terminalState: terminal?.state || job.state
+        };
+    }
+
+    _scheduleTimeoutFinalize(job) {
+        if (job.timeoutFinalizeTimer || job.terminal) return;
+        job.timeoutFinalizeTimer = setTimeout(() => {
+            if (!job.terminal) this._finishJob(job, "timeout", null, "JOB_TIMEOUT", "JOB_TIMEOUT").catch(() => {});
+        }, this.timeoutGraceMs);
+        job.timeoutFinalizeTimer.unref?.();
     }
 
     _enqueueJobEvent(job, handler) {
@@ -504,13 +603,26 @@ class SidecarServer extends EventEmitter {
         if (!job || job.terminal) return job?.terminalPromise;
         job.terminal = true;
         job.state = state;
+        if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
+        if (job.timeoutFinalizeTimer) clearTimeout(job.timeoutFinalizeTimer);
+        if (job.cancelTimeoutTimer) clearTimeout(job.cancelTimeoutTimer);
+        job.timeoutTimer = null;
+        job.timeoutFinalizeTimer = null;
+        job.cancelTimeoutTimer = null;
         try {
             await this._updateMeta(job, meta => {
                 meta.state = state;
                 meta.exitCode = exitCode;
                 meta.completedAt = new Date().toISOString();
                 if (reason) meta.exitReason = reason;
-                if (state === "failed") meta.errorCode = errorCode || reason || "JOB_FAILED";
+                if (state === "timeout") {
+                    meta.errorCode = "JOB_TIMEOUT";
+                } else if (state === "failed") {
+                    meta.errorCode = errorCode || reason || "JOB_FAILED";
+                    if (!job.accepted && !job.turnId && Object.prototype.hasOwnProperty.call(meta, "submissionState")) {
+                        meta.submissionState = "rejected";
+                    }
+                }
             });
         } catch (error) {
             const finalizeError = error instanceof SidecarError && error.code === "META_FINALIZE_FAILED"

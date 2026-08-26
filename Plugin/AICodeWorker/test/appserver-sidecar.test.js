@@ -98,22 +98,23 @@ async function createEnvironment(options = {}) {
         projectRoot,
         client,
         paths: runtimePaths(pluginDir, jobRoot),
-        async submit(jobId, text, projectPath = projectRoot) {
-            const paths = createMeta(jobRoot, jobId);
+        async submit(jobId, text, projectPath = projectRoot, submitOptions = {}) {
+            const paths = createMeta(jobRoot, jobId, submitOptions.meta || {});
             return client.submitAnalyzeJob({
                 jobId,
                 projectPath,
                 text,
                 metaPath: paths.metaPath,
                 outputPath: paths.outputPath,
-                codexOutputPath: paths.codexOutputPath
+                codexOutputPath: paths.codexOutputPath,
+                ...(Object.prototype.hasOwnProperty.call(submitOptions, "timeoutSec") ? { timeoutSec: submitOptions.timeoutSec } : {})
             });
         },
         async waitJob(jobId) {
             const metaPath = jobPaths(jobRoot, jobId).metaPath;
             await waitFor(() => {
                 const meta = readJsonOrNull(metaPath);
-                return Boolean(meta && ["completed", "cancelled", "failed"].includes(meta.state));
+                return Boolean(meta && ["completed", "cancelled", "failed", "timeout"].includes(meta.state));
             });
             return JSON.parse(fs.readFileSync(metaPath, "utf8"));
         },
@@ -165,6 +166,92 @@ async function spawnDetachedStarting(environment, delayMs) {
     await waitFor(() => readJsonOrNull(environment.paths.statePath)?.status === "starting", 5000);
     return { starter, child };
 }
+
+function assertSafeInspection(result) {
+    for (const field of ["controlToken", "endpoint", "processIdentity", "codexBin"]) {
+        assert.equal(Object.prototype.hasOwnProperty.call(result, field), false, `inspection exposed ${field}`);
+    }
+}
+
+test("inspectNoStart absent does not spawn", async () => {
+    const environment = await createEnvironment();
+    try {
+        const result = await environment.client.inspectNoStart();
+        assert.equal(result.status, "absent");
+        assert.equal(environment.client.sidecarChild, null);
+        assertSafeInspection(result);
+    } finally { await environment.close(); }
+});
+
+test("inspectNoStart observes ready without exposing secrets", async () => {
+    const environment = await createEnvironment();
+    try {
+        const state = await environment.client.ensure();
+        const result = await environment.client.inspectNoStart();
+        assert.equal(result.status, "ready");
+        assert.equal(result.instanceId, state.instanceId);
+        assert.equal(result.pid, state.pid);
+        assert.equal(result.activeJobs, 0);
+        assert.equal(result.maxConcurrency, 2);
+        assertSafeInspection(result);
+    } finally { await environment.close(); }
+});
+
+test("inspectNoStart live state wins over stale parent lock", async () => {
+    const environment = await createEnvironment();
+    try {
+        const state = await environment.client.ensure();
+        writeJsonAtomic(environment.paths.lockPath, {
+            ownerToken: "dead-parent", pid: 2147483647,
+            processIdentity: { pid: 2147483647, startTime: "dead" }, createdAt: Date.now() - 10000
+        });
+        const result = await environment.client.inspectNoStart();
+        assert.equal(result.status, "ready");
+        assert.equal(result.pid, state.pid);
+        assert.deepEqual(result.warnings, ["SIDECAR_STARTUP_LOCK_STALE"]);
+        assert.equal(fs.existsSync(environment.paths.lockPath), true);
+        assertSafeInspection(result);
+    } finally { await environment.close(); }
+});
+
+test("inspectNoStart malformed state fails closed", async () => {
+    const environment = await createEnvironment();
+    try {
+        fs.mkdirSync(environment.paths.runtime, { recursive: true });
+        fs.writeFileSync(environment.paths.statePath, "{malformed", "utf8");
+        const result = await environment.client.inspectNoStart();
+        assert.equal(result.status, "error");
+        assert.equal(result.errorCode, "SIDECAR_STATE_INVALID");
+        assert.equal(environment.client.sidecarChild, null);
+        assertSafeInspection(result);
+    } finally { await environment.close(); }
+});
+
+test("reconcileDeadInstance never starts a replacement", async () => {
+    const environment = await createEnvironment();
+    try {
+        const state = await environment.client.ensure();
+        const result = await environment.client.reconcileDeadInstance();
+        assert.equal(result.status, "ready");
+        assert.equal(result.pid, state.pid);
+        assert.equal(environment.client.sidecarChild.pid, state.pid);
+        assert.equal(isPidAlive(state.pid), true);
+        assertSafeInspection(result);
+    } finally { await environment.close(); }
+});
+
+test("reconcileDeadInstance reconciles confirmed dead state", async () => {
+    const environment = await createEnvironment();
+    try {
+        const oldState = stateFixture(environment, { instanceId: "dead-instance", controlToken: "dead-token" });
+        writeJsonAtomic(environment.paths.statePath, oldState);
+        const result = await environment.client.reconcileDeadInstance();
+        assert.equal(result.status, "absent");
+        assert.equal(result.reconciled, true);
+        assert.equal(fs.existsSync(environment.paths.statePath), false);
+        assert.equal(environment.client.sidecarChild, null);
+    } finally { await environment.close(); }
+});
 
 test("getLocalProcessIdentityConfirmed retries null and caches only success", async () => {
     const identity = deterministicLocalIdentity();
@@ -738,6 +825,166 @@ test("completed wins the cancel race and cancel is idempotent", async () => {
         assert.equal((await submission).accepted, true);
         assert.deepEqual(await environment.client.cancel({ jobId: "job_cancel_race" }), { cancelled: false, alreadyTerminal: true, state: "completed" });
     } finally { await environment.close(); }
+});
+
+test("submissionState becomes accepted on trusted turn binding", async () => {
+    const environment = await createEnvironment();
+    try {
+        const submission = await environment.submit(
+            "job_submission_accepted",
+            "[[DELAY_MS=300]][[FINAL=accepted]]",
+            environment.projectRoot,
+            { meta: { submissionState: "submitting" } }
+        );
+        const paths = jobPaths(environment.jobRoot, "job_submission_accepted");
+        const running = readJsonOrNull(paths.metaPath);
+        assert.equal(submission.accepted, true);
+        assert.equal(running.state, "running");
+        assert.equal(running.submissionState, "accepted");
+        assert.ok(running.threadId);
+        assert.ok(running.turnId);
+        assert.equal(running.executionBackend, "codex-app-server");
+        assert.equal(running.metaRevision, 2);
+        const completed = await environment.waitJob("job_submission_accepted");
+        assert.equal(completed.state, "completed");
+        assert.equal(completed.submissionState, "accepted");
+        assert.equal(completed.metaRevision, 3);
+    } finally { await environment.close(); }
+});
+
+test("explicit start failure marks submission rejected", async () => {
+    const environment = await createEnvironment();
+    const failingProject = path.join(environment.tempRoot, "fake-thread-fail");
+    fs.mkdirSync(failingProject);
+    try {
+        await assert.rejects(
+            environment.submit("job_submission_rejected", "ignored", failingProject, { meta: { submissionState: "submitting" } }),
+            error => error.code === "CODEX_RPC_ERROR"
+        );
+        const meta = await environment.waitJob("job_submission_rejected");
+        assert.equal(meta.state, "failed");
+        assert.equal(meta.submissionState, "rejected");
+        assert.equal(meta.errorCode, "CODEX_TURN_START_FAILED");
+        assert.equal(meta.metaRevision, 1);
+    } finally { await environment.close(); }
+});
+
+test("Sidecar-owned timeout finalizes an active turn", async () => {
+    const environment = await createEnvironment();
+    try {
+        await environment.submit("job_timeout_active", "[[DELAY_MS=5000]][[FINAL=late]]", environment.projectRoot, { timeoutSec: 0.05 });
+        const state = readJsonOrNull(environment.paths.statePath);
+        const meta = await environment.waitJob("job_timeout_active");
+        assert.equal(meta.state, "timeout");
+        assert.equal(meta.exitCode, null);
+        assert.equal(meta.errorCode, "JOB_TIMEOUT");
+        assert.ok(meta.completedAt);
+        assert.equal(meta.metaRevision, 3);
+        assert.equal(isPidAlive(state.pid), true);
+        assert.equal(isPidAlive(state.codexPid), true);
+        await environment.submit("job_timeout_other", "[[FINAL=other]]", environment.projectRoot, { timeoutSec: 1 });
+        assert.equal((await environment.waitJob("job_timeout_other")).state, "completed");
+        assert.equal(readJsonOrNull(environment.paths.statePath).pid, state.pid);
+    } finally { await environment.close(); }
+});
+
+test("timeout before turn binding still finalizes", async () => {
+    const environment = await createEnvironment();
+    let submission;
+    try {
+        submission = environment.submit(
+            "job_timeout_unbound",
+            "[[NO_TURN_RESPONSE]][[FINAL=never-bound]]",
+            environment.projectRoot,
+            { meta: { submissionState: "submitting" }, timeoutSec: 0.5 }
+        );
+        await waitFor(() => readJsonOrNull(jobPaths(environment.jobRoot, "job_timeout_unbound").metaPath)?.state === "running", 1500);
+        const state = readJsonOrNull(environment.paths.statePath);
+        const meta = await environment.waitJob("job_timeout_unbound");
+        assert.equal(meta.state, "timeout");
+        assert.equal(meta.submissionState, "submitting");
+        assert.equal(meta.turnId, undefined);
+        assert.equal(meta.exitCode, null);
+        assert.equal(meta.errorCode, "JOB_TIMEOUT");
+        assert.equal(meta.metaRevision, 2);
+        assert.equal(isPidAlive(state.pid), true);
+        assert.equal(isPidAlive(state.codexPid), true);
+        await environment.submit("job_after_unbound_timeout", "[[FINAL=after]]", environment.projectRoot, { timeoutSec: 1 });
+        assert.equal((await environment.waitJob("job_after_unbound_timeout")).state, "completed");
+    } finally {
+        await environment.close();
+        if (submission) await Promise.allSettled([submission]);
+    }
+});
+
+test("completed wins before timeout", async () => {
+    const environment = await createEnvironment();
+    try {
+        await environment.submit("job_completed_before_timeout", "[[DELAY_MS=40]][[FINAL=fast]]", environment.projectRoot, { timeoutSec: 0.4 });
+        const meta = await environment.waitJob("job_completed_before_timeout");
+        assert.equal(meta.state, "completed");
+        assert.equal(meta.exitCode, 0);
+        assert.equal(meta.errorCode, undefined);
+        assert.equal(meta.metaRevision, 3);
+        await delay(500);
+        assert.equal(readJsonOrNull(jobPaths(environment.jobRoot, "job_completed_before_timeout").metaPath).state, "completed");
+    } finally { await environment.close(); }
+});
+
+test("timeout wins over late completed", async () => {
+    const environment = await createEnvironment();
+    try {
+        await environment.submit("job_timeout_late_completed", "[[IGNORE_INTERRUPT]][[DELAY_MS=250]][[FINAL=late]]", environment.projectRoot, { timeoutSec: 0.05 });
+        const meta = await environment.waitJob("job_timeout_late_completed");
+        assert.equal(meta.state, "timeout");
+        assert.equal(meta.exitCode, null);
+        assert.equal(meta.errorCode, "JOB_TIMEOUT");
+    } finally { await environment.close(); }
+});
+
+test("cancel and timeout obey terminal first wins", async () => {
+    const environment = await createEnvironment();
+    try {
+        await environment.submit("job_cancel_wins", "[[DELAY_MS=1000]][[FINAL=cancelled]]", environment.projectRoot, { timeoutSec: 0.5 });
+        assert.deepEqual(await environment.client.cancel({ jobId: "job_cancel_wins" }), { cancelled: true, jobId: "job_cancel_wins", state: "cancelled" });
+        assert.equal((await environment.waitJob("job_cancel_wins")).state, "cancelled");
+
+        await environment.submit("job_timeout_wins", "[[IGNORE_INTERRUPT]][[DELAY_MS=1000]][[FINAL=timeout]]", environment.projectRoot, { timeoutSec: 0.05 });
+        await delay(100);
+        const lateCancel = await environment.client.cancel({ jobId: "job_timeout_wins" });
+        assert.deepEqual(lateCancel, { cancelled: false, alreadyTerminal: true, state: "timeout" });
+        assert.equal((await environment.waitJob("job_timeout_wins")).state, "timeout");
+    } finally { await environment.close(); }
+});
+
+test("terminal cleanup clears timeout timers", async () => {
+    const environment = await createEnvironment();
+    const server = new SidecarServer({ pluginDir: environment.pluginDir, jobRoot: environment.jobRoot });
+    const paths = createMeta(environment.jobRoot, "job_timer_cleanup");
+    const job = {
+        jobId: "job_timer_cleanup",
+        paths,
+        state: "running",
+        terminal: false,
+        timeoutTimer: setTimeout(() => {}, 10000),
+        timeoutFinalizeTimer: setTimeout(() => {}, 10000),
+        cancelTimeoutTimer: setTimeout(() => {}, 10000),
+        terminalPromise: Promise.resolve(),
+        resolveTerminal() {}
+    };
+    server.state = { status: "ready", instanceId: "timer-instance" };
+    server._updateMeta = async () => {};
+    server.activeJobs.set(job.jobId, job);
+    try {
+        await server._finishJob(job, "completed", 0, null);
+        assert.equal(job.timeoutTimer, null);
+        assert.equal(job.timeoutFinalizeTimer, null);
+        assert.equal(job.cancelTimeoutTimer, null);
+        assert.equal(server.activeJobs.has(job.jobId), false);
+    } finally {
+        server.activeJobs.clear();
+        await environment.close();
+    }
 });
 
 test("dead Sidecar reconciliation fails every old-instance running Job", async () => {

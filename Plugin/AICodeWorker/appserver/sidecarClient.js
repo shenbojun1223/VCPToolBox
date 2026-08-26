@@ -99,6 +99,107 @@ class SidecarClient {
         return this._callWithState(state, "submitAnalyzeJob", params);
     }
 
+    /**
+     * Observe Sidecar state without starting, cleaning, or taking over anything.
+     * This is intentionally separate from _probeExisting(): the latter is part
+     * of ensure() and may reconcile a dead instance while acquiring a lock.
+     */
+    async inspectNoStart(options = {}) {
+        let state;
+        try {
+            state = this._readState();
+        } catch (error) {
+            return this._inspectionError(error);
+        }
+
+        if (!state) {
+            let lock;
+            try {
+                lock = this._readLockRecord();
+            } catch (error) {
+                return this._inspectionError(error);
+            }
+            if (!lock) return { status: "absent", activeJobs: 0, maxConcurrency: this.maxConcurrency };
+            const lockStatus = this._inspectStartupLock(lock);
+            return {
+                status: lockStatus.status,
+                pid: lock.pid,
+                activeJobs: 0,
+                maxConcurrency: this.maxConcurrency,
+                ...(lockStatus.errorCode ? { errorCode: lockStatus.errorCode } : {})
+            };
+        }
+
+        if (!["starting", "ready", "degraded"].includes(state.status)) {
+            return this._inspectionError(new SidecarError("SIDECAR_STATE_INVALID", "Sidecar state status is invalid"), state);
+        }
+        const inspection = this._inspectStateProcess(state);
+        if (inspection.mismatch || !inspection.alive) {
+            return this._safeInspection(state, "dead");
+        }
+        if (inspection.unknown) {
+            return this._inspectionError(new SidecarError(
+                state.status === "starting" ? "SIDECAR_STARTING_UNVERIFIED" : "SIDECAR_STATE_PROCESS_UNVERIFIED",
+                "Sidecar process identity cannot be verified"
+            ), state);
+        }
+        const lockWarning = this._liveStateLockWarning();
+        if (state.status === "starting") return this._safeInspection(state, "starting", null, lockWarning);
+        if (state.status === "degraded") return this._safeInspection(state, "degraded", null, lockWarning);
+
+        if (options.ping === false) return this._safeInspection(state, "ready", null, lockWarning);
+        try {
+            const status = await this._callWithState(
+                state,
+                "status",
+                {},
+                { timeoutMs: Math.min(this.requestTimeoutMs, Math.max(250, Number(options.pingTimeoutMs || 750))) }
+            );
+            return this._safeInspection(state, "ready", status, lockWarning);
+        } catch (error) {
+            const currentInspection = this._inspectStateProcess(state);
+            if (!currentInspection.alive || currentInspection.mismatch) return this._safeInspection(state, "dead", null, lockWarning);
+            return this._safeInspection(state, "unresponsive", {
+                errorCode: error?.code || "SIDECAR_UNRESPONSIVE"
+            }, lockWarning);
+        }
+    }
+
+    /**
+     * Reconcile only a confirmed dead Sidecar. Live, starting, degraded and
+     * unresponsive instances are returned untouched; malformed/stale locks
+     * remain fail-closed.
+     */
+    async reconcileDeadInstance() {
+        const inspection = await this.inspectNoStart();
+        if (inspection.status !== "dead") return inspection;
+
+        let state;
+        try {
+            state = this._readState();
+        } catch (error) {
+            return this._inspectionError(error);
+        }
+        if (!state) return { status: "absent", activeJobs: 0, maxConcurrency: this.maxConcurrency };
+
+        try {
+            const cleaned = await this._cleanDeadState(state);
+            if (!cleaned) {
+                const replacement = this._readState();
+                if (replacement && !this._sameStateIdentity(replacement, state)) return this.inspectNoStart();
+                return { ...this._safeInspection(state, "dead"), errorCode: "SIDECAR_RECONCILIATION_NOT_PERFORMED" };
+            }
+            const replacement = this._readState();
+            return replacement
+                ? this.inspectNoStart()
+                : { status: "absent", activeJobs: 0, maxConcurrency: this.maxConcurrency, reconciled: true };
+        } catch (error) {
+            const replacement = this._readState();
+            if (replacement && !this._sameStateIdentity(replacement, state)) return this.inspectNoStart();
+            return this._inspectionError(error, state);
+        }
+    }
+
     async ping() {
         const state = await this._requireExisting();
         return this._callWithState(state, "ping", {});
@@ -124,6 +225,52 @@ class SidecarClient {
     async shutdown() {
         const state = await this._requireExisting();
         return this._callWithState(state, "shutdown", {});
+    }
+
+    _inspectionError(error, state = null) {
+        return {
+            ...this._safeInspection(state, "error"),
+            errorCode: error?.code || "SIDECAR_INSPECTION_FAILED"
+        };
+    }
+
+    _safeInspection(state, status, statusResult = null, warnings = null) {
+        const result = {
+            status,
+            instanceId: state?.instanceId || statusResult?.instanceId || null,
+            pid: state?.pid || statusResult?.pid || null,
+            activeJobs: Array.isArray(statusResult?.activeJobs)
+                ? statusResult.activeJobs.length
+                : Number.isInteger(statusResult?.activeJobs)
+                    ? statusResult.activeJobs
+                    : 0,
+            maxConcurrency: Number(statusResult?.maxConcurrency || this.maxConcurrency)
+        };
+        if (statusResult?.errorCode) result.errorCode = statusResult.errorCode;
+        if (warnings) result.warnings = [warnings];
+        return result;
+    }
+
+    _liveStateLockWarning() {
+        try {
+            const lock = this._readLockRecord();
+            if (!lock) return null;
+            const lockStatus = this._inspectStartupLock(lock);
+            return lockStatus.status === "stale-lock" ? lockStatus.errorCode : null;
+        } catch (error) {
+            return error?.code === "SIDECAR_LOCK_INVALID" ? "SIDECAR_STARTUP_LOCK_INVALID" : "SIDECAR_STARTUP_LOCK_UNREADABLE";
+        }
+    }
+
+    _inspectStartupLock(lock) {
+        if (!isPidAlive(lock.pid)) {
+            return { status: "stale-lock", errorCode: "SIDECAR_STARTUP_LOCK_STALE" };
+        }
+        const currentIdentity = getProcessIdentity(lock.pid);
+        if (!currentIdentity || !sameProcessIdentity(lock.processIdentity, currentIdentity)) {
+            return { status: "stale-lock", errorCode: "SIDECAR_STARTUP_LOCK_STALE" };
+        }
+        return { status: "starting", errorCode: "SIDECAR_STARTUP_LOCK_BUSY" };
     }
 
     async _requireExisting() {
@@ -428,7 +575,7 @@ class SidecarClient {
         throw new SidecarError("SIDECAR_START_TIMEOUT", "Timed out waiting for Sidecar readiness");
     }
 
-    _callWithState(state, method, params) {
+    _callWithState(state, method, params, options = {}) {
         if (!state?.endpoint || !state.controlToken) return Promise.reject(new SidecarError("SIDECAR_STATE_INVALID", "Sidecar state is incomplete"));
         const requestId = String(this.requestCounter++);
         return new Promise((resolve, reject) => {
@@ -442,12 +589,14 @@ class SidecarClient {
                 if (socket && !socket.destroyed) socket.destroy();
                 if (error) reject(error); else resolve(value);
             };
-            const timeout = setTimeout(() => finish(new SidecarError("SIDECAR_IPC_TIMEOUT", `Sidecar request timed out: ${method}`)), this.requestTimeoutMs);
+            const timeoutMs = Math.max(250, Number(options.timeoutMs || this.requestTimeoutMs));
+            const timeout = setTimeout(() => finish(new SidecarError("SIDECAR_IPC_TIMEOUT", `Sidecar request timed out: ${method}`)), timeoutMs);
             try {
                 socket = net.createConnection(state.endpoint);
                 socket.setEncoding("utf8");
                 socket.setTimeout(this.connectTimeoutMs, () => finish(new SidecarError("SIDECAR_IPC_TIMEOUT", "Sidecar IPC connection timed out")));
                 socket.once("connect", () => {
+                    socket.setTimeout(0);
                     try { socket.write(`${JSON.stringify({ requestId, token: state.controlToken, method, params })}\n`); } catch (error) { finish(new SidecarError("SIDECAR_IPC_WRITE_FAILED", "Could not write Sidecar request", { cause: error.code })); }
                 });
                 socket.on("data", chunk => {
