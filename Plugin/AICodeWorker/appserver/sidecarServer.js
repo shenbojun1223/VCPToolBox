@@ -18,10 +18,35 @@ const {
     assertJobId,
     assertAbsolutePath,
     removeEndpoint,
-    getLocalProcessIdentityConfirmed
+    getLocalProcessIdentityConfirmed,
+    getProcessIdentity
 } = require("./protocol");
 
 const TERMINAL_STATES = new Set(["completed", "cancelled", "failed", "timeout"]);
+
+function withSafeIdentityCwd(callback) {
+    if (process.platform !== "win32") return callback();
+    let originalCwd;
+    try { originalCwd = process.cwd(); } catch { return callback(); }
+    const safeCwd = process.env.SystemRoot || process.env.WINDIR || path.parse(process.execPath).root;
+    if (!safeCwd || path.resolve(originalCwd).toLowerCase() === path.resolve(safeCwd).toLowerCase()) return callback();
+    let changed = false;
+    try {
+        process.chdir(safeCwd);
+        changed = true;
+    } catch {}
+    try {
+        return callback();
+    } finally {
+        if (changed) {
+            try { process.chdir(originalCwd); } catch {}
+        }
+    }
+}
+
+function getProcessIdentitySafely(pid) {
+    return withSafeIdentityCwd(() => getProcessIdentity(pid));
+}
 
 class SidecarServer extends EventEmitter {
     constructor(options = {}) {
@@ -38,6 +63,10 @@ class SidecarServer extends EventEmitter {
         this.cancelTimeoutMs = Math.max(250, Number(options.cancelTimeoutMs || 3000));
         this.timeoutGraceMs = Math.max(250, Number(options.timeoutGraceMs || Math.min(this.cancelTimeoutMs, 1000)));
         this.drainTimeoutMs = Math.max(500, Number(options.drainTimeoutMs || 2500));
+        const maxIpcBufferBytes = Number(options.maxIpcBufferBytes);
+        this.maxIpcBufferBytes = Number.isFinite(maxIpcBufferBytes)
+            ? Math.max(1024, Math.floor(maxIpcBufferBytes))
+            : 1024 * 1024;
         this.testStartupDelayMs = Math.max(0, Number(options.testStartupDelayMs || 0));
         this.activeJobs = new Map();
         this.seenJobs = new Set();
@@ -69,7 +98,7 @@ class SidecarServer extends EventEmitter {
     async start() {
         if (this.started) return this;
         const processIdentity = await getLocalProcessIdentityConfirmed({
-            identityProvider: this.identityProvider,
+            identityProvider: this.identityProvider || getProcessIdentitySafely,
             delay: this.identityDelay
         });
         ensureDirectory(this.paths.runtime);
@@ -146,13 +175,31 @@ class SidecarServer extends EventEmitter {
         let handled = false;
         socket.setEncoding("utf8");
         socket.on("data", chunk => {
+            if (handled) return;
             buffer += chunk;
             let newline;
-            while (!handled && (newline = buffer.indexOf("\n")) !== -1) {
-                const line = buffer.slice(0, newline).replace(/\r$/, "");
+            while (!handled) {
+                newline = buffer.indexOf("\n");
+                if (newline === -1) {
+                    if (Buffer.byteLength(buffer, "utf8") > this.maxIpcBufferBytes) {
+                        handled = true;
+                        buffer = "";
+                        this._sendError(socket, null, new SidecarError("SIDECAR_IPC_BUFFER_OVERFLOW", "Sidecar IPC request exceeded the buffer limit"));
+                    }
+                    return;
+                }
+                const rawLine = buffer.slice(0, newline);
+                if (Buffer.byteLength(rawLine, "utf8") > this.maxIpcBufferBytes) {
+                    handled = true;
+                    buffer = "";
+                    this._sendError(socket, null, new SidecarError("SIDECAR_IPC_BUFFER_OVERFLOW", "Sidecar IPC request exceeded the buffer limit"));
+                    return;
+                }
+                const line = rawLine.replace(/\r$/, "");
                 buffer = buffer.slice(newline + 1);
                 if (!line.trim()) continue;
                 handled = true;
+                buffer = "";
                 this._handleIpcLine(socket, line).catch(error => this._sendError(socket, null, error));
             }
         });

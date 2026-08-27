@@ -175,6 +175,61 @@ function writeJsonAtomic(filePath, value) {
     atomicWriteFile(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function createJsonExclusive(filePath, value, options = {}) {
+    const serialized = JSON.stringify(value, null, 2);
+    if (typeof serialized !== "string") {
+        throw new SidecarError("META_INVALID", "JSON value is not serializable");
+    }
+    ensureDirectory(path.dirname(filePath));
+    const hooks = options.hooks || options;
+    const openFile = hooks.openSync || fs.openSync;
+    const writeFile = hooks.writeFileSync || fs.writeFileSync;
+    const syncFile = hooks.fsyncSync || fs.fsyncSync;
+    const closeFile = hooks.closeSync || fs.closeSync;
+    const linkFile = hooks.linkSync || fs.linkSync;
+    const unlinkFile = hooks.unlinkSync || fs.unlinkSync;
+    const temporary = `${filePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`;
+    let fd;
+    let stage = "open";
+    let primaryError = null;
+    let cleanupError = null;
+    try {
+        fd = openFile(temporary, "wx", 0o600);
+        stage = "write";
+        writeFile(fd, `${serialized}\n`, "utf8");
+        stage = "fsync";
+        syncFile(fd);
+        closeFile(fd);
+        fd = undefined;
+        stage = "publish";
+        linkFile(temporary, filePath);
+    } catch (error) {
+        primaryError = error;
+    } finally {
+        if (fd !== undefined) {
+            try { closeFile(fd); } catch {}
+        }
+        try { unlinkFile(temporary); } catch (error) { cleanupError = error; }
+    }
+    if (primaryError) {
+        if (cleanupError) {
+            throw new SidecarError(
+                "META_CREATE_FINALIZATION_FAILED",
+                "Could not clean up failed Job meta creation",
+                { cause: primaryError?.code, cleanupCause: cleanupError?.code, stage }
+            );
+        }
+        if (stage === "publish" && primaryError?.code === "EEXIST") {
+            throw new SidecarError("META_ALREADY_EXISTS", "Job meta file already exists");
+        }
+        throw new SidecarError("META_CREATE_FAILED", "Could not create Job meta file", {
+            cause: primaryError?.code,
+            stage
+        });
+    }
+    return filePath;
+}
+
 function readJson(filePath) {
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
@@ -317,54 +372,87 @@ function sameProcessIdentity(left, right) {
 async function terminateOwnedChild(child, options = {}) {
     if (!child || typeof child.kill !== "function") return { terminated: false, confirmed: false };
     const gracefulTimeoutMs = Math.max(0, Number(options.gracefulTimeoutMs ?? 750));
-    const identity = options.identity || getProcessIdentity(child.pid);
+    const forceConfirmationTimeoutMs = Math.min(2000, Math.max(0,
+        Number(options.forceConfirmationTimeoutMs ?? 1000)));
+    const confirmationPollMs = Math.min(100, Math.max(10,
+        Number(options.confirmationPollMs ?? 25)));
+    const getIdentity = typeof options.identityProvider === "function"
+        ? options.identityProvider
+        : getProcessIdentity;
+    const isAlive = typeof options.isPidAlive === "function"
+        ? options.isPidAlive
+        : isPidAlive;
+    const identity = Object.prototype.hasOwnProperty.call(options, "identity")
+        ? options.identity
+        : getIdentity(child.pid);
     const hasExited = () => (child.exitCode !== null && child.exitCode !== undefined) ||
         (child.signalCode !== null && child.signalCode !== undefined);
-    if (hasExited()) return { terminated: false, confirmed: true, alreadyExited: true };
-    if (identity) {
-        const initialIdentity = getProcessIdentity(child.pid);
-        if (initialIdentity && !sameProcessIdentity(identity, initialIdentity)) {
-            return { terminated: false, confirmed: false, identityMismatch: true };
-        }
-    }
-    try { child.kill(options.signal || "SIGTERM"); } catch {}
-    const exited = await new Promise(resolve => {
+    const waitForTermination = (timeoutMs, checkPid = true) => new Promise(resolve => {
         let settled = false;
         let timer;
-        const finish = value => {
+        const finish = confirmed => {
             if (settled) return;
             settled = true;
             if (timer) clearTimeout(timer);
             child.removeListener?.("exit", onExit);
             child.removeListener?.("close", onClose);
-            resolve(value);
+            resolve(confirmed);
         };
         const onExit = () => finish(true);
         const onClose = () => finish(true);
+        const poll = () => {
+            if (hasExited()) return finish(true);
+            if (checkPid) {
+                let alive = true;
+                try { alive = isAlive(child.pid) === true; } catch {}
+                if (!alive) return finish(true);
+            }
+            if (Date.now() >= deadline) return finish(false);
+            timer = setTimeout(poll, Math.min(confirmationPollMs, Math.max(0, deadline - Date.now())));
+        };
+        const deadline = Date.now() + timeoutMs;
         child.once?.("exit", onExit);
         child.once?.("close", onClose);
-        if (hasExited()) finish(true);
-        else timer = setTimeout(() => finish(false), gracefulTimeoutMs);
+        poll();
     });
-    if (exited || hasExited()) return { terminated: true, confirmed: true, forced: false };
     if (hasExited()) return { terminated: false, confirmed: true, alreadyExited: true };
-    const currentIdentity = getProcessIdentity(child.pid);
+    if (identity) {
+        const initialIdentity = getIdentity(child.pid);
+        if (initialIdentity && !sameProcessIdentity(identity, initialIdentity)) {
+            return { terminated: false, confirmed: false, identityMismatch: true };
+        }
+    }
+    try { child.kill(options.signal || "SIGTERM"); } catch {}
+    const exited = await waitForTermination(gracefulTimeoutMs, Boolean(identity));
+    if (exited || hasExited()) return { terminated: true, confirmed: true, forced: false };
+    const currentIdentity = getIdentity(child.pid);
     if (!identity || !currentIdentity || !sameProcessIdentity(identity, currentIdentity)) {
         return { terminated: false, confirmed: false, identityMismatch: true };
     }
     if (hasExited()) return { terminated: false, confirmed: true, alreadyExited: true };
+    let forceSent = false;
     try {
-        if (process.platform === "win32") {
+        if (typeof options.forceKill === "function") {
+            forceSent = options.forceKill(child) !== false;
+        } else if (process.platform === "win32") {
             const result = spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
                 stdio: "ignore", windowsHide: true
             });
-            return { terminated: result.status === 0, confirmed: result.status === 0, forced: true };
+            forceSent = result.status === 0;
+        } else {
+            forceSent = child.kill(options.forceSignal || "SIGKILL") !== false;
         }
-        child.kill(options.forceSignal || "SIGKILL");
-        return { terminated: true, confirmed: true, forced: true };
     } catch {
-        return { terminated: false, confirmed: false };
+        forceSent = false;
     }
+    const confirmed = await waitForTermination(forceConfirmationTimeoutMs);
+    return {
+        terminated: forceSent || confirmed,
+        confirmed,
+        forced: true,
+        forceSent,
+        ...(confirmed ? {} : { stillAlive: true })
+    };
 }
 
 async function reconcileDeadSidecarJobs(jobRoot, state, options = {}) {
@@ -487,20 +575,30 @@ function openMetaLock(lockPath, processIdentity) {
     if (!record.processIdentity) {
         throw new SidecarError("SIDECAR_META_LOCK_INVALID", "Current process identity could not be verified");
     }
+    const temporary = `${lockPath}.${process.pid}.${ownerToken}.tmp`;
     let fd;
+    let published = false;
     try {
-        fd = fs.openSync(lockPath, "wx", 0o600);
+        fd = fs.openSync(temporary, "wx", 0o600);
         fs.writeFileSync(fd, JSON.stringify(record), "utf8");
         fs.fsyncSync(fd);
-        return { fd, ownerToken, record };
+        fs.closeSync(fd);
+        fd = undefined;
+        try {
+            fs.linkSync(temporary, lockPath);
+            published = true;
+        } catch (error) {
+            if (error?.code !== "EEXIST") throw error;
+        }
     } catch (error) {
         if (fd !== undefined) {
             try { fs.closeSync(fd); } catch {}
-            try { fs.unlinkSync(lockPath); } catch {}
         }
-        if (error?.code === "EEXIST") return null;
         throw new SidecarError("SIDECAR_META_LOCK_FAILED", "Could not acquire Job meta lock", { cause: error?.code });
+    } finally {
+        try { fs.unlinkSync(temporary); } catch {}
     }
+    return published ? { fd: undefined, ownerToken, record } : null;
 }
 
 function releaseMetaLock(lockPath, lock) {
@@ -612,6 +710,7 @@ module.exports = {
     ensureDirectory,
     atomicWriteFile,
     writeJsonAtomic,
+    createJsonExclusive,
     readJson,
     readJsonOrNull,
     readStateStrict,

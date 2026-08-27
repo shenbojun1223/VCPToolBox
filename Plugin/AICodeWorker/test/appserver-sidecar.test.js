@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
+const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
@@ -23,7 +24,8 @@ const {
     metaLockPath,
     withJobMetaLock,
     terminateExactPid,
-    getLocalProcessIdentityConfirmed
+    getLocalProcessIdentityConfirmed,
+    createJsonExclusive
 } = require("../appserver/protocol");
 const { JsonLineRpcConnection } = require("../appserver/jsonLineRpcConnection");
 const { SidecarServer } = require("../appserver/sidecarServer");
@@ -47,6 +49,99 @@ async function waitFor(predicate, timeoutMs = 6000) {
         await delay(25);
     }
     throw new Error("timed out waiting for test condition");
+}
+
+async function removeTestRoot(tempRoot, label) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+        try {
+            fs.rmSync(tempRoot, {
+                recursive: true,
+                force: true,
+                maxRetries: 5,
+                retryDelay: 100
+            });
+        } catch (error) {
+            lastError = error;
+        }
+        if (!fs.existsSync(tempRoot)) return;
+        await delay(100);
+    }
+    throw new Error(`${label} cleanup left its tempRoot: ${tempRoot}${lastError ? ` (${lastError.code || lastError.message})` : ""}`);
+}
+
+async function listenIpcFixture(endpoint, responseFactory) {
+    const server = net.createServer(socket => {
+        let buffer = "";
+        socket.setEncoding("utf8");
+        socket.on("data", chunk => {
+            buffer += chunk;
+            const newline = buffer.indexOf("\n");
+            if (newline === -1) return;
+            const line = buffer.slice(0, newline);
+            let request;
+            try { request = JSON.parse(line); } catch { socket.end("not-json\n"); return; }
+            const response = responseFactory(request);
+            socket.end(`${typeof response === "string" ? response : JSON.stringify(response)}\n`);
+        });
+    });
+    await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(endpoint, resolve);
+    });
+    return server;
+}
+
+async function listenRawIpcFixture(endpoint, responseFactory) {
+    const server = net.createServer(socket => {
+        let request = "";
+        let responded = false;
+        socket.setEncoding("utf8");
+        socket.on("data", chunk => {
+            if (responded) return;
+            request += chunk;
+            if (!request.includes("\n")) return;
+            responded = true;
+            socket.end(responseFactory(request));
+        });
+    });
+    await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(endpoint, resolve);
+    });
+    return server;
+}
+
+function requestRawIpc(endpoint, payload) {
+    return new Promise((resolve, reject) => {
+        const socket = net.createConnection(endpoint);
+        let output = "";
+        let settled = false;
+        const finish = (error, value) => {
+            if (settled) return;
+            settled = true;
+            if (error) reject(error); else resolve(value);
+        };
+        socket.setEncoding("utf8");
+        socket.setTimeout(3000, () => {
+            socket.destroy();
+            finish(new Error("raw IPC fixture timed out"));
+        });
+        socket.on("data", chunk => { output += chunk; });
+        socket.once("error", error => finish(error));
+        socket.once("close", () => finish(null, { output }));
+        socket.once("connect", () => socket.end(payload));
+    });
+}
+
+async function closeIpcFixture(server) {
+    if (!server || !server.listening) return;
+    await new Promise((resolve, reject) => {
+        server.close(error => {
+            if (error && error.code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+            else resolve();
+        });
+    });
 }
 
 function createMeta(jobRoot, jobId, extra = {}) {
@@ -136,7 +231,7 @@ async function createEnvironment(options = {}) {
                 }
             }
             await delay(100);
-            try { fs.rmSync(this.tempRoot, { recursive: true, force: true }); } catch {}
+            await removeTestRoot(this.tempRoot, "sidecar fixture");
         }
     };
     return environment;
@@ -324,7 +419,13 @@ test("Sidecar start writes non-null local identity", async () => {
         const state = readJsonOrNull(environment.paths.statePath);
         assert.deepEqual(state.processIdentity, identity);
         assert.ok(state.processIdentity);
-    } finally { await server.shutdown(); }
+    } finally {
+        try {
+            await server.shutdown();
+        } finally {
+            await environment.close();
+        }
+    }
 });
 
 test("existing live starting Sidecar can be observed before caller local identity is acquired", async () => {
@@ -682,6 +783,178 @@ test("path traversal, fixed-path mismatch, relative projectPath, and wrong token
     } finally { await environment.close(); }
 });
 
+test("SidecarClient accepts only strict IPC envelopes and fails closed on malformed responses", async () => {
+    const environment = await createEnvironment();
+    let currentCase;
+    let server;
+    try {
+        const state = { endpoint: environment.paths.endpoint, controlToken: "fixture-token" };
+        const cases = [
+            {
+                name: "valid result object",
+                response: request => ({ requestId: request.requestId, ok: true, result: { accepted: true } }),
+                expected: { accepted: true }
+            },
+            {
+                name: "array result",
+                response: request => ({ requestId: request.requestId, ok: true, result: [] }),
+                code: "INVALID_SIDECAR_RESPONSE"
+            },
+            {
+                name: "missing ok",
+                response: request => ({ requestId: request.requestId, result: {} }),
+                code: "INVALID_SIDECAR_RESPONSE"
+            },
+            {
+                name: "malformed error",
+                response: request => ({ requestId: request.requestId, ok: false, error: { code: "BROKEN" } }),
+                code: "INVALID_SIDECAR_RESPONSE"
+            },
+            {
+                name: "requestId mismatch",
+                response: () => ({ requestId: "not-the-request", ok: true, result: {} }),
+                code: "SIDECAR_RESPONSE_MISMATCH"
+            },
+            {
+                name: "numeric requestId masquerade",
+                response: request => ({ requestId: Number(request.requestId), ok: true, result: {} }),
+                code: "SIDECAR_RESPONSE_MISMATCH"
+            }
+        ];
+        server = await listenIpcFixture(environment.paths.endpoint, request => currentCase.response(request));
+        for (const testCase of cases) {
+            currentCase = testCase;
+            if (testCase.expected) {
+                assert.deepEqual(await environment.client._callWithState(state, "ping", {}), testCase.expected, testCase.name);
+            } else {
+                await assert.rejects(
+                    environment.client._callWithState(state, "ping", {}),
+                    error => error.code === testCase.code,
+                    testCase.name
+                );
+            }
+        }
+    } finally {
+        try {
+            await closeIpcFixture(server);
+        } finally {
+            await environment.close();
+        }
+    }
+});
+
+test("SidecarClient bounds UTF-8 response buffers and consumes only the first response line", async () => {
+    const environment = await createEnvironment();
+    let server;
+    try {
+        const client = clientFor(environment, { maxIpcBufferBytes: 1024 });
+        const state = { endpoint: environment.paths.endpoint, controlToken: "fixture-token" };
+        for (const testCase of [
+            { name: "response without newline", payload: "界".repeat(342) },
+            { name: "oversized complete response line", payload: `${"界".repeat(342)}\n` }
+        ]) {
+            server = await listenRawIpcFixture(environment.paths.endpoint, () => testCase.payload);
+            await assert.rejects(
+                client._callWithState(state, "ping", {}),
+                error => error.code === "SIDECAR_IPC_BUFFER_OVERFLOW",
+                testCase.name
+            );
+            await closeIpcFixture(server);
+            server = null;
+        }
+
+        server = await listenRawIpcFixture(environment.paths.endpoint, request => {
+            const requestId = JSON.parse(request.trim()).requestId;
+            return `${JSON.stringify({ requestId, ok: true, result: { first: true } })}\n${"x".repeat(2048)}\n`;
+        });
+        assert.deepEqual(await client._callWithState(state, "ping", {}), { first: true });
+    } finally {
+        try {
+            await closeIpcFixture(server);
+        } finally {
+            await environment.close();
+        }
+    }
+});
+
+test("SidecarServer rejects oversized request buffers and closes each IPC socket", async () => {
+    const environment = await createEnvironment();
+    const sidecar = new SidecarServer({
+        pluginDir: environment.pluginDir,
+        jobRoot: environment.jobRoot,
+        maxIpcBufferBytes: 1024
+    });
+    sidecar.state = { controlToken: "fixture-token", instanceId: "fixture-instance" };
+    const server = net.createServer(socket => sidecar._acceptSocket(socket));
+    sidecar.server = server;
+    try {
+        await new Promise((resolve, reject) => {
+            server.once("error", reject);
+            server.listen(environment.paths.endpoint, resolve);
+        });
+        for (const payload of [
+            "界".repeat(342),
+            `${JSON.stringify({ requestId: "oversized", token: "fixture-token", method: "ping", params: { text: "x".repeat(1100) } })}\n${JSON.stringify({ requestId: "ignored", token: "fixture-token", method: "ping" })}\n`
+        ]) {
+            const response = await requestRawIpc(environment.paths.endpoint, payload);
+            const lines = response.output.trim().split(/\r?\n/).filter(Boolean);
+            assert.equal(lines.length, 1);
+            const envelope = JSON.parse(lines[0]);
+            assert.equal(envelope.requestId, null);
+            assert.equal(envelope.ok, false);
+            assert.equal(envelope.error.code, "SIDECAR_IPC_BUFFER_OVERFLOW");
+        }
+        await waitFor(() => sidecar.sockets.size === 0, 1000);
+    } finally {
+        await sidecar.shutdown();
+        await environment.close();
+    }
+});
+
+test("createJsonExclusive preserves an existing meta file on collision", async () => {
+    const environment = await createEnvironment();
+    try {
+        const target = path.join(environment.jobRoot, "meta", "job_collision.json");
+        const original = { jobId: "job_collision", state: "queued", owner: "original" };
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, `${JSON.stringify(original)}\n`, "utf8");
+        assert.throws(
+            () => createJsonExclusive(target, { ...original, owner: "replacement" }),
+            error => error.code === "META_ALREADY_EXISTS"
+        );
+        assert.deepEqual(readJsonOrNull(target), original);
+    } finally { await environment.close(); }
+});
+
+test("createJsonExclusive reports finalization failure when write and cleanup both fail", () => {
+    let closeCalls = 0;
+    assert.throws(
+        () => createJsonExclusive(
+            path.join(os.tmpdir(), "virtual-meta-finalization-failure.json"),
+            { jobId: "job_virtual_meta_failure" },
+            {
+                openSync: () => 123,
+                writeFileSync: () => {
+                    throw Object.assign(new Error("injected write failure"), { code: "EWRITE" });
+                },
+                fsyncSync: () => {},
+                closeSync: () => { closeCalls++; },
+                linkSync: () => {
+                    throw new Error("link must not run after write failure");
+                },
+                unlinkSync: () => {
+                    throw Object.assign(new Error("injected cleanup failure"), { code: "EDELETE" });
+                }
+            }
+        ),
+        error => error.code === "META_CREATE_FINALIZATION_FAILED" &&
+            error.details?.cause === "EWRITE" &&
+            error.details?.cleanupCause === "EDELETE" &&
+            error.details?.stage === "write"
+    );
+    assert.equal(closeCalls, 1);
+});
+
 test("duplicate jobId cannot be submitted a second time", async () => {
     const environment = await createEnvironment();
     try {
@@ -945,7 +1218,9 @@ test("timeout wins over late completed", async () => {
 test("cancel and timeout obey terminal first wins", async () => {
     const environment = await createEnvironment();
     try {
-        await environment.submit("job_cancel_wins", "[[DELAY_MS=1000]][[FINAL=cancelled]]", environment.projectRoot, { timeoutSec: 0.5 });
+        // Timeout starts before submit returns; keep a wide margin so this branch
+        // deterministically proves cancel-first rather than host scheduling speed.
+        await environment.submit("job_cancel_wins", "[[DELAY_MS=1000]][[FINAL=cancelled]]", environment.projectRoot, { timeoutSec: 3 });
         assert.deepEqual(await environment.client.cancel({ jobId: "job_cancel_wins" }), { cancelled: true, jobId: "job_cancel_wins", state: "cancelled" });
         assert.equal((await environment.waitJob("job_cancel_wins")).state, "cancelled");
 
@@ -1348,6 +1623,70 @@ test("identity mismatch and unavailable identity never force-kill", async () => 
     const unknownResult = await terminateOwnedChild(unknown, { identity: null, gracefulTimeoutMs: 1 });
     assert.equal(unknownResult.identityMismatch, true);
     assert.deepEqual(unknown.killCalls, ["SIGTERM"]);
+});
+
+function ownedTerminationFixture() {
+    const child = mockChild();
+    const identity = getProcessIdentity(process.pid);
+    assert.ok(identity);
+    return {
+        child,
+        identity,
+        options: {
+            identity,
+            identityProvider: pid => getProcessIdentity(pid),
+            gracefulTimeoutMs: 1,
+            forceConfirmationTimeoutMs: 35,
+            confirmationPollMs: 10
+        }
+    };
+}
+
+test("force signal sent while child and PID remain alive is not confirmed", async () => {
+    const fixture = ownedTerminationFixture();
+    const result = await terminateOwnedChild(fixture.child, {
+        ...fixture.options,
+        isPidAlive: () => true,
+        forceKill: () => true
+    });
+    assert.equal(result.forceSent, true);
+    assert.equal(result.confirmed, false);
+    assert.equal(result.stillAlive, true);
+});
+
+test("force signal followed by child exit/close is confirmed", async () => {
+    const fixture = ownedTerminationFixture();
+    const result = await terminateOwnedChild(fixture.child, {
+        ...fixture.options,
+        isPidAlive: () => true,
+        forceKill: () => {
+            setTimeout(() => {
+                fixture.child.signalCode = "SIGKILL";
+                fixture.child.emit("exit", null, "SIGKILL");
+                fixture.child.emit("close", null, "SIGKILL");
+            }, 5);
+            return true;
+        }
+    });
+    assert.equal(result.forceSent, true);
+    assert.equal(result.confirmed, true);
+    assert.equal(result.stillAlive, undefined);
+});
+
+test("force signal followed by PID disappearance is confirmed by bounded polling", async () => {
+    const fixture = ownedTerminationFixture();
+    let alive = true;
+    const result = await terminateOwnedChild(fixture.child, {
+        ...fixture.options,
+        isPidAlive: () => alive,
+        forceKill: () => {
+            alive = false;
+            return true;
+        }
+    });
+    assert.equal(result.forceSent, true);
+    assert.equal(result.confirmed, true);
+    assert.equal(result.stillAlive, undefined);
 });
 
 test("legal no-jsonrpc notification is processed", async () => {

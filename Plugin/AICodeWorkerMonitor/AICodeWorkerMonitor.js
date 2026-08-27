@@ -54,12 +54,20 @@ function buildJobStatusPayload(meta, filePath) {
             state: meta.state || 'unknown',
             worker: meta.worker || null,
             mode: meta.mode || null,
-            pid: meta.workerPid || meta.pid || null,
+            pid: meta.workerPid || meta.pid || meta.sidecarPid || null,
             startedAt: meta.startedAt || null,
             completedAt: meta.completedAt || null,
             exitCode: meta.exitCode !== undefined ? meta.exitCode : null,
             exitReason: meta.exitReason || null,
-            projectPath: meta.projectPath || null
+            projectPath: meta.projectPath || null,
+            executionBackend: meta.executionBackend || (meta.requestedExecutionBackend ? null : 'legacy-exec'),
+            requestedExecutionBackend: meta.requestedExecutionBackend || null,
+            submissionState: meta.submissionState || null,
+            sidecarInstanceId: meta.sidecarInstanceId || null,
+            sidecarPid: meta.sidecarPid || null,
+            threadId: meta.threadId || null,
+            turnId: meta.turnId || null,
+            errorCode: meta.errorCode || null
         }
     };
 }
@@ -213,6 +221,7 @@ module.exports = {
     initialize,
     shutdown,
     sendSnapshot,
+    buildJobStatusPayload,
     __testing: {
         buildJobStatusPayload,
         isJobMetaFile,

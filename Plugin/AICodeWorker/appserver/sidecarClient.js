@@ -22,6 +22,41 @@ const {
     writeJsonAtomic
 } = require("./protocol");
 
+const OWNED_CHILD_TERMINATION_PROOFS = new WeakSet();
+
+function getSafeIdentityCwd() {
+    if (process.platform !== "win32") return null;
+    return process.env.SystemRoot || process.env.WINDIR || path.parse(process.execPath).root;
+}
+
+function withSafeIdentityCwd(callback) {
+    if (process.platform !== "win32") return callback();
+    let originalCwd;
+    try { originalCwd = process.cwd(); } catch { return callback(); }
+    const safeCwd = getSafeIdentityCwd();
+    if (!safeCwd || path.resolve(originalCwd).toLowerCase() === path.resolve(safeCwd).toLowerCase()) return callback();
+    let changed = false;
+    try {
+        process.chdir(safeCwd);
+        changed = true;
+    } catch {}
+    try {
+        return callback();
+    } finally {
+        if (changed) {
+            try { process.chdir(originalCwd); } catch {}
+        }
+    }
+}
+
+function getProcessIdentitySafely(pid) {
+    return withSafeIdentityCwd(() => getProcessIdentity(pid));
+}
+
+function getLocalProcessIdentitySafely() {
+    return withSafeIdentityCwd(() => getLocalProcessIdentity());
+}
+
 class SidecarClient {
     constructor(options = {}) {
         this.pluginDir = path.resolve(options.pluginDir || process.cwd());
@@ -30,11 +65,11 @@ class SidecarClient {
         this.entryPath = path.resolve(options.entryPath || path.join(__dirname, "sidecar-entry.js"));
         this.codexBin = options.codexBin || "codex";
         this.codexGlobalArgs = Array.isArray(options.codexGlobalArgs) ? [...options.codexGlobalArgs] : [];
-        this.identityProvider = options.identityProvider;
+        this.identityProvider = options.identityProvider || getProcessIdentitySafely;
         this.identityDelay = options.identityDelay;
         this.processIdentity = Object.prototype.hasOwnProperty.call(options, "processIdentity")
             ? options.processIdentity
-            : getLocalProcessIdentity();
+            : getLocalProcessIdentitySafely();
         this.maxConcurrency = Math.max(1, Number(options.maxConcurrency || 2));
         this.connectTimeoutMs = Math.max(250, Number(options.connectTimeoutMs || 1500));
         this.requestTimeoutMs = Math.max(500, Number(options.requestTimeoutMs || 10000));
@@ -42,6 +77,10 @@ class SidecarClient {
         this.startingTimeoutMs = Math.max(100, Number(options.startingTimeoutMs || this.startupTimeoutMs));
         this.lockWaitMs = Math.max(1000, Number(options.lockWaitMs || 20000));
         this.staleLockMs = Math.max(1000, Number(options.staleLockMs || 5000));
+        const maxIpcBufferBytes = Number(options.maxIpcBufferBytes);
+        this.maxIpcBufferBytes = Number.isFinite(maxIpcBufferBytes)
+            ? Math.max(1024, Math.floor(maxIpcBufferBytes))
+            : 1024 * 1024;
         this.cleanupHooks = options.cleanupHooks || options.hooks || {};
         this.stateReader = options.stateReader || options.readState || options.testHooks?.readState || this.cleanupHooks.readState || null;
         this.testStartupDelayMs = Math.max(0, Number(options.testStartupDelayMs || 0));
@@ -53,12 +92,12 @@ class SidecarClient {
 
     async ensure() {
         const existing = await this._probeExisting(false, null);
-        if (existing) return existing;
+        if (existing) return this._assertCompatibleConcurrency(existing);
         try {
             await this._ensureLocalProcessIdentity();
         } catch (error) {
             const observed = await this._probeExisting(false, null);
-            if (observed) return observed;
+            if (observed) return this._assertCompatibleConcurrency(observed);
             throw error;
         }
         ensureDirectory(this.paths.runtime);
@@ -69,18 +108,38 @@ class SidecarClient {
                 lock = this._tryAcquireLock();
             } catch (error) {
                 const observed = await this._probeExisting(false, null);
-                if (observed) return observed;
+                if (observed) return this._assertCompatibleConcurrency(observed);
                 throw error;
             }
             if (lock) {
                 try {
                     const afterLock = await this._probeExisting(false, lock);
-                    if (afterLock) return afterLock;
+                    if (afterLock) return this._assertCompatibleConcurrency(afterLock);
                     const child = this._spawnSidecar();
                     try {
-                        return await this._waitForReady(child);
+                        const state = await this._waitForReady(child);
+                        return this._assertCompatibleConcurrency(state);
                     } catch (error) {
-                        await terminateOwnedChild(child, { identity: child.processIdentity, gracefulTimeoutMs: 500 });
+                        let termination;
+                        try {
+                            termination = await terminateOwnedChild(child, {
+                                identity: child.processIdentity,
+                                gracefulTimeoutMs: 500
+                            });
+                        } catch {
+                            termination = { confirmed: false };
+                        }
+                        if (termination?.confirmed === true) {
+                            const provenError = new SidecarError(error?.code || "SIDECAR_START_FAILED", error?.message, {
+                                ...(error?.details && typeof error.details === "object" && !Array.isArray(error.details)
+                                    ? error.details
+                                    : {}),
+                                safeToFallback: true,
+                                fallbackEvidence: "owned-child-termination-confirmed"
+                            });
+                            OWNED_CHILD_TERMINATION_PROOFS.add(provenError);
+                            throw provenError;
+                        }
                         throw error;
                     }
                 } finally {
@@ -89,7 +148,7 @@ class SidecarClient {
             }
             await this._delay(50);
             const observed = await this._probeExisting(false, null);
-            if (observed) return observed;
+            if (observed) return this._assertCompatibleConcurrency(observed);
         }
         throw new SidecarError("SIDECAR_START_TIMEOUT", "Timed out waiting for Sidecar startup lock");
     }
@@ -155,7 +214,12 @@ class SidecarClient {
                 {},
                 { timeoutMs: Math.min(this.requestTimeoutMs, Math.max(250, Number(options.pingTimeoutMs || 750))) }
             );
-            return this._safeInspection(state, "ready", status, lockWarning);
+            const inspection = this._safeInspection(state, "ready", status, lockWarning);
+            if (Number(status?.maxConcurrency) !== this.maxConcurrency) {
+                inspection.status = "error";
+                inspection.errorCode = "SIDECAR_CONCURRENCY_MISMATCH";
+            }
+            return inspection;
         } catch (error) {
             const currentInspection = this._inspectStateProcess(state);
             if (!currentInspection.alive || currentInspection.mismatch) return this._safeInspection(state, "dead", null, lockWarning);
@@ -266,7 +330,7 @@ class SidecarClient {
         if (!isPidAlive(lock.pid)) {
             return { status: "stale-lock", errorCode: "SIDECAR_STARTUP_LOCK_STALE" };
         }
-        const currentIdentity = getProcessIdentity(lock.pid);
+        const currentIdentity = getProcessIdentitySafely(lock.pid);
         if (!currentIdentity || !sameProcessIdentity(lock.processIdentity, currentIdentity)) {
             return { status: "stale-lock", errorCode: "SIDECAR_STARTUP_LOCK_STALE" };
         }
@@ -276,7 +340,7 @@ class SidecarClient {
     async _requireExisting() {
         const state = await this._probeExisting(true, null);
         if (!state) throw new SidecarError("SIDECAR_NOT_RUNNING", "Sidecar state does not exist");
-        return state;
+        return this._assertCompatibleConcurrency(state);
     }
 
     async _probeExisting(throwOnUnresponsive, heldLock = null) {
@@ -316,7 +380,7 @@ class SidecarClient {
     _inspectStateProcess(state) {
         if (!isPidAlive(state?.pid)) return { alive: false, confirmed: false, mismatch: false, unknown: false };
         if (!state.processIdentity) return { alive: true, confirmed: false, mismatch: false, unknown: true };
-        const current = getProcessIdentity(state.pid);
+        const current = getProcessIdentitySafely(state.pid);
         if (!current) return { alive: true, confirmed: false, mismatch: false, unknown: true };
         if (!sameProcessIdentity(state.processIdentity, current)) return { alive: true, confirmed: false, mismatch: true, unknown: false };
         return { alive: true, confirmed: true, mismatch: false, unknown: false };
@@ -458,6 +522,17 @@ class SidecarClient {
         return this.processIdentity;
     }
 
+    async _assertCompatibleConcurrency(state) {
+        const status = await this._callWithState(state, "status", {});
+        if (Number(status?.maxConcurrency) !== this.maxConcurrency) {
+            throw new SidecarError("SIDECAR_CONCURRENCY_MISMATCH", "Existing Sidecar concurrency does not match the required limit", {
+                expected: this.maxConcurrency,
+                actual: Number.isFinite(Number(status?.maxConcurrency)) ? Number(status.maxConcurrency) : null
+            });
+        }
+        return state;
+    }
+
     async _waitForLock() {
         await this._ensureLocalProcessIdentity();
         const startedAt = Date.now();
@@ -473,24 +548,40 @@ class SidecarClient {
         const ownerToken = crypto.randomBytes(16).toString("hex");
         const processIdentity = this.processIdentity;
         if (!processIdentity) throw new SidecarError("SIDECAR_LOCK_INVALID", "Current process identity could not be verified");
+        const record = { ownerToken, pid: process.pid, processIdentity, createdAt: Date.now() };
+        const temporary = `${this.paths.lockPath}.${process.pid}.${ownerToken}.tmp`;
+        let fd;
+        let published = false;
         try {
-            const fd = fs.openSync(this.paths.lockPath, "wx", 0o600);
-            const record = { ownerToken, pid: process.pid, processIdentity, createdAt: Date.now() };
+            fd = fs.openSync(temporary, "wx", 0o600);
             fs.writeFileSync(fd, JSON.stringify(record), "utf8");
             fs.fsyncSync(fd);
             fs.closeSync(fd);
-            return { ownerToken, record };
+            fd = undefined;
+            try {
+                fs.linkSync(temporary, this.paths.lockPath);
+                published = true;
+            } catch (error) {
+                if (error?.code !== "EEXIST") throw error;
+            }
         } catch (error) {
-            if (error.code !== "EEXIST") throw new SidecarError("SIDECAR_LOCK_FAILED", "Could not acquire Sidecar lock", { cause: error.code });
+            if (fd !== undefined) {
+                try { fs.closeSync(fd); } catch {}
+            }
+            throw new SidecarError("SIDECAR_LOCK_FAILED", "Could not acquire Sidecar lock", { cause: error?.code });
+        } finally {
+            try { fs.unlinkSync(temporary); } catch {}
         }
-        const record = this._readLockRecord();
-        if (!record) return null;
-        if (!isPidAlive(record.pid)) {
+        if (published) return { ownerToken, record };
+
+        const existing = this._readLockRecord();
+        if (!existing) return null;
+        if (!isPidAlive(existing.pid)) {
             throw new SidecarError("SIDECAR_STARTUP_LOCK_STALE", "Sidecar startup lock owner is not alive");
         }
-        const currentIdentity = getProcessIdentity(record.pid);
+        const currentIdentity = getProcessIdentitySafely(existing.pid);
         if (!currentIdentity) throw new SidecarError("SIDECAR_LOCK_INVALID", "Sidecar startup lock owner identity cannot be verified");
-        if (!sameProcessIdentity(record.processIdentity, currentIdentity)) {
+        if (!sameProcessIdentity(existing.processIdentity, currentIdentity)) {
             throw new SidecarError("SIDECAR_STARTUP_LOCK_STALE", "Sidecar startup lock owner identity does not match");
         }
         return null;
@@ -534,7 +625,7 @@ class SidecarClient {
         let child;
         try {
             child = spawn(process.execPath, args, {
-                cwd: this.pluginDir,
+                cwd: getSafeIdentityCwd() || this.pluginDir,
                 env: { ...process.env },
                 shell: false,
                 detached: true,
@@ -542,9 +633,13 @@ class SidecarClient {
                 windowsHide: true
             });
         } catch (error) {
-            throw new SidecarError("SIDECAR_SPAWN_FAILED", "Could not start Sidecar", { cause: error.code });
+            throw new SidecarError("SIDECAR_SPAWN_FAILED", "Could not start Sidecar", {
+                cause: error.code,
+                safeToFallback: true,
+                fallbackEvidence: "spawn-not-created"
+            });
         }
-        child.processIdentity = getProcessIdentity(child.pid);
+        child.processIdentity = getProcessIdentitySafely(child.pid);
         this.sidecarChild = child;
         child.unref();
         return child;
@@ -585,6 +680,7 @@ class SidecarClient {
             const finish = (error, value) => {
                 if (settled) return;
                 settled = true;
+                buffer = "";
                 clearTimeout(timeout);
                 if (socket && !socket.destroyed) socket.destroy();
                 if (error) reject(error); else resolve(value);
@@ -600,15 +696,44 @@ class SidecarClient {
                     try { socket.write(`${JSON.stringify({ requestId, token: state.controlToken, method, params })}\n`); } catch (error) { finish(new SidecarError("SIDECAR_IPC_WRITE_FAILED", "Could not write Sidecar request", { cause: error.code })); }
                 });
                 socket.on("data", chunk => {
+                    if (settled) return;
                     buffer += chunk;
                     const newline = buffer.indexOf("\n");
-                    if (newline === -1) return;
+                    if (newline === -1) {
+                        if (Buffer.byteLength(buffer, "utf8") > this.maxIpcBufferBytes) {
+                            finish(new SidecarError("SIDECAR_IPC_BUFFER_OVERFLOW", "Sidecar IPC response exceeded the buffer limit"));
+                        }
+                        return;
+                    }
+                    const lineBytes = Buffer.byteLength(buffer.slice(0, newline), "utf8");
+                    if (lineBytes > this.maxIpcBufferBytes) {
+                        finish(new SidecarError("SIDECAR_IPC_BUFFER_OVERFLOW", "Sidecar IPC response exceeded the buffer limit"));
+                        return;
+                    }
                     const line = buffer.slice(0, newline);
+                    buffer = "";
                     let response;
                     try { response = JSON.parse(line); } catch { finish(new SidecarError("INVALID_SIDECAR_RESPONSE", "Sidecar returned invalid JSON")); return; }
-                    if (String(response.requestId) !== requestId) { finish(new SidecarError("SIDECAR_RESPONSE_MISMATCH", "Sidecar response requestId mismatch")); return; }
-                    if (response.ok) finish(null, response.result);
-                    else finish(new SidecarError(response.error?.code || "SIDECAR_REQUEST_FAILED", response.error?.message || "Sidecar request failed", response.error?.details));
+                    if (!response || typeof response !== "object" || Array.isArray(response)) {
+                        finish(new SidecarError("INVALID_SIDECAR_RESPONSE", "Sidecar response envelope is invalid"));
+                        return;
+                    }
+                    if (response.requestId !== requestId) {
+                        finish(new SidecarError("SIDECAR_RESPONSE_MISMATCH", "Sidecar response requestId mismatch"));
+                        return;
+                    }
+                    const isObject = value => value && typeof value === "object" && !Array.isArray(value);
+                    const hasText = value => typeof value === "string" && value.trim().length > 0;
+                    if (response.ok === true && isObject(response.result)) {
+                        finish(null, response.result);
+                        return;
+                    }
+                    if (response.ok === false && isObject(response.error) &&
+                        hasText(response.error.code) && hasText(response.error.message)) {
+                        finish(new SidecarError(response.error.code.trim(), response.error.message.trim(), response.error.details));
+                        return;
+                    }
+                    finish(new SidecarError("INVALID_SIDECAR_RESPONSE", "Sidecar response envelope is invalid"));
                 });
                 socket.once("error", error => finish(new SidecarError("SIDECAR_IPC_ERROR", "Sidecar IPC failed", { cause: error.code })));
                 socket.once("close", () => {
@@ -625,4 +750,10 @@ class SidecarClient {
     }
 }
 
-module.exports = { SidecarClient };
+function hasOwnedChildTerminationProof(error) {
+    return (typeof error === "object" && error !== null) || typeof error === "function"
+        ? OWNED_CHILD_TERMINATION_PROOFS.has(error)
+        : false;
+}
+
+module.exports = { SidecarClient, hasOwnedChildTerminationProof };
