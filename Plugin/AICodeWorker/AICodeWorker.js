@@ -29,7 +29,11 @@ const BACKOFF_RUN_WAIT = [2, 3, 5, 10, 15, 20, 30, 30, 30, 30, 30, 30, 30, 30, 3
 const BACKOFF_QUERY    = [5, 10, 15, 20, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30];
 const TRACE_MODES = new Set(["summary", "events", "raw"]);
 const RESPONSE_MODES = new Set(["compact", "full"]);
+const RUN_MODES = new Set(["analyze", "patch", "write"]);
 const CODEX_MODELS_CACHE_FILE = "models_cache.json";
+const PATCH_CONTRACT_VERSION = 1;
+const PATCH_MAX_BYTES = 524288;
+const PATCH_REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 
 // ─── 配置加载 ─────────────────────────────────────────────────────────────────
 
@@ -59,6 +63,8 @@ function loadConfig() {
         enableCodex:      (raw.ENABLE_CODEX        || "false") !== "false",
         enableCodexAppServerAnalyze:
             String(raw.ENABLE_CODEX_APP_SERVER_ANALYZE || "").trim().toLowerCase() === "true",
+        enableCodexAppServerPatch:
+            String(raw.ENABLE_CODEX_APP_SERVER_PATCH || "").trim().toLowerCase() === "true",
         codexBin:          raw.CODEX_BIN            || "codex",
         codexModel:        raw.CODEX_MODEL          || "",
         codexProfile:      raw.CODEX_PROFILE        || "",
@@ -175,6 +181,71 @@ const APP_SERVER_FALLBACK_CODES = new Set([
 
 function isAppServerSubmissionUnknown(error) {
     return APP_SERVER_UNKNOWN_SUBMISSION_CODES.has(String(error?.code || ""));
+}
+
+const APP_SERVER_PATCH_UNSUPPORTED_CODES = new Set([
+    "UNKNOWN_METHOD",
+    "METHOD_NOT_FOUND",
+    "UNSUPPORTED_METHOD",
+    "UNSUPPORTED_PROTOCOL",
+    "PROTOCOL_VERSION_MISMATCH",
+    "SIDECAR_PROTOCOL_VERSION_MISMATCH",
+    "SIDECAR_VERSION_MISMATCH",
+    "AICW_PATCH_CODEX_VERSION_UNVERIFIED"
+]);
+const APP_SERVER_PATCH_META_CODES = new Set([
+    "DUPLICATE_JOB_ID",
+    "META_NOT_FOUND",
+    "META_INVALID",
+    "META_MALFORMED",
+    "META_JOB_MISMATCH"
+]);
+
+function isAppServerPatchSubmissionUnknown(error) {
+    return error?.code === "AICW_APP_SERVER_PATCH_SUBMISSION_UNKNOWN" ||
+        isAppServerSubmissionUnknown(error);
+}
+
+function mapAppServerPatchSubmissionError(error) {
+    const code = String(error?.code || "");
+    if (isAppServerPatchSubmissionUnknown(error)) {
+        return {
+            errorCode: "AICW_APP_SERVER_PATCH_SUBMISSION_UNKNOWN",
+            state: "running",
+            submissionState: "unknown",
+            message: "Codex app-server patch 提交结果未知，已保留原任务；禁止重放或回退。"
+        };
+    }
+    if (code === "CONCURRENCY_LIMIT") {
+        return {
+            errorCode: "AICW_APP_SERVER_PATCH_CONCURRENCY_LIMIT",
+            state: "failed",
+            submissionState: "rejected",
+            message: "Codex app-server analyze/patch 共享并发额度已满，任务未被接受。"
+        };
+    }
+    if (APP_SERVER_PATCH_UNSUPPORTED_CODES.has(code)) {
+        return {
+            errorCode: "AICW_APP_SERVER_PATCH_UNSUPPORTED",
+            state: "failed",
+            submissionState: "rejected",
+            message: "当前 Sidecar 或 Codex 版本无法确认支持 patch 协议，已安全拒绝。"
+        };
+    }
+    if (APP_SERVER_PATCH_META_CODES.has(code)) {
+        return {
+            errorCode: "AICW_APP_SERVER_PATCH_META_FAILED",
+            state: "failed",
+            submissionState: "rejected",
+            message: "Codex app-server patch Job 元数据或唯一性校验失败，已安全拒绝。"
+        };
+    }
+    return {
+        errorCode: "AICW_APP_SERVER_PATCH_UNAVAILABLE",
+        state: "failed",
+        submissionState: "rejected",
+        message: "Codex app-server patch 当前不可用，任务未回退到 legacy。"
+    };
 }
 
 function shouldFallbackToLegacyBeforeJob(error, beforeInspection, afterInspection, context = {}) {
@@ -805,7 +876,7 @@ function applyPreset(input) {
     return {
         ...input,
         task:        def.generate(input),
-        mode:        input.mode || def.mode,
+        mode:        input.mode === undefined ? def.mode : input.mode,
         projectPath: projectPath || input.projectPath,
     };
 }
@@ -1269,6 +1340,40 @@ function buildRawAppServerTrace(filePath) {
         redact(raw.slice(-CFG.traceRawMaxChars));
 }
 
+function normalizePatchTracePhase(meta) {
+    const phase = String(meta?.jobPhase || "").trim().toLowerCase();
+    if (["baseline-check", "running", "validating", "publishing", "completed", "failed"].includes(phase)) {
+        return phase;
+    }
+    if (meta?.state === "completed") return "completed";
+    if (["failed", "cancelled", "timeout"].includes(meta?.state)) return "failed";
+    return "running";
+}
+
+function buildAppServerPatchTracePayload(meta, traceMode) {
+    const payload = { traceMode };
+    if (traceMode === "summary") return payload;
+    const event = {
+        type: "patch_phase",
+        phase: normalizePatchTracePhase(meta),
+        errorCode: meta?.errorCode ? String(meta.errorCode).slice(0, 80) : null,
+        sequence: 1
+    };
+    if (traceMode === "raw") {
+        return {
+            ...payload,
+            rawTrace: JSON.stringify(event),
+            traceNote: "app-server patch raw 轨迹仅包含安全阶段与错误码。"
+        };
+    }
+    return {
+        ...payload,
+        executionTrace: [event],
+        traceText: `[patch] ${event.phase}${event.errorCode ? ` (${event.errorCode})` : ""}`,
+        traceNote: "app-server patch events 轨迹仅包含安全阶段与错误码。"
+    };
+}
+
 function buildTracePayload(jobId, meta, overrideMode = null) {
     const traceMode = normalizeTraceMode(overrideMode, meta?.traceMode || CFG.defaultTraceMode) || "summary";
     const payload = { traceMode };
@@ -1284,6 +1389,9 @@ function buildTracePayload(jobId, meta, overrideMode = null) {
 
     const p = jobPaths(jobId);
     if (isAppServerMeta(meta)) {
+        if (isAppServerPatchMeta(meta)) {
+            return buildAppServerPatchTracePayload(meta, traceMode);
+        }
         if (traceMode === "raw") {
             return {
                 ...payload,
@@ -1318,7 +1426,7 @@ function buildTracePayload(jobId, meta, overrideMode = null) {
 
 function buildResult(jobId, meta, traceModeOverride = null) {
     const p = jobPaths(jobId);
-    const appServerPatch = meta?.executionBackend === "codex-app-server" && meta?.jobKind === "patch";
+    const appServerPatch = isAppServerPatchMeta(meta);
     const patchProjection = buildPatchArtifactProjection(jobId, meta);
 
     let output = "";
@@ -1385,6 +1493,7 @@ function buildResult(jobId, meta, traceModeOverride = null) {
         completedAt: meta.completedAt,
         projectPath: meta.projectPath,
         mode:        meta.mode,
+        jobKind:     meta?.jobKind || null,
         codexModel: meta.codexModel || null,
         codexModelSource:
             meta.codexModelSource || null,
@@ -1581,7 +1690,7 @@ function isMachineCompactSummaryLine(line) {
 }
 
 function readCompactSummary(jobId, meta) {
-    if (meta?.executionBackend === "codex-app-server" && meta?.jobKind === "patch") {
+    if (isAppServerPatchMeta(meta)) {
         return compactStateSummary(meta);
     }
     const p = jobPaths(jobId);
@@ -1635,15 +1744,40 @@ function readCompactSummary(jobId, meta) {
     return compactStateSummary(meta);
 }
 
+function isCodexAppServerPatchRoute(worker, mode) {
+    return CFG.enableCodexAppServerPatch &&
+        String(worker || "").trim().toLowerCase() === "codex" &&
+        String(mode || "").trim().toLowerCase() === "patch";
+}
+
+function isAppServerPatchMeta(meta) {
+    return isAppServerMeta(meta) && meta?.jobKind === "patch";
+}
+
 function buildPatchArtifactProjection(jobId, meta) {
     const p = jobPaths(jobId);
-    if (meta?.executionBackend === "codex-app-server" && meta?.jobKind === "patch") {
-        const inspected = inspectAuthorizedPatchArtifact(CFG.jobRoot, jobId, meta);
+    if (isAppServerPatchMeta(meta)) {
+        let inspected = { authorized: false };
+        try {
+            inspected = inspectAuthorizedPatchArtifact(CFG.jobRoot, jobId, meta);
+        } catch {}
+        const authorized = inspected.authorized === true &&
+            Number(meta?.patchContractVersion) === PATCH_CONTRACT_VERSION;
+        const baseHead = authorized && /^[0-9a-f]{40,64}$/.test(String(meta?.baseHead || ""))
+            ? String(meta.baseHead)
+            : null;
         return {
-            patchFile: inspected.authorized ? p.patch : null,
-            patchAvailable: inspected.authorized === true,
-            patchBytes: inspected.authorized ? inspected.patchBytes : null,
-            patchFileCount: inspected.authorized ? inspected.patchFileCount : null
+            patchFile: authorized ? p.patch : null,
+            patchAvailable: authorized,
+            patchSha256: authorized ? inspected.patchSha256 : null,
+            patchBytes: authorized ? inspected.patchBytes : null,
+            patchFileCount: authorized ? inspected.patchFileCount : null,
+            patchContractVersion: authorized ? PATCH_CONTRACT_VERSION : null,
+            baseHead,
+            baselineStable: authorized && meta.baselineStable === true,
+            applyCheckPassed: authorized && meta.applyCheckPassed === true,
+            patchValidated: authorized && meta.patchValidated === true,
+            jobPhase: normalizePatchTracePhase(meta)
         };
     }
     const patchFile = fs.existsSync(p.patch) ? p.patch : null;
@@ -1664,10 +1798,11 @@ function buildCompactQueryResult(jobId, meta, options = {}) {
         completedAt: meta?.completedAt || null,
         worker: meta?.worker || null,
         mode: meta?.mode || null,
+        jobKind: meta?.jobKind || null,
         codexModel: meta?.codexModel || null,
         reasoningEffortEffective:
             meta?.reasoningEffortEffective || meta?.reasoningEffort || null,
-        warnings: compactWarnings(meta?.warnings),
+        warnings: isAppServerPatchMeta(meta) ? [] : compactWarnings(meta?.warnings),
         summary: String(summary || "").slice(0, 240),
         outputFile: p.output,
         codexOutputFile: fs.existsSync(p.codexOutput) ? p.codexOutput : null,
@@ -1696,18 +1831,38 @@ function compactCapabilitiesResult(full) {
                     ? worker.reasoningEfforts
                     : [],
                 configuredReasoningEffort: worker.configuredReasoningEffort || null,
-                reasoningEffortEffective: worker.reasoningEffortDefault || null
+                reasoningEffortEffective: worker.reasoningEffortDefault || null,
+                supportsAppServerPatch: worker.supportsAppServerPatch === true
             }
             : { name: worker?.name || "unknown", available: Boolean(worker?.available) }),
         codexAppServerAnalyzeEnabled: Boolean(full.codexAppServerAnalyzeEnabled),
+        codexAppServerPatchEnabled: Boolean(full.codexAppServerPatchEnabled),
         legacyMaxConcurrentJobs: full.legacyMaxConcurrentJobs,
         appServerMaxConcurrentJobs: full.appServerMaxConcurrentJobs,
+        appServerConcurrencyScope: "shared-analyze-patch",
         codexAppServerStatus: full.codexAppServerStatus || "unknown",
         codexAppServerActiveJobs: Number(full.codexAppServerActiveJobs || 0),
         codexAppServerErrorCode: full.codexAppServerErrorCode || null,
+        codexAppServerPatchProtocolSupport:
+            full.codexAppServerPatchProtocolSupport === true
+                ? true
+                : full.codexAppServerPatchProtocolSupport || false,
+        patchContractVersion: PATCH_CONTRACT_VERSION,
+        patchMaxBytes: PATCH_MAX_BYTES,
+        patchRepositoryPolicy: "clean-git-root",
+        patchOperations: ["modify-existing-tracked-file"],
         configuredReasoningEffort: codex.configuredReasoningEffort || null,
         reasoningEffortEffective: codex.reasoningEffortDefault || null
     };
+}
+
+function inspectPatchProtocolSupport(inspection) {
+    if (!CFG.enableCodexAppServerPatch) return false;
+    if (inspection?.patchProtocolSupported === true &&
+        Number(inspection?.patchContractVersion) === PATCH_CONTRACT_VERSION) {
+        return true;
+    }
+    return "unknown";
 }
 
 async function cmdCapabilities(input = {}) {
@@ -1723,7 +1878,8 @@ async function cmdCapabilities(input = {}) {
         pid: null,
         errorCode: null
     };
-    if (CFG.enableCodexAppServerAnalyze) {
+    const appServerConfigured = CFG.enableCodexAppServerAnalyze || CFG.enableCodexAppServerPatch;
+    if (appServerConfigured) {
         try {
             appServerInspection = await createSidecarClient().inspectNoStart();
         } catch (error) {
@@ -1753,6 +1909,7 @@ async function cmdCapabilities(input = {}) {
             : "";
     const codexCapabilities =
         resolveCodexModelCapabilities(requestedModel);
+    const patchProtocolSupport = inspectPatchProtocolSupport(appServerInspection);
 
     const result = {
         status: "success",
@@ -1779,6 +1936,7 @@ async function cmdCapabilities(input = {}) {
                 supportsPerTaskModel: true,
                 supportsLegacyExec: true,
                 supportsAppServerAnalyze: CFG.enableCodexAppServerAnalyze,
+                supportsAppServerPatch: patchProtocolSupport === true,
                 legacyMaxConcurrentJobs: CFG.maxConcurrentJobs,
                 appServerMaxConcurrentJobs: CFG.appServerMaxConcurrentJobs,
                 sandboxModes: [
@@ -1833,12 +1991,19 @@ async function cmdCapabilities(input = {}) {
             }
         ],
         codexAppServerAnalyzeEnabled: CFG.enableCodexAppServerAnalyze,
+        codexAppServerPatchEnabled: CFG.enableCodexAppServerPatch,
         legacyMaxConcurrentJobs: CFG.maxConcurrentJobs,
         appServerMaxConcurrentJobs: CFG.appServerMaxConcurrentJobs,
-        codexAppServerStatus: CFG.enableCodexAppServerAnalyze
+        appServerConcurrencyScope: "shared-analyze-patch",
+        patchContractVersion: PATCH_CONTRACT_VERSION,
+        patchMaxBytes: PATCH_MAX_BYTES,
+        patchRepositoryPolicy: "clean-git-root",
+        patchOperations: ["modify-existing-tracked-file"],
+        codexAppServerPatchProtocolSupport: patchProtocolSupport,
+        codexAppServerStatus: appServerConfigured
             ? (appServerInspection.status || "error")
             : "disabled",
-        codexAppServerObservedState: CFG.enableCodexAppServerAnalyze
+        codexAppServerObservedState: appServerConfigured
             ? (appServerInspection.status || "error")
             : "disabled",
         codexAppServerActiveJobs: Number(appServerInspection.activeJobs || 0),
@@ -1890,7 +2055,14 @@ function normalizeRunRequest(input = {}) {
     if (!["opencode", "codex", "antigravity"].includes(normWorker)) {
         return { status: "error", error: `worker "${worker}" 不支持。可用: opencode, codex, antigravity` };
     }
-    const normalizedMode = String(mode || "analyze").trim().toLowerCase();
+    const normalizedMode = String(mode).trim().toLowerCase();
+    if (!RUN_MODES.has(normalizedMode)) {
+        return {
+            status: "error",
+            error: `mode "${String(mode)}" 不支持。可用: analyze, patch, write`,
+            errorCode: "AICW_INVALID_MODE"
+        };
+    }
     const normalizedAttachments = attachments === undefined ? [] : attachments;
     if (!Array.isArray(normalizedAttachments)) {
         return { status: "error", error: "attachments 必须是数组。" };
@@ -1957,7 +2129,7 @@ function normalizeRunRequest(input = {}) {
 function appServerSubmissionResult(jobId, meta) {
     if (TERMINAL_STATES.has(meta?.state)) {
         const result = buildResult(jobId, meta);
-        result.warnings = meta.warnings || [];
+        result.warnings = isAppServerPatchMeta(meta) ? [] : (meta.warnings || []);
         return result;
     }
     const p = jobPaths(jobId);
@@ -1975,10 +2147,12 @@ function appServerSubmissionResult(jobId, meta) {
         reasoningEffortSupported: meta?.reasoningEffortSupported || [],
         modelDefaultReasoningEffort: meta?.modelDefaultReasoningEffort || null,
         configuredReasoningEffort: meta?.configuredReasoningEffort || null,
-        warnings: meta?.warnings || [],
+        warnings: isAppServerPatchMeta(meta) ? [] : (meta?.warnings || []),
         outputFile: p.output,
         logFile: p.log,
-        patchFile: null,
+        ...(isAppServerPatchMeta(meta)
+            ? buildPatchArtifactProjection(jobId, meta)
+            : { patchFile: null }),
         codexOutputFile: fs.existsSync(p.codexOutput) ? p.codexOutput : null,
         ...executionMetaPayload(meta),
         message: `任务已提交。使用 query 命令查询进度：command=query, jobId=${jobId}`
@@ -2035,6 +2209,47 @@ function buildAppServerMeta(jobId, p, prepared, projectPath, timeoutS) {
     };
 }
 
+function buildAppServerPatchMeta(jobId, p, prepared, projectPath, timeoutS) {
+    return {
+        jobId,
+        state: "running",
+        pid: null,
+        workerPid: null,
+        worker: "codex",
+        mode: "patch",
+        jobKind: "patch",
+        patchContractVersion: PATCH_CONTRACT_VERSION,
+        jobPhase: "prepared",
+        projectPath,
+        startedAt: new Date().toISOString(),
+        timeoutSec: timeoutS,
+        traceMode: prepared.normalizedTraceMode,
+        summaryHint: prepared.summaryHint || null,
+        warnings: [...preflightCheck(prepared.task, "patch"), ...checkFileSizes(prepared.task)],
+        requestedExecutionBackend: APP_SERVER_BACKEND,
+        submissionState: "prepared",
+        patchValidated: false,
+        applyCheckPassed: false,
+        baselineStable: false,
+        patchAvailable: false,
+        metaRevision: 0,
+        exitCode: null,
+        completedAt: null,
+        codexModel: prepared.reasoningMetadata.codexModel,
+        codexModelSource: prepared.reasoningMetadata.codexModelSource,
+        reasoningEffort: prepared.reasoningMetadata.reasoningEffort,
+        reasoningEffortEffective: prepared.reasoningMetadata.reasoningEffortEffective,
+        reasoningEffortSource: prepared.reasoningMetadata.reasoningEffortSource,
+        reasoningEffortSupported: prepared.reasoningMetadata.reasoningEffortSupported,
+        modelDefaultReasoningEffort: prepared.reasoningMetadata.modelDefaultReasoningEffort,
+        configuredReasoningEffort: prepared.reasoningMetadata.configuredReasoningEffort,
+        output: p.output,
+        log: p.log,
+        patch: p.patch,
+        codexOutput: p.codexOutput
+    };
+}
+
 function bestEffortRemoveAppServerInitFiles(paths, unlink = fs.unlinkSync) {
     for (const filePath of [paths.output, paths.log, paths.codexOutput]) {
         try { unlink(filePath); } catch {}
@@ -2049,6 +2264,13 @@ async function initializeAppServerJob(jobId, paths, meta, dependencies = {}) {
     });
     const writeMeta = dependencies.writeJsonAtomic || writeJsonAtomic;
     const unlink = dependencies.unlinkSync || fs.unlinkSync;
+    const patchJob = meta?.jobKind === "patch";
+    const initErrorCode = patchJob
+        ? "AICW_APP_SERVER_PATCH_META_FAILED"
+        : "AICW_APP_SERVER_META_INIT_FAILED";
+    const finalizationErrorCode = patchJob
+        ? "AICW_APP_SERVER_PATCH_META_FINALIZATION_FAILED"
+        : "AICW_APP_SERVER_META_FINALIZATION_FAILED";
 
     return lock(CFG.jobRoot, jobId, async () => {
         createExclusive(paths.meta, meta);
@@ -2072,7 +2294,7 @@ async function initializeAppServerJob(jobId, paths, meta, dependencies = {}) {
                 submissionState: "rejected",
                 completedAt: new Date().toISOString(),
                 exitCode: 1,
-                errorCode: "AICW_APP_SERVER_META_INIT_FAILED",
+                errorCode: initErrorCode,
                 metaRevision: Number(persistedMeta.metaRevision || 0) + 1
             };
             let terminalPersisted = false;
@@ -2091,7 +2313,7 @@ async function initializeAppServerJob(jobId, paths, meta, dependencies = {}) {
                     error,
                     terminalError,
                     metaDeleted,
-                    errorCode: "AICW_APP_SERVER_META_FINALIZATION_FAILED"
+                    errorCode: finalizationErrorCode
                 };
             }
             if (terminalPersisted) bestEffortRemoveAppServerInitFiles(paths, unlink);
@@ -2308,6 +2530,214 @@ async function cmdRunAppServerAnalyze(prepared, dependencies = {}) {
     return appServerSubmissionResult(jobId, current);
 }
 
+async function persistAppServerPatchSubmissionOutcome(jobId, metaPath, fallbackMeta, outcome, dependencies = {}) {
+    const update = dependencies.updateJobMetaLocked || updateJobMetaLocked;
+    let confirmedBeforeUpdate = false;
+    try {
+        const result = await update(CFG.jobRoot, jobId, metaPath, value => {
+            if (isAppServerSubmissionConfirmed(value)) {
+                confirmedBeforeUpdate = true;
+                return {};
+            }
+            value.submissionState = outcome.submissionState;
+            value.errorCode = outcome.errorCode;
+            value.jobPhase = outcome.state === "running" ? "running" : "failed";
+            value.patchAvailable = false;
+            value.patchValidated = false;
+            value.applyCheckPassed = false;
+            value.baselineStable = false;
+            if (outcome.state !== "running") {
+                value.state = "failed";
+                value.completedAt = new Date().toISOString();
+                value.exitCode = 1;
+            }
+            return value;
+        });
+        return {
+            status: "success",
+            meta: result?.meta || readMeta(jobId) || fallbackMeta,
+            confirmedBeforeUpdate
+        };
+    } catch (error) {
+        return {
+            status: "error",
+            error,
+            meta: readMeta(jobId) || fallbackMeta
+        };
+    }
+}
+
+async function cmdRunAppServerPatch(prepared, dependencies = {}) {
+    if (!CFG.enableCodexAppServerPatch) {
+        return appServerErrorResult(null, {
+            error: "Codex app-server patch 未启用。",
+            errorCode: "AICW_APP_SERVER_PATCH_UNAVAILABLE"
+        });
+    }
+    if (!CFG.enableCodex) {
+        return appServerErrorResult(null, {
+            error: "Codex 已被禁用（ENABLE_CODEX=false）。",
+            errorCode: "AICW_APP_SERVER_PATCH_UNAVAILABLE"
+        });
+    }
+    if (prepared.sessionId) {
+        return appServerErrorResult(null, {
+            error: "Codex app-server patch 第一版不接受 sessionId。",
+            errorCode: "AICW_APP_SERVER_PATCH_SESSION_UNSUPPORTED"
+        });
+    }
+    if (prepared.attachments.length > 0) {
+        return appServerErrorResult(null, {
+            error: "Codex app-server patch 第一版不支持附件。",
+            errorCode: "AICW_APP_SERVER_PATCH_ATTACHMENTS_UNSUPPORTED"
+        });
+    }
+
+    const patchModel = prepared.reasoningMetadata.codexModel;
+    const patchEffort = prepared.reasoningMetadata.reasoningEffortEffective;
+    if (!patchModel || !patchEffort || !PATCH_REASONING_EFFORTS.has(patchEffort)) {
+        return appServerErrorResult(null, {
+            error: "Codex app-server patch 需要可验证的 model 与 minimal/low/medium/high/xhigh reasoning effort。",
+            errorCode: "AICW_APP_SERVER_PATCH_UNSUPPORTED"
+        });
+    }
+
+    const client = dependencies.client || createSidecarClient();
+    try {
+        await client.ensure();
+    } catch (error) {
+        return appServerErrorResult(error, {
+            error: "Codex app-server patch 当前不可用，未创建任务且未回退到 legacy。",
+            errorCode: APP_SERVER_PATCH_UNSUPPORTED_CODES.has(String(error?.code || ""))
+                ? "AICW_APP_SERVER_PATCH_UNSUPPORTED"
+                : "AICW_APP_SERVER_PATCH_UNAVAILABLE"
+        });
+    }
+
+    ensureJobDirs();
+    const timeoutS = Number(prepared.timeoutSec) || CFG.defaultTimeout;
+    const projectPath = path.resolve(prepared.projectPath);
+    let jobId;
+    let p;
+    let meta;
+    let initialized;
+
+    for (let attempt = 0; attempt < 8 && !initialized; attempt++) {
+        jobId = generateJobId();
+        p = jobPaths(jobId);
+        meta = buildAppServerPatchMeta(jobId, p, prepared, projectPath, timeoutS);
+        try {
+            initialized = await initializeAppServerJob(jobId, p, meta, dependencies);
+            if (initialized.status === "failed" || initialized.status === "finalization-failed") break;
+        } catch (error) {
+            if (error?.code === "META_ALREADY_EXISTS" && attempt < 7) continue;
+            if (error?.code === "META_CREATE_FINALIZATION_FAILED") {
+                return appServerErrorResult(error, {
+                    error: "Codex app-server patch 元数据创建失败，临时文件无法可靠清理。",
+                    errorCode: "AICW_APP_SERVER_PATCH_META_FINALIZATION_FAILED",
+                    jobId,
+                    state: "unknown",
+                    metaDeleted: !fs.existsSync(p.meta),
+                    finalizationError: error.code
+                });
+            }
+            return appServerErrorResult(error, {
+                error: "Codex app-server patch 元数据创建失败。",
+                errorCode: "AICW_APP_SERVER_PATCH_META_FAILED",
+                jobId,
+                state: "failed"
+            });
+        }
+    }
+
+    if (!initialized || initialized.status === "failed" || initialized.status === "finalization-failed") {
+        if (initialized?.status === "finalization-failed") {
+            return appServerErrorResult(initialized.terminalError || initialized.error, {
+                error: "Codex app-server patch 元数据初始化失败，终态无法可靠落盘。",
+                errorCode: "AICW_APP_SERVER_PATCH_META_FINALIZATION_FAILED",
+                jobId,
+                state: "unknown",
+                metaDeleted: initialized.metaDeleted,
+                finalizationError: initialized.errorCode
+            });
+        }
+        return appServerErrorResult(initialized?.error, {
+            error: "Codex app-server patch 元数据初始化失败。",
+            errorCode: "AICW_APP_SERVER_PATCH_META_FAILED",
+            jobId,
+            state: "failed",
+            submissionState: "rejected",
+            completedAt: initialized?.meta?.completedAt || null
+        });
+    }
+    meta = initialized.meta;
+
+    const finalizeSubmissionError = async (error, explicitCode = null) => {
+        const outcome = mapAppServerPatchSubmissionError(
+            explicitCode ? new SidecarError(explicitCode, "Patch submission was rejected") : error
+        );
+        const persisted = await persistAppServerPatchSubmissionOutcome(
+            jobId,
+            p.meta,
+            readMeta(jobId) || meta,
+            outcome,
+            dependencies
+        );
+        if (persisted.confirmedBeforeUpdate) {
+            return appServerSubmissionResult(jobId, persisted.meta);
+        }
+        if (persisted.status === "error") {
+            return appServerErrorResult(persisted.error, {
+                error: "Codex app-server patch 提交状态无法可靠落盘；保留原 jobId，禁止重放或回退。",
+                errorCode: "AICW_APP_SERVER_PATCH_META_FINALIZATION_FAILED",
+                submissionErrorCode: outcome.errorCode,
+                jobId,
+                state: "unknown"
+            });
+        }
+        return appServerErrorResult(error, {
+            error: outcome.message,
+            errorCode: outcome.errorCode,
+            jobId,
+            state: persisted.meta?.state || outcome.state,
+            submissionState: persisted.meta?.submissionState || outcome.submissionState
+        });
+    };
+
+    let submitted;
+    try {
+        submitted = await client.submitPatchJob({
+            jobId,
+            projectPath,
+            text: wrapTask(prepared.task, "patch"),
+            metaPath: p.meta,
+            outputPath: p.output,
+            codexOutputPath: p.codexOutput,
+            patchPath: p.patch,
+            timeoutSec: timeoutS,
+            model: patchModel,
+            effort: patchEffort,
+            patchContractVersion: PATCH_CONTRACT_VERSION
+        });
+    } catch (error) {
+        return finalizeSubmissionError(error);
+    }
+
+    if (!submitted || typeof submitted !== "object" || Array.isArray(submitted) ||
+        typeof submitted.accepted !== "boolean") {
+        return finalizeSubmissionError(new SidecarError(
+            "INVALID_SIDECAR_RESPONSE",
+            "Sidecar patch response is missing a boolean accepted field"
+        ));
+    }
+    if (submitted.accepted === false) {
+        return finalizeSubmissionError(
+            new SidecarError(submitted.errorCode || "SIDECAR_NOT_READY", "Patch submission was rejected")
+        );
+    }
+    return appServerSubmissionResult(jobId, readMeta(jobId) || meta);
+}
+
 async function cmdRun(input) {
     const normalized = normalizeRunRequest(input);
     if (normalized.status === "error") return normalized;
@@ -2320,6 +2750,9 @@ async function cmdRun(input) {
             });
         }
         return cmdRunAppServerAnalyze(prepared);
+    }
+    if (isCodexAppServerPatchRoute(prepared.worker, prepared.mode)) {
+        return cmdRunAppServerPatch(prepared);
     }
     return cmdRunLegacy(prepared);
 }
@@ -2699,7 +3132,7 @@ async function resolveRunAndWaitAfterWait(jobId, input = {}, dependencies = {}) 
     }
     if (meta && TERMINAL_STATES.has(meta.state)) {
         const result = build(jobId, meta);
-        result.warnings = meta.warnings || [];
+        result.warnings = isAppServerPatchMeta(meta) ? [] : (meta.warnings || []);
         return result;
     }
     return {
@@ -2707,7 +3140,7 @@ async function resolveRunAndWaitAfterWait(jobId, input = {}, dependencies = {}) 
         jobId,
         state: meta?.state || "unknown",
         errorCode: "AICW_RUN_AND_WAIT_CANCEL_UNCONFIRMED",
-        warnings: meta?.warnings || [],
+        warnings: isAppServerPatchMeta(meta) ? [] : (meta?.warnings || []),
         ...(meta?.startedAt ? { startedAt: meta.startedAt } : {}),
         hint: cancelResult?.error
             ? `任务等待耗尽，取消未确认：${String(cancelResult.error).slice(0, 200)}；未生成第二个 Job。`
@@ -2731,7 +3164,7 @@ async function cmdRunAndWait(input) {
         meta = checkAndMarkDead(meta, jobId, "run_and_wait");
         if (meta.state !== "running") {
             const result = buildResult(jobId, meta);
-            result.warnings = meta.warnings || [];
+            result.warnings = isAppServerPatchMeta(meta) ? [] : (meta.warnings || []);
             return result;
         }
     }
@@ -2796,11 +3229,12 @@ async function cmdQuery(input) {
         }
         return {
             status: "success", jobId, state: "running",
-            warnings: meta.warnings || [],
+            warnings: isAppServerPatchMeta(meta) ? [] : (meta.warnings || []),
             startedAt: meta.startedAt, suggestedWaitSec: 0,
             hint: shouldWait
                 ? "任务仍在运行，请再调用一次 query；也可用 command=trace 即时查看已有执行轨迹。"
                 : "任务仍在运行。本次 wait=false，已立即返回当前状态与已有轨迹。",
+            ...(isAppServerPatchMeta(meta) ? buildPatchArtifactProjection(jobId, meta) : {}),
             ...buildTracePayload(jobId, meta, traceModeOverride)
         };
     }
@@ -2822,6 +3256,22 @@ async function cmdTrace(input) {
     let meta = readMeta(jobId);
     if (!meta) return { status: "error", error: `Job "${jobId}" 不存在。` };
     meta = checkAndMarkDead(meta, jobId, "trace");
+
+    if (isAppServerPatchMeta(meta)) {
+        return {
+            status: "success",
+            jobId,
+            state: meta.state,
+            worker: "codex",
+            mode: "patch",
+            jobKind: "patch",
+            jobPhase: normalizePatchTracePhase(meta),
+            errorCode: meta.errorCode || null,
+            startedAt: meta.startedAt || null,
+            completedAt: meta.completedAt || null,
+            ...buildTracePayload(jobId, meta, traceMode)
+        };
+    }
 
     return {
         status: "success",
@@ -2869,9 +3319,22 @@ async function cmdListJobs(input) {
         try {
             let m = JSON.parse(fs.readFileSync(path.join(metaDir, file), "utf8"));
             m = checkAndMarkDead(m, m.jobId, "listJobs");
+            const patchProjection = isAppServerPatchMeta(m)
+                ? buildPatchArtifactProjection(m.jobId, m)
+                : null;
             jobs.push({
                 jobId: m.jobId, state: m.state, worker: m.worker,
                 mode: m.mode, projectPath: m.projectPath,
+                jobKind: m.jobKind || null,
+                ...(patchProjection ? {
+                    jobPhase: patchProjection.jobPhase,
+                    patchAvailable: patchProjection.patchAvailable,
+                    patchValidated: patchProjection.patchValidated,
+                    applyCheckPassed: patchProjection.applyCheckPassed,
+                    baselineStable: patchProjection.baselineStable,
+                    patchBytes: patchProjection.patchBytes,
+                    patchFileCount: patchProjection.patchFileCount
+                } : {}),
                 startedAt: m.startedAt, completedAt: m.completedAt, exitCode: m.exitCode,
                 traceMode: m.traceMode || CFG.defaultTraceMode,
                 codexModel: m.codexModel || null,
@@ -3074,6 +3537,9 @@ module.exports = {
     normalizeRunRequest,
     normalizeResponseMode,
     isAppServerMeta,
+    isAppServerPatchMeta,
+    isCodexAppServerAnalyzeRoute,
+    isCodexAppServerPatchRoute,
     shouldFallbackToLegacyBeforeJob,
     parseAppServerExecutionTrace,
     buildTracePayload,
@@ -3089,6 +3555,7 @@ module.exports = {
     resolveRunAndWaitAfterWait,
     initializeAppServerJob,
     cmdRunAppServerAnalyze,
+    cmdRunAppServerPatch,
     cmdCapabilities,
     cmdRun,
     cmdRunAndWait,

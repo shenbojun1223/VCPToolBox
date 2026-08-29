@@ -5,7 +5,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const { test } = require("node:test");
 
 const sourcePluginDir = path.resolve(__dirname, "..");
@@ -28,6 +28,29 @@ async function waitFor(predicate, timeoutMs = 10000) {
 
 function readJson(filePath) {
     try { return JSON.parse(fs.readFileSync(filePath, "utf8")); } catch { return null; }
+}
+
+function validPatch(replacement = "gamma", relative = "tracked.txt") {
+    return [
+        `diff --git a/${relative} b/${relative}`,
+        "index fbbee86..0000000 100644",
+        `--- a/${relative}`,
+        `+++ b/${relative}`,
+        "@@ -1,2 +1,2 @@",
+        " alpha",
+        "-beta",
+        `+${replacement}`,
+        ""
+    ].join("\n");
+}
+
+function runFixtureGit(projectRoot, args) {
+    const result = spawnSync("git", args, {
+        cwd: projectRoot,
+        encoding: "utf8",
+        windowsHide: true
+    });
+    assert.equal(result.status, 0, `fixture git ${args[0]} failed`);
 }
 
 async function removeTestRoot(tempRoot, label) {
@@ -69,7 +92,9 @@ setTimeout(()=>process.stdout.write(JSON.stringify({type:"opencode-result"})+"\\
 }
 
 async function createEnvironment(options = {}) {
-    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vcp-aicodeworker-routing-"));
+    const tempRoot = fs.realpathSync.native(
+        fs.mkdtempSync(path.join(os.tmpdir(), "vcp-aicodeworker-routing-"))
+    );
     const pluginDir = path.join(tempRoot, "plugin");
     const appserverDir = path.join(pluginDir, "appserver");
     const jobRoot = path.join(pluginDir, "jobs");
@@ -85,7 +110,7 @@ async function createEnvironment(options = {}) {
         path.join(pluginDir, "app-server"),
         options.badAppServer
             ? "if (process.argv.includes('--version')) process.exit(17); process.argv.splice(2, 0, 'app-server'); process.exit(17);"
-            : "if (process.argv.includes('--version')) { process.stdout.write('fake-codex 1.0.0\\n'); process.exit(0); } process.argv.splice(2, 0, 'app-server'); require('./fake-codex-app-server.js');",
+            : "if (process.argv.includes('--version')) { process.stdout.write('codex-cli 0.144.5\\n'); process.exit(0); } process.argv.splice(2, 0, 'app-server'); require('./fake-codex-app-server.js');",
         "utf8"
     );
     const workerPath = path.join(pluginDir, "AICodeWorker.js");
@@ -112,8 +137,24 @@ async function createEnvironment(options = {}) {
     );
     writeLegacyScript(path.join(projectRoot, "exec"), "exec");
     writeLegacyScript(path.join(projectRoot, "run"), "run");
+    fs.writeFileSync(
+        path.join(codexHome, "config.toml"),
+        'model = "gpt-5-codex"\nmodel_reasoning_effort = "medium"\n',
+        "utf8"
+    );
+    if (options.gitProject) {
+        fs.writeFileSync(path.join(projectRoot, "tracked.txt"), "alpha\nbeta\n", "utf8");
+        runFixtureGit(projectRoot, ["init"]);
+        runFixtureGit(projectRoot, ["config", "user.email", "routing-fixture@example.invalid"]);
+        runFixtureGit(projectRoot, ["config", "user.name", "Routing Fixture"]);
+        runFixtureGit(projectRoot, ["add", "."]);
+        runFixtureGit(projectRoot, ["commit", "-m", "fixture baseline"]);
+    }
     const flagLine = Object.prototype.hasOwnProperty.call(options, "flag")
         ? `ENABLE_CODEX_APP_SERVER_ANALYZE=${options.flag}\n`
+        : "";
+    const patchFlagLine = Object.prototype.hasOwnProperty.call(options, "patchFlag")
+        ? `ENABLE_CODEX_APP_SERVER_PATCH=${options.patchFlag}\n`
         : "";
     fs.writeFileSync(path.join(pluginDir, "config.env"), [
         "ENABLE_OPENCODE=true",
@@ -124,6 +165,7 @@ async function createEnvironment(options = {}) {
         "OPENCODE_MODEL=",
         "ENABLE_CODEX=true",
         flagLine.trimEnd(),
+        patchFlagLine.trimEnd(),
         `CODEX_BIN=${process.execPath}`,
         `CODEX_HOME=${codexHome}`,
         `ALLOWED_PROJECT_ROOTS=${projectRoot}`,
@@ -247,6 +289,7 @@ function installAuthorizedAppServerPatch(environment, jobId, patchText = "diff -
     fs.mkdirSync(path.dirname(paths.outputPath), { recursive: true });
     fs.writeFileSync(paths.patchPath, patchText, { encoding: "utf8", mode: 0o600 });
     fs.writeFileSync(paths.outputPath, `${patchText}\nMODEL_PATCH_BODY_MUST_NOT_RETURN`, "utf8");
+    fs.writeFileSync(paths.codexOutputPath, `${patchText}\nCODEX_PATCH_BODY_MUST_NOT_RETURN`, "utf8");
     const patchSha256 = crypto.createHash("sha256").update(Buffer.from(patchText, "utf8")).digest("hex");
     const patchBytes = Buffer.byteLength(patchText, "utf8");
     const publicArtifact = protocol.inspectPatchArtifactFile(paths.patchPath, directoryIdentity, {
@@ -265,6 +308,8 @@ function installAuthorizedAppServerPatch(environment, jobId, patchText = "diff -
         sidecarInstanceId: "completed-patch-instance",
         jobKind: "patch",
         jobPhase: "completed",
+        patchContractVersion: 1,
+        baseHead: "a".repeat(40),
         patchValidated: true,
         applyCheckPassed: true,
         baselineStable: true,
@@ -274,6 +319,7 @@ function installAuthorizedAppServerPatch(environment, jobId, patchText = "diff -
         patchArtifactNonce: "bbbbbbbbbbbbbbbbbbbbbbbb",
         patchArtifactDirectoryIdentity: directoryIdentity,
         patchArtifactPublicIdentity: publicArtifact.identity,
+        warnings: [{ level: "warn", message: "secret-target-warning.txt" }],
         exitCode: 0,
         completedAt: new Date().toISOString()
     };
@@ -647,6 +693,38 @@ test("strict feature flag routes Codex analyze only when trimmed lowercase true"
     }
 });
 
+test("strict patch flag enables only trimmed case-insensitive true", async () => {
+    for (const patchFlag of [undefined, "", "false", "0", "1", "yes", " TRUE "]) {
+        const environment = await createEnvironment({
+            ...(patchFlag === undefined ? {} : { patchFlag })
+        });
+        try {
+            const worker = require(environment.workerPath);
+            assert.equal(
+                worker.isCodexAppServerPatchRoute("codex", "patch"),
+                patchFlag === " TRUE ",
+                `patchFlag=${String(patchFlag)}`
+            );
+            assert.equal(worker.isCodexAppServerPatchRoute("codex", "write"), false);
+            assert.equal(worker.isCodexAppServerPatchRoute("opencode", "patch"), false);
+        } finally { await environment.cleanup(); }
+    }
+});
+
+test("analyze and patch app-server flags are independent", async () => {
+    for (const flags of [
+        { flag: "true", patchFlag: "false", analyze: true, patch: false },
+        { flag: "false", patchFlag: "true", analyze: false, patch: true }
+    ]) {
+        const environment = await createEnvironment(flags);
+        try {
+            const worker = require(environment.workerPath);
+            assert.equal(worker.isCodexAppServerAnalyzeRoute("codex", "analyze"), flags.analyze);
+            assert.equal(worker.isCodexAppServerPatchRoute("codex", "patch"), flags.patch);
+        } finally { await environment.cleanup(); }
+    }
+});
+
 test("enabled Codex analyze uses app-server safe trace and does not create args", async () => {
     const environment = await createEnvironment({ flag: "true" });
     try {
@@ -697,13 +775,13 @@ test("app-server attachments are rejected before Job and Sidecar creation", asyn
     }
 });
 
-test("Codex patch/write and non-Codex remain legacy", async () => {
-    const environment = await createEnvironment({ flag: "true" });
+test("patch flag false preserves legacy while write and non-Codex patch remain legacy", async () => {
+    const environment = await createEnvironment({ flag: "true", patchFlag: "false" });
     try {
         for (const input of [
             { worker: "codex", mode: "patch", task: "patch legacy" },
             { worker: "codex", mode: "write", task: "write legacy" },
-            { worker: "opencode", mode: "analyze", task: "other worker" }
+            { worker: "opencode", mode: "patch", task: "other worker patch" }
         ]) {
             const response = await environment.invoke({ command: "run", projectPath: environment.projectRoot, ...input });
             assert.equal(response.status, "success");
@@ -711,12 +789,77 @@ test("Codex patch/write and non-Codex remain legacy", async () => {
             assert.equal(meta.executionBackend, "legacy-exec");
             assert.equal(meta.requestedExecutionBackend, undefined);
         }
-        const source = fs.readFileSync(environment.workerPath, "utf8");
-        assert.equal(source.includes("ENABLE_CODEX_APP_SERVER_PATCH"), false);
-        assert.equal(source.includes("isCodexAppServerPatchRoute"), false);
     } finally {
         await environment.cleanup();
     }
+});
+
+test("patch flag true routes only Codex patch through app-server and never mutates the project", async () => {
+    const environment = await createEnvironment({ flag: "false", patchFlag: "true", gitProject: true });
+    try {
+        const patch = validPatch("routed-patch");
+        const response = await environment.invoke({
+            command: "run",
+            worker: "codex",
+            mode: "patch",
+            projectPath: environment.projectRoot,
+            task: `[[FINAL_BASE64=${Buffer.from(patch, "utf8").toString("base64")}]]`
+        });
+        assert.equal(response.status, "success", JSON.stringify(response));
+        const jobId = resultOf(response).jobId;
+        const meta = await waitForMeta(environment, jobId, true);
+        assert.equal(meta.executionBackend, "codex-app-server");
+        assert.equal(meta.jobKind, "patch");
+        assert.equal(meta.patchContractVersion, 1);
+        assert.equal(
+            meta.patchValidated,
+            true,
+            `patch terminal=${JSON.stringify({ state: meta.state, errorCode: meta.errorCode, jobPhase: meta.jobPhase })}`
+        );
+        assert.equal(meta.applyCheckPassed, true);
+        assert.equal(meta.baselineStable, true);
+        assert.equal(fs.existsSync(path.join(environment.jobRoot, "meta", `${jobId}.args.json`)), false);
+        assert.equal(fs.readFileSync(path.join(environment.projectRoot, "tracked.txt"), "utf8"), "alpha\nbeta\n");
+    } finally { await environment.cleanup(); }
+});
+
+test("unknown or blank run mode is rejected before Job, lock, or Sidecar while other commands ignore mode", async () => {
+    const environment = await createEnvironment({ flag: "true", patchFlag: "true" });
+    try {
+        for (const [index, mode] of ["unknown", "   ", null].entries()) {
+            const response = await environment.invoke({
+                command: index % 2 === 0 ? "run" : "run_and_wait",
+                worker: "codex",
+                mode,
+                projectPath: environment.projectRoot,
+                task: "invalid mode"
+            });
+            assert.equal(response.status, "error");
+            assert.equal(response.errorCode, "AICW_INVALID_MODE");
+        }
+        assert.equal(fs.existsSync(path.join(environment.jobRoot, "meta")), false);
+        assert.equal(fs.existsSync(path.join(environment.jobRoot, "runtime", "sidecar-state.json")), false);
+        const worker = require(environment.workerPath);
+        const presetTarget = path.join(environment.projectRoot, "exec");
+        const rejectedPreset = worker.normalizeRunRequest({
+            preset: "index",
+            targetPath: presetTarget,
+            projectPath: environment.projectRoot,
+            mode: "   "
+        });
+        assert.equal(rejectedPreset.status, "error");
+        assert.equal(rejectedPreset.errorCode, "AICW_INVALID_MODE");
+        const legalPreset = worker.normalizeRunRequest({
+            preset: "index",
+            targetPath: presetTarget,
+            projectPath: environment.projectRoot
+        });
+        assert.equal(legalPreset.status, "success");
+        assert.equal(legalPreset.prepared.mode, "analyze");
+        const capabilities = await environment.invoke({ command: "capabilities", mode: "unknown" });
+        assert.equal(capabilities.status, "success");
+        assert.equal(fs.existsSync(path.join(environment.jobRoot, "runtime", "sidecar-state.json")), false);
+    } finally { await environment.cleanup(); }
 });
 
 test("app-server concurrency is two and the third submission is rejected without fallback", async () => {
@@ -860,21 +1003,59 @@ test("run_and_wait waits for app-server terminal state", async () => {
 });
 
 test("capabilities observes without starting Sidecar and exposes both quotas", async () => {
-    for (const flag of ["false", "true"]) {
-        const environment = await createEnvironment({ flag });
+    for (const fixture of [
+        { flag: "false", patchFlag: "false", status: "disabled" },
+        { flag: "true", patchFlag: "false", status: "absent" },
+        { flag: "false", patchFlag: "true", status: "absent" }
+    ]) {
+        const environment = await createEnvironment(fixture);
         try {
             const response = await environment.invoke({ command: "capabilities" });
             assert.equal(response.status, "success");
             const result = resultOf(response);
-            assert.equal(result.codexAppServerAnalyzeEnabled, flag === "true");
+            assert.equal(result.codexAppServerAnalyzeEnabled, fixture.flag === "true");
+            assert.equal(result.codexAppServerPatchEnabled, fixture.patchFlag === "true");
             assert.equal(result.legacyMaxConcurrentJobs, 1);
             assert.equal(result.appServerMaxConcurrentJobs, 2);
-            assert.equal(result.codexAppServerStatus, flag === "true" ? "absent" : "disabled");
+            assert.equal(result.appServerConcurrencyScope, "shared-analyze-patch");
+            assert.equal(result.patchContractVersion, 1);
+            assert.equal(result.patchMaxBytes, 524288);
+            assert.equal(result.patchRepositoryPolicy, "clean-git-root");
+            assert.deepEqual(result.patchOperations, ["modify-existing-tracked-file"]);
+            assert.equal(result.codexAppServerStatus, fixture.status);
+            assert.equal(
+                result.codexAppServerPatchProtocolSupport,
+                fixture.patchFlag === "true" ? "unknown" : false
+            );
+            assert.equal(result.workers.find(worker => worker.name === "codex").supportsAppServerPatch, false);
             assert.equal(fs.existsSync(path.join(environment.jobRoot, "runtime", "sidecar-state.json")), false);
         } finally {
             await environment.cleanup();
         }
     }
+});
+
+test("live Sidecar status without patch protocol proof is never reported as supported", async () => {
+    const environment = await createEnvironment({ flag: "true", patchFlag: "true" });
+    try {
+        const run = await environment.invoke({
+            command: "run",
+            worker: "codex",
+            mode: "analyze",
+            projectPath: environment.projectRoot,
+            task: "[[FINAL=protocol-observation]]"
+        });
+        assert.equal(run.status, "success");
+        await waitForMeta(environment, resultOf(run).jobId, true);
+        const capabilities = resultOf(await environment.invoke({ command: "capabilities" }));
+        assert.equal(capabilities.codexAppServerStatus, "ready");
+        assert.equal(capabilities.codexAppServerPatchEnabled, true);
+        assert.equal(capabilities.codexAppServerPatchProtocolSupport, "unknown");
+        assert.equal(
+            capabilities.workers.find(worker => worker.name === "codex").supportsAppServerPatch,
+            false
+        );
+    } finally { await environment.cleanup(); }
 });
 
 test("shutdown command remains unknown", async () => {
@@ -979,6 +1160,18 @@ function appServerPrepared(worker, environment, task = "fixture task") {
     return normalized.prepared;
 }
 
+function appServerPatchPrepared(worker, environment, task = "fixture patch task", extra = {}) {
+    const normalized = worker.normalizeRunRequest({
+        worker: "codex",
+        mode: "patch",
+        projectPath: environment.projectRoot,
+        task,
+        ...extra
+    });
+    assert.equal(normalized.status, "success");
+    return normalized.prepared;
+}
+
 function fakeAppServerClient(submitState = {}) {
     return {
         inspectNoStart: async () => ({ status: "absent" }),
@@ -988,6 +1181,29 @@ function fakeAppServerClient(submitState = {}) {
             return { accepted: true };
         }
     };
+}
+
+function fakePatchClient(submitState = {}, behavior = {}) {
+    return {
+        ensure: async () => {
+            submitState.ensureCalls = (submitState.ensureCalls || 0) + 1;
+            if (behavior.ensureError) throw behavior.ensureError;
+            return { status: "ready" };
+        },
+        submitPatchJob: async params => {
+            submitState.calls = (submitState.calls || 0) + 1;
+            submitState.params = params;
+            if (behavior.submitError) throw behavior.submitError;
+            if (Object.prototype.hasOwnProperty.call(behavior, "response")) return behavior.response;
+            return { accepted: true };
+        }
+    };
+}
+
+function jobMetaFiles(environment) {
+    const directory = path.join(environment.jobRoot, "meta");
+    if (!fs.existsSync(directory)) return [];
+    return fs.readdirSync(directory).filter(file => file.endsWith(".json") && !file.endsWith(".args.json"));
 }
 
 function assertCompactQuery(result) {
@@ -1135,6 +1351,205 @@ test("normal app-server initialization persists submitting once and submits exac
         assert.equal(fs.existsSync(path.join(environment.jobRoot, "logs", `${response.jobId}.log`)), true);
         assert.equal(fs.existsSync(path.join(environment.jobRoot, "output", `${response.jobId}.codex-last.txt`)), true);
     } finally { await environment.cleanup(); }
+});
+
+test("patch rejects attachments and sessionId before Job or Sidecar creation", async () => {
+    for (const extra of [{ attachments: ["image.png"] }, { sessionId: "forbidden-session" }]) {
+        const environment = await createEnvironment({ patchFlag: "true" });
+        try {
+            const worker = require(environment.workerPath);
+            const submitState = {};
+            const response = await worker.cmdRunAppServerPatch(
+                appServerPatchPrepared(worker, environment, "early rejection", extra),
+                { client: fakePatchClient(submitState) }
+            );
+            assert.equal(response.status, "error");
+            assert.match(response.errorCode, /PATCH_(?:ATTACHMENTS|SESSION)_UNSUPPORTED/);
+            assert.equal(submitState.ensureCalls || 0, 0);
+            assert.equal(submitState.calls || 0, 0);
+            assert.deepEqual(jobMetaFiles(environment), []);
+            assert.equal(fs.existsSync(path.join(environment.jobRoot, "runtime", "sidecar-state.json")), false);
+        } finally { await environment.cleanup(); }
+    }
+});
+
+test("patch pre-Job Sidecar failure is unavailable and never falls back", async () => {
+    const environment = await createEnvironment({ patchFlag: "true" });
+    try {
+        const worker = require(environment.workerPath);
+        const protocol = require(path.join(environment.pluginDir, "appserver", "protocol.js"));
+        const submitState = {};
+        const response = await worker.cmdRunAppServerPatch(
+            appServerPatchPrepared(worker, environment),
+            {
+                client: fakePatchClient(submitState, {
+                    ensureError: new protocol.SidecarError("SIDECAR_START_FAILED", "injected startup failure")
+                })
+            }
+        );
+        assert.equal(response.status, "error");
+        assert.equal(response.errorCode, "AICW_APP_SERVER_PATCH_UNAVAILABLE");
+        assert.equal(submitState.ensureCalls, 1);
+        assert.equal(submitState.calls || 0, 0);
+        assert.deepEqual(jobMetaFiles(environment), []);
+        assert.equal(fs.existsSync(path.join(environment.jobRoot, ".job_lock")), false);
+    } finally { await environment.cleanup(); }
+});
+
+test("patch UNKNOWN_METHOD, version mismatch, and concurrency reject without legacy fallback", async () => {
+    const cases = [
+        ["UNKNOWN_METHOD", "AICW_APP_SERVER_PATCH_UNSUPPORTED"],
+        ["AICW_PATCH_CODEX_VERSION_UNVERIFIED", "AICW_APP_SERVER_PATCH_UNSUPPORTED"],
+        ["CONCURRENCY_LIMIT", "AICW_APP_SERVER_PATCH_CONCURRENCY_LIMIT"],
+        ["DUPLICATE_JOB_ID", "AICW_APP_SERVER_PATCH_META_FAILED"]
+    ];
+    for (const [code, expected] of cases) {
+        const environment = await createEnvironment({ patchFlag: "true" });
+        try {
+            const worker = require(environment.workerPath);
+            const protocol = require(path.join(environment.pluginDir, "appserver", "protocol.js"));
+            const submitState = {};
+            const response = await worker.cmdRunAppServerPatch(
+                appServerPatchPrepared(worker, environment, `reject ${code}`),
+                {
+                    client: fakePatchClient(submitState, {
+                        submitError: new protocol.SidecarError(code, "injected rejection")
+                    })
+                }
+            );
+            assert.equal(response.status, "error");
+            assert.equal(response.errorCode, expected);
+            assert.equal(submitState.calls, 1);
+            const files = jobMetaFiles(environment);
+            assert.equal(files.length, 1);
+            const meta = readJson(path.join(environment.jobRoot, "meta", files[0]));
+            assert.equal(meta.jobKind, "patch");
+            assert.equal(meta.state, "failed");
+            assert.equal(meta.submissionState, "rejected");
+            assert.equal(meta.errorCode, expected);
+            assert.equal(meta.fallbackFrom, undefined);
+            assert.equal(fs.existsSync(path.join(environment.jobRoot, "meta", `${meta.jobId}.args.json`)), false);
+        } finally { await environment.cleanup(); }
+    }
+});
+
+test("accepted patch submits once with only fixed contract fields and no public patch precreation", async () => {
+    const environment = await createEnvironment({ patchFlag: "true" });
+    try {
+        const worker = require(environment.workerPath);
+        const submitState = {};
+        const response = await worker.cmdRunAppServerPatch(
+            appServerPatchPrepared(worker, environment, "accepted once", { timeoutSec: 7 }),
+            { client: fakePatchClient(submitState) }
+        );
+        assert.equal(response.status, "success");
+        assert.equal(submitState.ensureCalls, 1);
+        assert.equal(submitState.calls, 1);
+        assert.deepEqual(Object.keys(submitState.params).sort(), [
+            "codexOutputPath", "effort", "jobId", "metaPath", "model", "outputPath",
+            "patchContractVersion", "patchPath", "projectPath", "text", "timeoutSec"
+        ].sort());
+        const protocol = require(path.join(environment.pluginDir, "appserver", "protocol.js"));
+        const fixed = protocol.jobPaths(environment.jobRoot, response.jobId);
+        assert.equal(submitState.params.metaPath, fixed.metaPath);
+        assert.equal(submitState.params.outputPath, fixed.outputPath);
+        assert.equal(submitState.params.codexOutputPath, fixed.codexOutputPath);
+        assert.equal(submitState.params.patchPath, fixed.patchPath);
+        assert.equal(submitState.params.timeoutSec, 7);
+        assert.equal(submitState.params.model, "gpt-5-codex");
+        assert.equal(submitState.params.effort, "medium");
+        assert.equal(submitState.params.patchContractVersion, 1);
+        for (const forbidden of ["sandbox", "cwd", "approvalPolicy", "networkAccess", "artifactDirectory"]) {
+            assert.equal(Object.prototype.hasOwnProperty.call(submitState.params, forbidden), false);
+        }
+        const meta = readJson(fixed.metaPath);
+        assert.equal(meta.state, "running");
+        assert.equal(meta.jobKind, "patch");
+        assert.equal(meta.jobPhase, "prepared");
+        assert.equal(meta.submissionState, "submitting");
+        assert.equal(meta.requestedExecutionBackend, "codex-app-server");
+        assert.equal(meta.patchValidated, false);
+        assert.equal(meta.applyCheckPassed, false);
+        assert.equal(meta.baselineStable, false);
+        assert.equal(meta.patchAvailable, false);
+        assert.equal(fs.existsSync(fixed.patchPath), false);
+        assert.equal(fs.existsSync(fixed.outputPath), true);
+        assert.equal(fs.existsSync(fixed.codexOutputPath), true);
+    } finally { await environment.cleanup(); }
+});
+
+test("patch transport uncertainty and invalid responses preserve one original Job without replay", async () => {
+    const cases = [
+        { code: "SIDECAR_IPC_TIMEOUT" },
+        { code: "SIDECAR_IPC_CLOSED" },
+        { code: "SIDECAR_IPC_ERROR" },
+        { code: "SIDECAR_RESPONSE_MISMATCH" },
+        { code: "INVALID_SIDECAR_RESPONSE" },
+        { response: {} }
+    ];
+    for (const fixture of cases) {
+        const environment = await createEnvironment({ patchFlag: "true" });
+        try {
+            const worker = require(environment.workerPath);
+            const protocol = require(path.join(environment.pluginDir, "appserver", "protocol.js"));
+            const submitState = {};
+            const behavior = Object.prototype.hasOwnProperty.call(fixture, "response")
+                ? { response: fixture.response }
+                : { submitError: new protocol.SidecarError(fixture.code, "injected transport uncertainty") };
+            const response = await worker.cmdRunAppServerPatch(
+                appServerPatchPrepared(worker, environment, `unknown ${fixture.code || "invalid"}`),
+                { client: fakePatchClient(submitState, behavior) }
+            );
+            assert.equal(response.status, "error");
+            assert.equal(response.errorCode, "AICW_APP_SERVER_PATCH_SUBMISSION_UNKNOWN");
+            assert.equal(submitState.calls, 1);
+            assert.ok(response.jobId);
+            const meta = readJson(metaPath(environment, response.jobId));
+            assert.equal(meta.state, "running");
+            assert.equal(meta.submissionState, "unknown");
+            assert.equal(meta.errorCode, "AICW_APP_SERVER_PATCH_SUBMISSION_UNKNOWN");
+            assert.deepEqual(jobMetaFiles(environment), [`${response.jobId}.json`]);
+            assert.equal(fs.existsSync(path.join(environment.jobRoot, "meta", `${response.jobId}.args.json`)), false);
+        } finally { await environment.cleanup(); }
+    }
+});
+
+test("patch meta collision, init failure, and finalization failure never submit", async () => {
+    const cases = [
+        {
+            expected: "AICW_APP_SERVER_PATCH_META_FAILED",
+            dependency(protocol) {
+                return { createJsonExclusive: () => { throw new protocol.SidecarError("META_ALREADY_EXISTS", "collision"); } };
+            }
+        },
+        {
+            expected: "AICW_APP_SERVER_PATCH_META_FAILED",
+            dependency() {
+                return { writeFileSync: () => { throw Object.assign(new Error("init failure"), { code: "EINIT" }); } };
+            }
+        },
+        {
+            expected: "AICW_APP_SERVER_PATCH_META_FINALIZATION_FAILED",
+            dependency(protocol) {
+                return { createJsonExclusive: () => { throw new protocol.SidecarError("META_CREATE_FINALIZATION_FAILED", "finalization"); } };
+            }
+        }
+    ];
+    for (const fixture of cases) {
+        const environment = await createEnvironment({ patchFlag: "true" });
+        try {
+            const worker = require(environment.workerPath);
+            const protocol = require(path.join(environment.pluginDir, "appserver", "protocol.js"));
+            const submitState = {};
+            const response = await worker.cmdRunAppServerPatch(
+                appServerPatchPrepared(worker, environment, fixture.expected),
+                { client: fakePatchClient(submitState), ...fixture.dependency(protocol) }
+            );
+            assert.equal(response.status, "error");
+            assert.equal(response.errorCode, fixture.expected);
+            assert.equal(submitState.calls || 0, 0);
+        } finally { await environment.cleanup(); }
+    }
 });
 
 test("terminal query wait=false defaults to compact while full remains available", async () => {
@@ -1332,7 +1747,7 @@ test("query wait=true defaults to full and compact projection excludes injected 
 });
 
 test("compact capabilities is a small routing-safe whitelist and full remains compatible", async () => {
-    const environment = await createEnvironment({ flag: "true" });
+    const environment = await createEnvironment({ flag: "true", patchFlag: "true" });
     try {
         const full = resultOf(await environment.invoke({ command: "capabilities" }));
         const compact = resultOf(await environment.invoke({ command: "capabilities", responseMode: "compact" }));
@@ -1343,7 +1758,7 @@ test("compact capabilities is a small routing-safe whitelist and full remains co
         const codex = compact.workers.find(worker => worker.name === "codex");
         assert.deepEqual(Object.keys(codex).sort(), [
             "available", "configuredReasoningEffort", "model", "modelSource", "name",
-            "reasoningEffortEffective", "reasoningEfforts", "version"
+            "reasoningEffortEffective", "reasoningEfforts", "supportsAppServerPatch", "version"
         ].sort());
         for (const worker of compact.workers.filter(item => item.name !== "codex")) {
             assert.deepEqual(Object.keys(worker).sort(), ["available", "name"]);
@@ -1351,6 +1766,14 @@ test("compact capabilities is a small routing-safe whitelist and full remains co
         assert.equal(compact.legacyMaxConcurrentJobs, 1);
         assert.equal(compact.appServerMaxConcurrentJobs, 2);
         assert.equal(compact.codexAppServerAnalyzeEnabled, true);
+        assert.equal(compact.codexAppServerPatchEnabled, true);
+        assert.equal(compact.appServerConcurrencyScope, "shared-analyze-patch");
+        assert.equal(compact.patchContractVersion, 1);
+        assert.equal(compact.patchMaxBytes, 524288);
+        assert.equal(compact.patchRepositoryPolicy, "clean-git-root");
+        assert.deepEqual(compact.patchOperations, ["modify-existing-tracked-file"]);
+        assert.equal(compact.codexAppServerPatchProtocolSupport, "unknown");
+        assert.equal(codex.supportsAppServerPatch, false);
         assert.equal(typeof compact.codexAppServerStatus, "string");
         assert.equal(typeof compact.codexAppServerActiveJobs, "number");
         assert.equal(Object.prototype.hasOwnProperty.call(compact, "reasoningEffortDetails"), false);
@@ -1380,14 +1803,141 @@ test("completed app-server patch full and compact query return only authorized a
         for (const result of [full, compact]) {
             assert.equal(result.patchFile, artifact.paths.patchPath);
             assert.equal(result.patchAvailable, true);
+            assert.equal(result.patchSha256, artifact.meta.patchSha256);
             assert.equal(result.patchBytes, Buffer.byteLength(artifact.patchText, "utf8"));
             assert.equal(result.patchFileCount, 1);
+            assert.equal(result.patchContractVersion, 1);
+            assert.equal(result.baseHead, artifact.meta.baseHead);
+            assert.equal(result.baselineStable, true);
+            assert.equal(result.applyCheckPassed, true);
+            assert.equal(result.patchValidated, true);
+            assert.equal(result.jobPhase, "completed");
             assert.equal(JSON.stringify(result).includes("MODEL_PATCH_BODY_MUST_NOT_RETURN"), false);
+            assert.equal(JSON.stringify(result).includes("CODEX_PATCH_BODY_MUST_NOT_RETURN"), false);
+            assert.equal(JSON.stringify(result).includes("secret-target-warning.txt"), false);
             assert.equal(JSON.stringify(result).includes("多字节🙂"), false);
-            assert.equal(JSON.stringify(result).includes(artifact.meta.patchSha256), false);
+            assert.equal(JSON.stringify(result).includes(artifact.meta.patchArtifactNonce), false);
+            assert.equal(JSON.stringify(result).includes(JSON.stringify(artifact.meta.patchArtifactDirectoryIdentity)), false);
+            assert.equal(JSON.stringify(result).includes(JSON.stringify(artifact.meta.patchArtifactPublicIdentity)), false);
         }
         assert.equal(full.output, "");
         assert.equal(Object.prototype.hasOwnProperty.call(compact, "output"), false);
+    } finally { await environment.cleanup(); }
+});
+
+test("non-completed app-server patch states never expose a patch or diff body", async () => {
+    for (const state of ["running", "failed", "cancelled", "timeout"]) {
+        const environment = await createEnvironment({ patchFlag: "false" });
+        try {
+            const jobId = `job_patch_state_${state}`;
+            const outputPath = path.join(environment.jobRoot, "output", `${jobId}.txt`);
+            fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+            fs.mkdirSync(path.join(environment.jobRoot, "meta"), { recursive: true });
+            fs.writeFileSync(outputPath, `diff --git a/secret.txt b/secret.txt\nSTATE_${state}_DIFF`, "utf8");
+            fs.writeFileSync(metaPath(environment, jobId), JSON.stringify({
+                jobId,
+                state,
+                worker: "codex",
+                mode: "patch",
+                jobKind: "patch",
+                jobPhase: state === "running" ? "running" : "failed",
+                projectPath: environment.projectRoot,
+                executionBackend: "codex-app-server",
+                requestedExecutionBackend: "codex-app-server",
+                patchValidated: true,
+                applyCheckPassed: true,
+                baselineStable: true,
+                patchContractVersion: 1,
+                errorCode: state === "failed" ? "AICW_TEST_PATCH_FAILED" : null
+            }), "utf8");
+            for (const responseMode of ["full", "compact"]) {
+                const result = resultOf(await environment.invoke({
+                    command: "query",
+                    jobId,
+                    wait: false,
+                    responseMode
+                }));
+                assert.equal(result.patchFile, null);
+                assert.equal(result.patchAvailable, false);
+                assert.equal(JSON.stringify(result).includes(`STATE_${state}_DIFF`), false);
+                assert.equal(JSON.stringify(result).includes("secret.txt"), false);
+            }
+        } finally { await environment.cleanup(); }
+    }
+});
+
+test("patch trace, listJobs, and Monitor expose only safe patch status fields", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    try {
+        const artifact = installAuthorizedAppServerPatch(environment, "job_patch_safe_surfaces");
+        const injected = {
+            ...artifact.meta,
+            patchAvailable: true,
+            candidatePath: "C:\\secret\\candidate.patch",
+            targetPaths: ["secret-target.txt"],
+            gitStderr: "GIT_STDERR_MUST_NOT_RETURN",
+            gitStatus: "GIT_STATUS_MUST_NOT_RETURN",
+            task: "TASK_MUST_NOT_RETURN",
+            controlToken: "CONTROL_MUST_NOT_RETURN",
+            endpoint: "ENDPOINT_MUST_NOT_RETURN",
+            processIdentity: { marker: "PROCESS_IDENTITY_MUST_NOT_RETURN" }
+        };
+        artifact.protocol.writeJsonAtomic(artifact.paths.metaPath, injected);
+
+        for (const traceMode of ["events", "raw"]) {
+            const trace = resultOf(await environment.invoke({
+                command: "trace",
+                jobId: artifact.meta.jobId,
+                traceMode
+            }));
+            assert.equal(trace.jobKind, "patch");
+            assert.equal(trace.jobPhase, "completed");
+            const serialized = JSON.stringify(trace);
+            for (const secret of [
+                "diff --git", "secret-target.txt", "GIT_STDERR_MUST_NOT_RETURN",
+                "GIT_STATUS_MUST_NOT_RETURN", "candidate.patch", artifact.meta.patchArtifactNonce,
+                "CONTROL_MUST_NOT_RETURN", "ENDPOINT_MUST_NOT_RETURN", "PROCESS_IDENTITY_MUST_NOT_RETURN"
+            ]) {
+                assert.equal(serialized.includes(secret), false, `trace leaked ${secret}`);
+            }
+        }
+
+        const listed = resultOf(await environment.invoke({ command: "listJobs", limit: 5 }));
+        const listedPatch = listed.jobs.find(job => job.jobId === artifact.meta.jobId);
+        assert.equal(listedPatch.jobKind, "patch");
+        assert.equal(listedPatch.jobPhase, "completed");
+        assert.equal(listedPatch.patchAvailable, true);
+        assert.equal(listedPatch.patchValidated, true);
+        assert.equal(listedPatch.applyCheckPassed, true);
+        assert.equal(listedPatch.baselineStable, true);
+        assert.equal(listedPatch.patchBytes, artifact.meta.patchBytes);
+        assert.equal(listedPatch.patchFileCount, 1);
+        for (const secret of ["diff --git", "candidate.patch", artifact.meta.patchArtifactNonce, "GIT_STDERR_MUST_NOT_RETURN"]) {
+            assert.equal(JSON.stringify(listed).includes(secret), false, `listJobs leaked ${secret}`);
+        }
+
+        const monitor = require(sourceMonitor);
+        const payload = monitor.buildJobStatusPayload({
+            ...injected,
+            patchFile: artifact.paths.patchPath,
+            errorCode: "AICW_SAFE_ERROR"
+        }, `${artifact.meta.jobId}.json`);
+        assert.equal(payload.data.jobKind, "patch");
+        assert.equal(payload.data.jobPhase, "completed");
+        assert.equal(payload.data.patchAvailable, true);
+        assert.equal(payload.data.patchValidated, true);
+        assert.equal(payload.data.applyCheckPassed, true);
+        assert.equal(payload.data.baselineStable, true);
+        assert.equal(payload.data.patchBytes, artifact.meta.patchBytes);
+        assert.equal(payload.data.patchFileCount, 1);
+        assert.equal(payload.data.errorCode, "AICW_SAFE_ERROR");
+        for (const secret of [
+            artifact.paths.patchPath, "diff --git", "secret-target.txt", "candidate.patch",
+            artifact.meta.patchArtifactNonce, "GIT_STDERR_MUST_NOT_RETURN", "TASK_MUST_NOT_RETURN",
+            "CONTROL_MUST_NOT_RETURN", "ENDPOINT_MUST_NOT_RETURN", "PROCESS_IDENTITY_MUST_NOT_RETURN"
+        ]) {
+            assert.equal(JSON.stringify(payload).includes(secret), false, `Monitor leaked ${secret}`);
+        }
     } finally { await environment.cleanup(); }
 });
 
@@ -1408,8 +1958,14 @@ test("completed app-server patch tamper or same-content replacement is unauthori
                 }));
                 assert.equal(result.patchFile, null);
                 assert.equal(result.patchAvailable, false);
+                assert.equal(result.patchSha256, null);
                 assert.equal(result.patchBytes, null);
                 assert.equal(result.patchFileCount, null);
+                assert.equal(result.patchContractVersion, null);
+                assert.equal(result.baseHead, null);
+                assert.equal(result.patchValidated, false);
+                assert.equal(result.applyCheckPassed, false);
+                assert.equal(result.baselineStable, false);
             }
             assert.equal(fs.existsSync(artifact.paths.patchPath), true, "query must not delete tampered public artifact");
         } finally { await environment.cleanup(); }

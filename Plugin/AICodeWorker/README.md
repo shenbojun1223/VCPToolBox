@@ -51,7 +51,7 @@ targetPath:「始」/app/VCPToolBox_new/Plugin/AICodeWorker/AICodeWorker.js「�
 ## 功能
 
 - **analyze 模式**：只读分析代码结构、逻辑、bug，不修改任何文件
-- **patch 模式**：以 unified diff 格式输出修改建议，人工审查后由 ServerFileOperator 落盘
+- **patch 模式**：默认保持 legacy；可用独立且默认关闭的 app-server patch flag 生成、验证 unified diff 制品，始终需要人工审查与另行应用
 - **write 模式**：opencode 直接修改/新增文件，完成后输出变更摘要（可含删除操作）
 - **同步/异步两种调用方式**：`run_and_wait` 直接等结果返回（日常首选）；`run` 立即返回 jobId 不等待，配合 `query`/`listJobs`/`cancel` 用于特别耗时的任务
 - **多 Worker**：默认 opencode（免费），复杂任务可点名 antigravity/agy（消耗 Gemini Pro 配额）
@@ -78,9 +78,13 @@ PROJECT_CONTEXT=
 # 大文件预检阈值(KB)，任务涉及文件超过此大小会在 warnings 里提醒缩小范围/分段处理（默认 200）
 FILE_SIZE_WARN_KB=200
 
-# ⚠️ 全局并发上限(opencode、codex和antigravity共用同一计数)，默认1。超限的run/run_and_wait直接被拒绝
-# (零资源开销，不spawn任何进程)。2026-06-27崩服务器事故后加的硬保险，不建议调大。
+# ⚠️ legacy runner 并发上限（opencode、legacy Codex、antigravity共用），默认1。
+# app-server analyze/patch 另共享固定上限2；超限直接拒绝，不排队、不回退。
 MAX_CONCURRENT_JOBS=1
+
+# 两个 app-server flag 相互独立，只有严格的字符串 true 才启用；默认都关闭。
+ENABLE_CODEX_APP_SERVER_ANALYZE=false
+ENABLE_CODEX_APP_SERVER_PATCH=false
 
 # 模型：BASE_URL/API_KEY 都留空 = 用 opencode 自带【免费】模型（不烧你的 token）。
 # 但 OPENCODE_MODEL 别留空（留空会回退到付费默认模型），填一个 opencode/ 开头的免费模型：
@@ -142,6 +146,49 @@ projectPath: C:\VCP\VCPToolBox
 task: 请只读分析指定模块，给出文件依据与验证结论，不修改文件。
 mode: analyze
 ```
+
+## Codex app-server patch 安全契约
+
+`ENABLE_CODEX_APP_SERVER_PATCH=false` 是独立的默认值。它不会被
+`ENABLE_CODEX_APP_SERVER_ANALYZE` 隐式开启，反向也一样：
+
+- flag 关闭：`worker=codex, mode=patch` 完全保持 legacy 行为。
+- flag 开启：只有 `worker=codex, mode=patch` 走 app-server；非 Codex Worker 和
+  `mode=write` 始终 legacy。
+- app-server patch 第一版不接受 attachments 或 `sessionId`，不自动应用 patch，
+  更不开放 app-server write。
+- analyze 与 patch 共用 Sidecar 的 `maxConcurrency=2` 和 activeJobs 池。
+
+app-server patch 只接受干净 Git 仓库根目录，并只允许修改现有、已 tracked 的 regular
+file。create/delete/rename、mode change、binary、submodule 一律拒绝。内核固定使用
+read-only sandbox、approval policy `never` 与禁用网络；调用方不能覆盖 cwd、sandbox、
+approval、network、artifact 目录或 patch 路径。
+
+状态机为：
+
+```text
+prepared → submitting → accepted → baseline-check → running
+         → validating → publishing → completed
+         └────────────────────────────→ failed/cancelled/timeout
+```
+
+提交严格 exactly-once。一旦 Job/meta 已创建，只调用一次 `submitPatchJob`；IPC timeout、
+closed/error、畸形响应或 request mismatch 都视为 submission unknown，保留原 jobId，禁止
+重放或回退，只能继续 `query`/`cancel`。Sidecar 缺失、启动失败、无响应、并发满、
+`UNKNOWN_METHOD`、协议或 Codex 版本不匹配也全部 fail-closed，不会退回 legacy。
+
+公开结果不直接返回 patch 正文。full/compact 只有在 `state=completed`、后端与 jobKind
+匹配、三项验证布尔值均为 true，且固定 public patch 的目录/regular-file identity、hash、
+bytes 持续复验通过时，才返回 `patchFile`、SHA-256、字节数、文件数、base HEAD 和验证状态；
+否则 `patchFile=null, patchAvailable=false`。trace 仅返回安全阶段与错误码，不返回 delta、
+目标文件、Git stderr/status、candidate/nonce 或 artifact identity。
+
+即使 query 已授权，真正应用 patch 前仍必须重新确认仓库 HEAD 与工作树基线未变化，并再次
+执行 apply/check；query 的授权结果不是自动应用许可。
+
+> 运维门禁：Slice 3A 之前启动的旧 Sidecar 不具备 patch RPC。开启 patch flag 前，必须先
+> 对旧 Sidecar 做有界 shutdown，确认退出后再启动新实例。不要依赖 capabilities 自动启动、
+> 替换或热升级 Sidecar；无法从实际 status 证明 patch 协议时，能力值只能是 unknown/false。
 
 
 ## Codex 逐任务推理强度
