@@ -19,7 +19,8 @@ const {
     withJobMetaLock,
     updateJobMetaLocked,
     writeJsonAtomic,
-    createJsonExclusive
+    createJsonExclusive,
+    inspectAuthorizedPatchArtifact
 } = require("./appserver/protocol");
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -1317,6 +1318,8 @@ function buildTracePayload(jobId, meta, overrideMode = null) {
 
 function buildResult(jobId, meta, traceModeOverride = null) {
     const p = jobPaths(jobId);
+    const appServerPatch = meta?.executionBackend === "codex-app-server" && meta?.jobKind === "patch";
+    const patchProjection = buildPatchArtifactProjection(jobId, meta);
 
     let output = "";
     // Codex 的 stdout 是 JSONL 事件流，直接从中提取报告会混入转义符和事件外壳。
@@ -1326,7 +1329,7 @@ function buildResult(jobId, meta, traceModeOverride = null) {
         meta?.worker === "codex" && fs.existsSync(p.codexOutput)
             ? p.codexOutput
             : p.output;
-    if (fs.existsSync(preferredOutputPath)) {
+    if (!appServerPatch && fs.existsSync(preferredOutputPath)) {
         const raw = fs.readFileSync(preferredOutputPath, "utf8");
         const masked = redact(raw);
         output = masked.length > 50000
@@ -1335,7 +1338,7 @@ function buildResult(jobId, meta, traceModeOverride = null) {
     }
 
     let logSummary = "";
-    if (fs.existsSync(p.log)) {
+    if (!appServerPatch && fs.existsSync(p.log)) {
         const rawLog = fs.readFileSync(p.log, "utf8");
         const ml = redact(rawLog);
         logSummary = ml.length > 5000 ? "[日志已截断]\n" + ml.slice(-5000) : ml;
@@ -1407,7 +1410,7 @@ function buildResult(jobId, meta, traceModeOverride = null) {
         logSummary,
         outputFile: p.output,
         logFile:    p.log,
-        patchFile:       fs.existsSync(p.patch) ? p.patch : null,
+        ...patchProjection,
         codexOutputFile: fs.existsSync(p.codexOutput) ? p.codexOutput : null,
         ...executionMetaPayload(meta),
         ...tracePayload,
@@ -1578,6 +1581,9 @@ function isMachineCompactSummaryLine(line) {
 }
 
 function readCompactSummary(jobId, meta) {
+    if (meta?.executionBackend === "codex-app-server" && meta?.jobKind === "patch") {
+        return compactStateSummary(meta);
+    }
     const p = jobPaths(jobId);
     const preferredOutputPath = meta?.worker === "codex" && fs.existsSync(p.codexOutput)
         ? p.codexOutput
@@ -1628,6 +1634,22 @@ function readCompactSummary(jobId, meta) {
     }
     return compactStateSummary(meta);
 }
+
+function buildPatchArtifactProjection(jobId, meta) {
+    const p = jobPaths(jobId);
+    if (meta?.executionBackend === "codex-app-server" && meta?.jobKind === "patch") {
+        const inspected = inspectAuthorizedPatchArtifact(CFG.jobRoot, jobId, meta);
+        return {
+            patchFile: inspected.authorized ? p.patch : null,
+            patchAvailable: inspected.authorized === true,
+            patchBytes: inspected.authorized ? inspected.patchBytes : null,
+            patchFileCount: inspected.authorized ? inspected.patchFileCount : null
+        };
+    }
+    const patchFile = fs.existsSync(p.patch) ? p.patch : null;
+    return { patchFile, patchAvailable: Boolean(patchFile) };
+}
+
 function buildCompactQueryResult(jobId, meta, options = {}) {
     const p = jobPaths(jobId);
     const terminal = TERMINAL_STATES.has(meta?.state);
@@ -1650,6 +1672,7 @@ function buildCompactQueryResult(jobId, meta, options = {}) {
         outputFile: p.output,
         codexOutputFile: fs.existsSync(p.codexOutput) ? p.codexOutput : null,
         logFile: p.log,
+        ...buildPatchArtifactProjection(jobId, meta),
         ...executionMetaPayload(meta),
         traceAvailable: fs.existsSync(p.output)
     };
@@ -3058,6 +3081,7 @@ module.exports = {
     compactStateSummary,
     isMachineCompactSummaryLine,
     readCompactSummary,
+    buildPatchArtifactProjection,
     buildCompactQueryResult,
     compactCapabilitiesResult,
     executionMetaPayload,

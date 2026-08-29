@@ -5,6 +5,8 @@ const { spawn } = require("child_process");
 const { JsonLineRpcConnection } = require("./jsonLineRpcConnection");
 const { SidecarError, getProcessIdentity, terminateOwnedChild } = require("./protocol");
 
+const PATCH_CODEX_VERSION = "codex-cli 0.144.5";
+
 class CodexAppServerProcess extends EventEmitter {
     constructor(options = {}) {
         super();
@@ -145,12 +147,22 @@ class CodexAppServerProcess extends EventEmitter {
         return result.thread;
     }
 
-    async startTurn({ threadId, text, effort } = {}) {
+    isPatchVersionAllowed() {
+        return this.version === PATCH_CODEX_VERSION;
+    }
+
+    async startTurn({ threadId, text, effort, patchMode = false, projectPath, model } = {}) {
         if (!this.connection || this.closed) throw new SidecarError("CODEX_NOT_READY", "Codex app-server is not ready");
         const params = {
             threadId,
             input: [{ type: "text", text: String(text || ""), text_elements: [] }]
         };
+        if (patchMode) {
+            params.cwd = projectPath;
+            params.sandboxPolicy = { type: "readOnly", networkAccess: false };
+            params.approvalPolicy = "never";
+            params.model = model;
+        }
         if (effort) params.effort = effort;
         const result = await this.connection.request("turn/start", params);
         const turnId = result?.turn?.id;
@@ -188,4 +200,4 @@ class CodexAppServerProcess extends EventEmitter {
     }
 }
 
-module.exports = { CodexAppServerProcess };
+module.exports = { CodexAppServerProcess, PATCH_CODEX_VERSION };

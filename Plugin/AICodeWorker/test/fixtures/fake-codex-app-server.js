@@ -1,8 +1,14 @@
 "use strict";
 
+const fs = require("fs");
 const readline = require("readline");
 
-const VERSION = "fake-codex-app-server/1.0.0";
+const versionArgument = process.argv.find(argument => argument.startsWith("--fake-version="));
+const recordArgument = process.argv.find(argument => argument.startsWith("--fake-record-base64="));
+const VERSION = versionArgument ? versionArgument.slice("--fake-version=".length) : "codex-cli 0.144.5";
+const RECORD_PATH = recordArgument
+    ? Buffer.from(recordArgument.slice("--fake-record-base64=".length), "base64").toString("utf8")
+    : null;
 
 if (process.argv.includes("--version") && !process.argv.includes("app-server")) {
     process.stdout.write(`${VERSION}\n`);
@@ -16,6 +22,11 @@ if (!(process.argv.includes("app-server") && process.argv.includes("--stdio"))) 
 let nextThread = 1;
 let nextTurn = 1;
 const turns = new Map();
+
+function record(value) {
+    if (!RECORD_PATH) return;
+    try { fs.appendFileSync(RECORD_PATH, `${JSON.stringify(value)}\n`, "utf8"); } catch {}
+}
 
 function send(message, omitJsonRpc = false) {
     const value = { ...message };
@@ -33,6 +44,8 @@ function control(text, name) {
 }
 
 function finalText(text) {
+    const encoded = String(text || "").match(/\[\[FINAL_BASE64=([A-Za-z0-9+/=]+)\]\]/);
+    if (encoded) return Buffer.from(encoded[1], "base64").toString("utf8");
     const match = String(text || "").match(/\[\[FINAL=([^\]]*)\]\]/);
     return match ? match[1] : `fake-final:${String(text || "")}`;
 }
@@ -73,6 +86,8 @@ function emitResult(turn) {
     else {
         emitDelta(turn);
         finishTurn(turn, "completed", turn.noJsonRpc);
+        const crashAfterCompleted = control(turn.text, "CRASH_AFTER_COMPLETED_MS");
+        if (crashAfterCompleted !== null) setTimeout(() => process.exit(18), crashAfterCompleted);
         if (turn.deltaAfterCompleted) {
             send({
                 jsonrpc: "2.0",
@@ -105,6 +120,18 @@ function startTurn(request) {
         deltaAfterCompleted: has(text, "DELTA_AFTER_COMPLETED")
     };
     turns.set(turnId, turn);
+    record({
+        method: "turn/start",
+        params: {
+            threadId: request.params?.threadId,
+            cwd: request.params?.cwd,
+            sandboxPolicy: request.params?.sandboxPolicy,
+            approvalPolicy: request.params?.approvalPolicy,
+            model: request.params?.model,
+            effort: request.params?.effort,
+            inputTypes: Array.isArray(request.params?.input) ? request.params.input.map(item => item?.type) : []
+        }
+    });
     if (has(text, "NO_TURN_RESPONSE")) return;
     if (has(text, "INVALID_JSON")) process.stdout.write("{not-json\n");
 
@@ -133,6 +160,14 @@ function startTurn(request) {
                 method: "turn/started",
                 params: { threadId: turn.threadId, turn: { id: `conflict-${turn.id}`, status: "inProgress" } }
             }, turn.noJsonRpc), 5));
+        }
+        if (has(text, "SERVER_REQUEST")) {
+            send({
+                jsonrpc: "2.0",
+                id: `fake-server-request-${turn.id}`,
+                method: "item/commandExecution/requestApproval",
+                params: { threadId: turn.threadId, turnId: turn.id }
+            });
         }
         if (!turn.finished && !(eventsBeforeResponse || completedBeforeResponse)) {
             turn.timers.push(setTimeout(() => {
@@ -177,6 +212,16 @@ function handle(request) {
             send({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "fake thread failure" } });
             return;
         }
+        record({
+            method: "thread/start",
+            params: {
+                cwd: request.params?.cwd,
+                ephemeral: request.params?.ephemeral,
+                sandbox: request.params?.sandbox,
+                approvalPolicy: request.params?.approvalPolicy,
+                model: request.params?.model
+            }
+        });
         const id = `thread-${nextThread++}`;
         send({ jsonrpc: "2.0", id: request.id, result: { thread: { id, cwd, status: "active" } } });
         return;

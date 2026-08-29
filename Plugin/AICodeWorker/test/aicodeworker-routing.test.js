@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -235,6 +236,49 @@ async function waitForMeta(environment, jobId, terminal = false) {
 
 function resultOf(response) {
     return response.status === "success" ? response.result : response;
+}
+
+function installAuthorizedAppServerPatch(environment, jobId, patchText = "diff --git a/a b/a\n") {
+    const protocol = require(path.join(environment.pluginDir, "appserver", "protocol.js"));
+    fs.mkdirSync(environment.jobRoot, { recursive: true });
+    const directoryIdentity = protocol.pinPatchArtifactDirectory(environment.jobRoot, { create: true });
+    const paths = protocol.jobPaths(environment.jobRoot, jobId);
+    fs.mkdirSync(path.dirname(paths.metaPath), { recursive: true });
+    fs.mkdirSync(path.dirname(paths.outputPath), { recursive: true });
+    fs.writeFileSync(paths.patchPath, patchText, { encoding: "utf8", mode: 0o600 });
+    fs.writeFileSync(paths.outputPath, `${patchText}\nMODEL_PATCH_BODY_MUST_NOT_RETURN`, "utf8");
+    const patchSha256 = crypto.createHash("sha256").update(Buffer.from(patchText, "utf8")).digest("hex");
+    const patchBytes = Buffer.byteLength(patchText, "utf8");
+    const publicArtifact = protocol.inspectPatchArtifactFile(paths.patchPath, directoryIdentity, {
+        jobRoot: environment.jobRoot,
+        expectedSha256: patchSha256,
+        expectedBytes: patchBytes
+    });
+    const meta = {
+        jobId,
+        state: "completed",
+        worker: "codex",
+        mode: "patch",
+        projectPath: environment.projectRoot,
+        executionBackend: "codex-app-server",
+        requestedExecutionBackend: "codex-app-server",
+        sidecarInstanceId: "completed-patch-instance",
+        jobKind: "patch",
+        jobPhase: "completed",
+        patchValidated: true,
+        applyCheckPassed: true,
+        baselineStable: true,
+        patchSha256,
+        patchBytes,
+        patchFileCount: 1,
+        patchArtifactNonce: "bbbbbbbbbbbbbbbbbbbbbbbb",
+        patchArtifactDirectoryIdentity: directoryIdentity,
+        patchArtifactPublicIdentity: publicArtifact.identity,
+        exitCode: 0,
+        completedAt: new Date().toISOString()
+    };
+    protocol.writeJsonAtomic(paths.metaPath, meta);
+    return { protocol, paths, meta, patchText };
 }
 
 test("generateJobId stays unique in one second and matches the structured format", async () => {
@@ -667,6 +711,9 @@ test("Codex patch/write and non-Codex remain legacy", async () => {
             assert.equal(meta.executionBackend, "legacy-exec");
             assert.equal(meta.requestedExecutionBackend, undefined);
         }
+        const source = fs.readFileSync(environment.workerPath, "utf8");
+        assert.equal(source.includes("ENABLE_CODEX_APP_SERVER_PATCH"), false);
+        assert.equal(source.includes("isCodexAppServerPatchRoute"), false);
     } finally {
         await environment.cleanup();
     }
@@ -1321,5 +1368,107 @@ test("query and capabilities reject an invalid responseMode", async () => {
         const capabilities = await environment.invoke({ command: "capabilities", responseMode: "brief" });
         assert.equal(capabilities.status, "error");
         assert.match(capabilities.error, /responseMode/);
+    } finally { await environment.cleanup(); }
+});
+
+test("completed app-server patch full and compact query return only authorized artifact metadata", async () => {
+    const environment = await createEnvironment({ flag: "false" });
+    try {
+        const artifact = installAuthorizedAppServerPatch(environment, "job_query_authorized_patch", "diff --git a/a b/a\n多字节🙂\n");
+        const full = resultOf(await environment.invoke({ command: "query", jobId: artifact.meta.jobId, wait: true, responseMode: "full" }));
+        const compact = resultOf(await environment.invoke({ command: "query", jobId: artifact.meta.jobId, wait: false, responseMode: "compact" }));
+        for (const result of [full, compact]) {
+            assert.equal(result.patchFile, artifact.paths.patchPath);
+            assert.equal(result.patchAvailable, true);
+            assert.equal(result.patchBytes, Buffer.byteLength(artifact.patchText, "utf8"));
+            assert.equal(result.patchFileCount, 1);
+            assert.equal(JSON.stringify(result).includes("MODEL_PATCH_BODY_MUST_NOT_RETURN"), false);
+            assert.equal(JSON.stringify(result).includes("多字节🙂"), false);
+            assert.equal(JSON.stringify(result).includes(artifact.meta.patchSha256), false);
+        }
+        assert.equal(full.output, "");
+        assert.equal(Object.prototype.hasOwnProperty.call(compact, "output"), false);
+    } finally { await environment.cleanup(); }
+});
+
+test("completed app-server patch tamper or same-content replacement is unauthorized in full and compact", async () => {
+    for (const mode of ["tamper", "replacement"]) {
+        const environment = await createEnvironment({ flag: "false" });
+        try {
+            const artifact = installAuthorizedAppServerPatch(environment, `job_query_patch_${mode}`);
+            if (mode === "tamper") {
+                fs.writeFileSync(artifact.paths.patchPath, "tampered", "utf8");
+            } else {
+                fs.renameSync(artifact.paths.patchPath, `${artifact.paths.patchPath}.original`);
+                fs.writeFileSync(artifact.paths.patchPath, artifact.patchText, "utf8");
+            }
+            for (const responseMode of ["full", "compact"]) {
+                const result = resultOf(await environment.invoke({
+                    command: "query", jobId: artifact.meta.jobId, wait: responseMode === "full", responseMode
+                }));
+                assert.equal(result.patchFile, null);
+                assert.equal(result.patchAvailable, false);
+                assert.equal(result.patchBytes, null);
+                assert.equal(result.patchFileCount, null);
+            }
+            assert.equal(fs.existsSync(artifact.paths.patchPath), true, "query must not delete tampered public artifact");
+        } finally { await environment.cleanup(); }
+    }
+});
+
+test("completed app-server patch public symlink or junction is unauthorized", async t => {
+    const environment = await createEnvironment({ flag: "false" });
+    try {
+        const artifact = installAuthorizedAppServerPatch(environment, "job_query_patch_link");
+        const target = path.join(environment.jobRoot, "link-target.patch");
+        fs.writeFileSync(target, artifact.patchText, "utf8");
+        fs.unlinkSync(artifact.paths.patchPath);
+        try {
+            fs.symlinkSync(target, artifact.paths.patchPath, "file");
+        } catch (error) {
+            if (["EPERM", "EACCES", "UNKNOWN"].includes(error?.code)) {
+                const originalDirectory = path.dirname(artifact.paths.patchPath);
+                const displacedDirectory = `${originalDirectory}.original`;
+                const junctionTarget = path.join(environment.jobRoot, "junction-target");
+                fs.renameSync(originalDirectory, displacedDirectory);
+                fs.mkdirSync(junctionTarget, { recursive: true });
+                fs.writeFileSync(path.join(junctionTarget, path.basename(artifact.paths.patchPath)), artifact.patchText, "utf8");
+                try {
+                    fs.symlinkSync(junctionTarget, originalDirectory, "junction");
+                } catch (junctionError) {
+                    if (["EPERM", "EACCES", "UNKNOWN"].includes(junctionError?.code)) {
+                        t.diagnostic(`symlink and junction creation unavailable: ${junctionError.code}`);
+                        return;
+                    }
+                    throw junctionError;
+                }
+            }
+            else throw error;
+        }
+        for (const responseMode of ["full", "compact"]) {
+            const result = resultOf(await environment.invoke({ command: "query", jobId: artifact.meta.jobId, wait: false, responseMode }));
+            assert.equal(result.patchFile, null);
+            assert.equal(result.patchAvailable, false);
+        }
+    } finally { await environment.cleanup(); }
+});
+
+test("legacy patch query keeps fixed-path compatibility in full and compact", async () => {
+    const environment = await createEnvironment({ flag: "false" });
+    try {
+        const jobId = "job_query_legacy_patch";
+        const patchPath = path.join(environment.jobRoot, "patches", `${jobId}.patch`);
+        fs.mkdirSync(path.dirname(patchPath), { recursive: true });
+        fs.mkdirSync(path.join(environment.jobRoot, "meta"), { recursive: true });
+        fs.writeFileSync(patchPath, "legacy patch", "utf8");
+        fs.writeFileSync(metaPath(environment, jobId), JSON.stringify({
+            jobId, state: "completed", worker: "codex", mode: "patch",
+            projectPath: environment.projectRoot, executionBackend: "legacy-exec", exitCode: 0
+        }), "utf8");
+        for (const responseMode of ["full", "compact"]) {
+            const result = resultOf(await environment.invoke({ command: "query", jobId, wait: false, responseMode }));
+            assert.equal(result.patchFile, patchPath);
+            assert.equal(result.patchAvailable, true);
+        }
     } finally { await environment.cleanup(); }
 });

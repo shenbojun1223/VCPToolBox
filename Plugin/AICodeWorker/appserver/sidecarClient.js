@@ -19,7 +19,9 @@ const {
     terminateOwnedChild,
     reconcileDeadSidecarJobs,
     removeEndpoint,
-    writeJsonAtomic
+    writeJsonAtomic,
+    assertJobId,
+    jobPaths
 } = require("./protocol");
 
 const OWNED_CHILD_TERMINATION_PROOFS = new WeakSet();
@@ -156,6 +158,38 @@ class SidecarClient {
     async submitAnalyzeJob(params) {
         const state = await this.ensure();
         return this._callWithState(state, "submitAnalyzeJob", params);
+    }
+
+    async submitPatchJob(params = {}) {
+        const jobId = assertJobId(params.jobId);
+        const fixedPaths = jobPaths(this.jobRoot, jobId);
+        const state = await this.ensure();
+        try {
+            return await this._callWithState(state, "submitPatchJob", {
+                ...params,
+                jobId,
+                metaPath: fixedPaths.metaPath,
+                outputPath: fixedPaths.outputPath,
+                codexOutputPath: fixedPaths.codexOutputPath,
+                patchPath: fixedPaths.patchPath
+            });
+        } catch (error) {
+            const unknownTransportCodes = new Set([
+                "SIDECAR_IPC_TIMEOUT",
+                "SIDECAR_IPC_ERROR",
+                "SIDECAR_IPC_CLOSED",
+                "SIDECAR_IPC_WRITE_FAILED",
+                "SIDECAR_IPC_BUFFER_OVERFLOW",
+                "SIDECAR_RESPONSE_MISMATCH",
+                "INVALID_SIDECAR_RESPONSE"
+            ]);
+            if (!unknownTransportCodes.has(error?.code)) throw error;
+            throw new SidecarError(
+                "AICW_APP_SERVER_PATCH_SUBMISSION_UNKNOWN",
+                "Patch submission outcome is unknown and must not be replayed",
+                { transportCode: error.code }
+            );
+        }
     }
 
     /**

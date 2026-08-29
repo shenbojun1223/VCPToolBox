@@ -109,8 +109,20 @@ function jobPaths(jobRoot, jobId) {
     return {
         metaPath: path.join(root, "meta", `${id}.json`),
         outputPath: path.join(root, "output", `${id}.txt`),
-        codexOutputPath: path.join(root, "output", `${id}.codex-last.txt`)
+        codexOutputPath: path.join(root, "output", `${id}.codex-last.txt`),
+        patchPath: path.join(root, "patches", `${id}.patch`)
     };
+}
+
+function validatePatchJobPaths(jobRoot, jobId, supplied = {}) {
+    const result = validateJobPaths(jobRoot, jobId, supplied);
+    const expected = jobPaths(jobRoot, jobId);
+    const patchPath = assertAbsolutePath(supplied.patchPath, "patchPath");
+    if (!samePath(patchPath, expected.patchPath)) {
+        throw new SidecarError("INVALID_JOB_PATH", "patchPath does not match the fixed job path");
+    }
+    assertWithinDirectory(patchPath, jobRoot, "patchPath");
+    return { ...result, patchPath };
 }
 
 function validateJobPaths(jobRoot, jobId, supplied = {}) {
@@ -135,6 +147,290 @@ function validateJobPaths(jobRoot, jobId, supplied = {}) {
 
 function ensureDirectory(directory) {
     fs.mkdirSync(directory, { recursive: true });
+}
+
+const PATCH_ARTIFACT_IDENTITY_VERSION = 1;
+const PATCH_NONCE_RE = /^[0-9a-f]{24}$/;
+const PATCH_INSTANCE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+function artifactError(code, message, details) {
+    return new SidecarError(code, message, details);
+}
+
+function pathIsWithinCanonical(target, root) {
+    let targetPath = path.resolve(target);
+    let rootPath = path.resolve(root);
+    if (process.platform === "win32") {
+        targetPath = targetPath.toLowerCase();
+        rootPath = rootPath.toLowerCase();
+    }
+    const relative = path.relative(rootPath, targetPath);
+    return relative === "" || (
+        relative !== ".." &&
+        !relative.startsWith(`..${path.sep}`) &&
+        !path.isAbsolute(relative)
+    );
+}
+
+function readReliableIdentity(target, expectedType, code, hooks = {}) {
+    let stat;
+    let realpath;
+    try {
+        stat = (hooks.lstatSync || fs.lstatSync)(target, { bigint: true });
+        if (stat.isSymbolicLink() || (expectedType === "directory" ? !stat.isDirectory() : !stat.isFile())) {
+            throw artifactError(code, `Patch artifact ${expectedType} is unsafe`);
+        }
+        realpath = (hooks.realpathSync || fs.realpathSync.native)(target);
+    } catch (error) {
+        if (error instanceof SidecarError) throw error;
+        throw artifactError(code, `Patch artifact ${expectedType} identity is unavailable`, { cause: error?.code });
+    }
+    if (typeof stat.dev !== "bigint" || typeof stat.ino !== "bigint" || stat.dev < 0n || stat.ino <= 0n) {
+        throw artifactError(code, `Patch artifact ${expectedType} identity is unreliable`);
+    }
+    return {
+        dev: stat.dev.toString(10),
+        ino: stat.ino.toString(10),
+        realpath: path.resolve(realpath)
+    };
+}
+
+function assertNoReparseDirectoryComponents(directory, code, hooks = {}) {
+    const resolved = path.resolve(directory);
+    const parsed = path.parse(resolved);
+    let current = parsed.root;
+    for (const segment of resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+        current = path.join(current, segment);
+        let stat;
+        try { stat = (hooks.lstatSync || fs.lstatSync)(current, { bigint: true }); } catch (error) {
+            throw artifactError(code, "Patch artifact directory component is unavailable", { cause: error?.code });
+        }
+        if (stat.isSymbolicLink() || !stat.isDirectory()) {
+            throw artifactError(code, "Patch artifact directory component is unsafe");
+        }
+    }
+}
+
+function sameArtifactIdentity(left, right) {
+    return Boolean(left && right &&
+        String(left.dev) === String(right.dev) &&
+        String(left.ino) === String(right.ino) &&
+        samePath(left.realpath, right.realpath));
+}
+
+function sameArtifactObjectIdentity(left, right) {
+    return Boolean(left && right &&
+        String(left.dev) === String(right.dev) &&
+        String(left.ino) === String(right.ino));
+}
+
+function normalizePatchDirectoryIdentity(identity, code = "AICW_PATCH_ARTIFACT_DIR_DRIFT") {
+    if (!identity || typeof identity !== "object" || Array.isArray(identity) ||
+        identity.schemaVersion !== PATCH_ARTIFACT_IDENTITY_VERSION ||
+        typeof identity.canonicalJobRoot !== "string" ||
+        typeof identity.jobRootDev !== "string" || typeof identity.jobRootIno !== "string" ||
+        typeof identity.realpath !== "string" || typeof identity.dev !== "string" || typeof identity.ino !== "string" ||
+        !/^\d+$/.test(identity.jobRootDev) || !/^\d+$/.test(identity.jobRootIno) ||
+        !/^\d+$/.test(identity.dev) || !/^[1-9]\d*$/.test(identity.ino)) {
+        throw artifactError(code, "Patch artifact directory identity is invalid");
+    }
+    return {
+        schemaVersion: PATCH_ARTIFACT_IDENTITY_VERSION,
+        canonicalJobRoot: path.resolve(identity.canonicalJobRoot),
+        jobRootDev: identity.jobRootDev,
+        jobRootIno: identity.jobRootIno,
+        realpath: path.resolve(identity.realpath),
+        dev: identity.dev,
+        ino: identity.ino
+    };
+}
+
+function pinPatchArtifactDirectory(jobRoot, options = {}) {
+    const hooks = options.hooks || options;
+    const rootPath = normalizeDirectory(jobRoot, "jobRoot");
+    assertNoReparseDirectoryComponents(rootPath, "AICW_PATCH_ARTIFACT_DIR_UNSAFE", hooks);
+    let rootIdentity = readReliableIdentity(rootPath, "directory", "AICW_PATCH_ARTIFACT_DIR_UNSAFE", hooks);
+    const canonicalRootIdentity = readReliableIdentity(rootIdentity.realpath, "directory", "AICW_PATCH_ARTIFACT_DIR_UNSAFE", hooks);
+    if (!sameArtifactIdentity(rootIdentity, canonicalRootIdentity)) {
+        throw artifactError("AICW_PATCH_ARTIFACT_DIR_UNSAFE", "Patch jobRoot canonical identity is inconsistent");
+    }
+    const patchesPath = path.join(rootIdentity.realpath, "patches");
+    let patchesIdentity;
+    try {
+        patchesIdentity = readReliableIdentity(patchesPath, "directory", "AICW_PATCH_ARTIFACT_DIR_UNSAFE", hooks);
+    } catch (error) {
+        if (error?.details?.cause !== "ENOENT" || options.create !== true) throw error;
+        const rootBeforeCreate = readReliableIdentity(rootPath, "directory", "AICW_PATCH_ARTIFACT_DIR_UNSAFE", hooks);
+        if (!sameArtifactIdentity(rootIdentity, rootBeforeCreate)) {
+            throw artifactError("AICW_PATCH_ARTIFACT_DIR_DRIFT", "Patch jobRoot identity changed before directory creation");
+        }
+        try {
+            (hooks.mkdirSync || fs.mkdirSync)(patchesPath, { recursive: false, mode: 0o700 });
+        } catch (createError) {
+            if (createError?.code !== "EEXIST") {
+                throw artifactError("AICW_PATCH_ARTIFACT_DIR_UNSAFE", "Patch artifact directory could not be created", { cause: createError?.code });
+            }
+        }
+        rootIdentity = readReliableIdentity(rootPath, "directory", "AICW_PATCH_ARTIFACT_DIR_DRIFT", hooks);
+        patchesIdentity = readReliableIdentity(patchesPath, "directory", "AICW_PATCH_ARTIFACT_DIR_UNSAFE", hooks);
+    }
+    if (!pathIsWithinCanonical(patchesIdentity.realpath, rootIdentity.realpath) || !samePath(patchesIdentity.realpath, patchesPath)) {
+        throw artifactError("AICW_PATCH_ARTIFACT_DIR_UNSAFE", "Patch artifact directory escapes canonical jobRoot");
+    }
+    const rootAfter = readReliableIdentity(rootPath, "directory", "AICW_PATCH_ARTIFACT_DIR_DRIFT", hooks);
+    if (!sameArtifactIdentity(rootIdentity, rootAfter)) {
+        throw artifactError("AICW_PATCH_ARTIFACT_DIR_DRIFT", "Patch jobRoot identity changed while pinning directory");
+    }
+    return Object.freeze({
+        schemaVersion: PATCH_ARTIFACT_IDENTITY_VERSION,
+        canonicalJobRoot: rootIdentity.realpath,
+        jobRootDev: rootIdentity.dev,
+        jobRootIno: rootIdentity.ino,
+        realpath: patchesIdentity.realpath,
+        dev: patchesIdentity.dev,
+        ino: patchesIdentity.ino
+    });
+}
+
+function verifyPatchArtifactDirectory(jobRoot, pinnedIdentity, options = {}) {
+    const expected = normalizePatchDirectoryIdentity(pinnedIdentity);
+    let current;
+    try {
+        current = pinPatchArtifactDirectory(jobRoot, { ...(options.hooks ? { hooks: options.hooks } : options), create: false });
+    } catch (error) {
+        if (error?.code === "AICW_PATCH_ARTIFACT_DIR_UNSAFE") {
+            throw artifactError("AICW_PATCH_ARTIFACT_DIR_DRIFT", "Pinned patch artifact directory became unsafe", { cause: error?.details?.cause });
+        }
+        throw error;
+    }
+    if (!samePath(expected.canonicalJobRoot, current.canonicalJobRoot) ||
+        expected.jobRootDev !== current.jobRootDev || expected.jobRootIno !== current.jobRootIno ||
+        !samePath(expected.realpath, current.realpath) || expected.dev !== current.dev || expected.ino !== current.ino) {
+        throw artifactError("AICW_PATCH_ARTIFACT_DIR_DRIFT", "Pinned patch artifact directory identity changed");
+    }
+    return current;
+}
+
+function createPatchArtifactNonce(options = {}) {
+    const nonce = (options.randomBytes || crypto.randomBytes)(12).toString("hex");
+    if (!PATCH_NONCE_RE.test(nonce)) throw artifactError("AICW_PATCH_ARTIFACT_DIR_UNSAFE", "Patch artifact nonce generation failed");
+    return nonce;
+}
+
+function patchCandidatePath(jobRoot, jobId, sidecarInstanceId, patchArtifactNonce) {
+    const id = assertJobId(jobId);
+    if (typeof sidecarInstanceId !== "string" || !PATCH_INSTANCE_RE.test(sidecarInstanceId)) {
+        throw artifactError("AICW_PATCH_ARTIFACT_DIR_UNSAFE", "Patch Sidecar instance identity is invalid");
+    }
+    if (typeof patchArtifactNonce !== "string" || !PATCH_NONCE_RE.test(patchArtifactNonce)) {
+        throw artifactError("AICW_PATCH_ARTIFACT_DIR_UNSAFE", "Patch artifact nonce is invalid");
+    }
+    return path.join(normalizeDirectory(jobRoot, "jobRoot"), "patches", `.${id}.${sidecarInstanceId}.${patchArtifactNonce}.candidate`);
+}
+
+function inspectPatchArtifactFile(filePath, directoryIdentity, options = {}) {
+    const hooks = options.hooks || options;
+    const expectedPath = path.resolve(filePath);
+    verifyPatchArtifactDirectory(options.jobRoot, directoryIdentity, { hooks });
+    const identity = readReliableIdentity(expectedPath, "file", options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", hooks);
+    const canonicalExpectedPath = path.join(path.resolve(directoryIdentity.realpath), path.basename(expectedPath));
+    if (!samePath(identity.realpath, canonicalExpectedPath) || !samePath(path.dirname(identity.realpath), directoryIdentity.realpath)) {
+        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact file escaped its pinned directory");
+    }
+    if (options.expectedIdentity && !sameArtifactObjectIdentity(identity, options.expectedIdentity)) {
+        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact file identity changed");
+    }
+    let content;
+    try { content = (hooks.readFileSync || fs.readFileSync)(expectedPath); } catch (error) {
+        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact file could not be read", { cause: error?.code });
+    }
+    const afterRead = readReliableIdentity(expectedPath, "file", options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", hooks);
+    verifyPatchArtifactDirectory(options.jobRoot, directoryIdentity, { hooks });
+    if (!sameArtifactIdentity(identity, afterRead)) {
+        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact file changed while being read");
+    }
+    const actualSha256 = crypto.createHash("sha256").update(content).digest("hex");
+    if (options.expectedSha256 !== undefined && actualSha256 !== options.expectedSha256) {
+        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact hash mismatch");
+    }
+    if (options.expectedBytes !== undefined && content.length !== options.expectedBytes) {
+        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact byte length mismatch");
+    }
+    return { identity: afterRead, sha256: actualSha256, bytes: content.length };
+}
+
+function removePatchArtifactExact(filePath, directoryIdentity, options = {}) {
+    const hooks = options.hooks || options;
+    let inspected;
+    try {
+        inspected = inspectPatchArtifactFile(filePath, directoryIdentity, options);
+    } catch (error) {
+        if (error?.details?.cause === "ENOENT" && options.missingIsSuccess !== false) return true;
+        return false;
+    }
+    try { hooks.afterArtifactHashCheck?.({ filePath: path.resolve(filePath), identity: inspected.identity }); } catch { return false; }
+    try {
+        verifyPatchArtifactDirectory(options.jobRoot, directoryIdentity, { hooks });
+        inspectPatchArtifactFile(filePath, directoryIdentity, {
+            ...options,
+            hooks,
+            expectedIdentity: inspected.identity,
+            expectedSha256: inspected.sha256,
+            expectedBytes: inspected.bytes
+        });
+        (hooks.unlinkSync || fs.unlinkSync)(filePath);
+        verifyPatchArtifactDirectory(options.jobRoot, directoryIdentity, { hooks });
+        try {
+            (hooks.lstatSync || fs.lstatSync)(filePath, { bigint: true });
+            return false;
+        } catch (error) {
+            return error?.code === "ENOENT";
+        }
+    } catch {
+        return false;
+    }
+}
+
+function inspectAuthorizedPatchArtifact(jobRoot, jobId, meta, options = {}) {
+    const unauthorized = code => ({ authorized: false, patchAvailable: false, patchPath: null, code: code || "AICW_PATCH_PUBLIC_ARTIFACT_UNAUTHORIZED" });
+    try {
+        const id = assertJobId(jobId);
+        if (!meta || typeof meta !== "object" || Array.isArray(meta) || String(meta.jobId || "") !== id ||
+            meta.executionBackend !== "codex-app-server" || meta.jobKind !== "patch" || meta.state !== "completed" ||
+            meta.patchValidated !== true || meta.applyCheckPassed !== true || meta.baselineStable !== true ||
+            typeof meta.patchSha256 !== "string" || !/^[0-9a-f]{64}$/.test(meta.patchSha256) ||
+            !Number.isSafeInteger(meta.patchBytes) || meta.patchBytes < 0) {
+            return unauthorized();
+        }
+        const expectedPath = jobPaths(jobRoot, id).patchPath;
+        if ((meta.patchPath && !samePath(meta.patchPath, expectedPath)) || (meta.patchFile && !samePath(meta.patchFile, expectedPath))) {
+            return unauthorized();
+        }
+        const directoryIdentity = normalizePatchDirectoryIdentity(meta.patchArtifactDirectoryIdentity);
+        if (!meta.patchArtifactPublicIdentity || typeof meta.patchArtifactPublicIdentity !== "object" ||
+            typeof meta.patchArtifactPublicIdentity.dev !== "string" || typeof meta.patchArtifactPublicIdentity.ino !== "string" ||
+            typeof meta.patchArtifactPublicIdentity.realpath !== "string") {
+            return unauthorized();
+        }
+        const inspected = inspectPatchArtifactFile(expectedPath, directoryIdentity, {
+            jobRoot,
+            hooks: options.hooks || options,
+            expectedIdentity: meta.patchArtifactPublicIdentity,
+            expectedSha256: meta.patchSha256,
+            expectedBytes: meta.patchBytes,
+            failureCode: "AICW_PATCH_PUBLIC_ARTIFACT_UNAUTHORIZED"
+        });
+        return {
+            authorized: true,
+            patchAvailable: true,
+            patchPath: expectedPath,
+            patchSha256: inspected.sha256,
+            patchBytes: inspected.bytes,
+            patchFileCount: Number.isSafeInteger(meta.patchFileCount) ? meta.patchFileCount : null
+        };
+    } catch {
+        return unauthorized();
+    }
 }
 
 function atomicWriteFile(filePath, content) {
@@ -493,18 +789,69 @@ async function reconcileDeadSidecarJobs(jobRoot, state, options = {}) {
         if (initialMeta.state !== "running" || initialMeta.executionBackend !== "codex-app-server" || initialMeta.sidecarInstanceId !== state.instanceId) continue;
         let updated = false;
         try {
+            let artifactFailures = [];
             const result = await updateMeta(jobRoot, jobId, metaPath, meta => {
                 if (!meta || typeof meta !== "object" || Array.isArray(meta) ||
                     meta.state !== "running" || meta.executionBackend !== "codex-app-server" ||
                     meta.sidecarInstanceId !== state.instanceId) return META_UPDATE_SKIPPED;
+                if (meta.jobKind === "patch") {
+                    let directoryIdentity;
+                    try {
+                        directoryIdentity = verifyPatchArtifactDirectory(jobRoot, meta.patchArtifactDirectoryIdentity, { hooks: options.artifactHooks || {} });
+                        options.artifactHooks?.beforeReconcileCleanup?.({ jobRoot, jobId, directoryIdentity });
+                        verifyPatchArtifactDirectory(jobRoot, directoryIdentity, { hooks: options.artifactHooks || {} });
+                    } catch (error) {
+                        artifactFailures.push(failure(error?.code || "AICW_PATCH_ARTIFACT_DIR_DRIFT", jobId));
+                    }
+                    if (directoryIdentity) {
+                        let candidatePath;
+                        try {
+                            candidatePath = patchCandidatePath(jobRoot, jobId, meta.sidecarInstanceId, meta.patchArtifactNonce);
+                        } catch (error) {
+                            artifactFailures.push(failure(error?.code || "AICW_PATCH_ARTIFACT_DIR_UNSAFE", jobId));
+                        }
+                        if (candidatePath && !removePatchArtifactExact(candidatePath, directoryIdentity, {
+                            jobRoot,
+                            hooks: options.artifactHooks || {},
+                            failureCode: "AICW_PATCH_ARTIFACT_CLEANUP_FAILED"
+                        })) {
+                            artifactFailures.push(failure("AICW_PATCH_ARTIFACT_CLEANUP_FAILED", jobId));
+                        }
+                    }
+                    const publicPatch = jobPaths(jobRoot, jobId).patchPath;
+                    if (directoryIdentity && !removePatchArtifactExact(publicPatch, directoryIdentity, {
+                        jobRoot,
+                        hooks: options.artifactHooks || {},
+                        expectedSha256: meta.patchSha256,
+                        expectedBytes: meta.patchBytes,
+                        failureCode: "AICW_PATCH_ARTIFACT_CLEANUP_FAILED"
+                    })) {
+                        artifactFailures.push(failure("AICW_PATCH_ARTIFACT_CLEANUP_FAILED", jobId));
+                    }
+                    if (artifactFailures.length) return META_UPDATE_SKIPPED;
+                }
+                const crashedDuringPatchFinalize = meta.jobKind === "patch" &&
+                    ["validating", "publishing"].includes(meta.jobPhase);
                 meta.state = "failed";
+                if (meta.jobKind === "patch") meta.jobPhase = "failed";
                 meta.completedAt = completedAt;
                 meta.exitCode = 1;
-                meta.errorCode = "SIDECAR_PROCESS_EXITED";
+                meta.errorCode = crashedDuringPatchFinalize
+                    ? "SIDECAR_PROCESS_EXITED_DURING_PATCH_FINALIZE"
+                    : "SIDECAR_PROCESS_EXITED";
                 meta.exitReason = "Sidecar process exited before Job completion";
+                if (meta.jobKind === "patch") {
+                    meta.patchValidated = false;
+                    meta.applyCheckPassed = false;
+                    meta.baselineStable = false;
+                }
                 updated = true;
                 return meta;
             }, { ...options, hooks: options.metaHooks || {} });
+            if (artifactFailures.length) {
+                failures.push(...artifactFailures);
+                continue;
+            }
             if (updated && result?.updated !== false) reconciled++;
         } catch {
             failures.push(failure("META_UPDATE_FAILED", jobId));
@@ -604,12 +951,7 @@ function openMetaLock(lockPath, processIdentity) {
 function releaseMetaLock(lockPath, lock) {
     if (!lock) return false;
     try { fs.closeSync(lock.fd); } catch {}
-    let current;
-    try { current = parseMetaLockRecord(lockPath); } catch { return false; }
-    if (!current || current.ownerToken !== lock.ownerToken ||
-        Number(current.pid) !== process.pid || !sameProcessIdentity(current.processIdentity, lock.record.processIdentity)) {
-        return false;
-    }
+    if (!ownsMetaLock(lockPath, lock)) return false;
     try {
         fs.unlinkSync(lockPath);
         return true;
@@ -617,6 +959,15 @@ function releaseMetaLock(lockPath, lock) {
         if (error?.code === "ENOENT") return false;
         throw new SidecarError("SIDECAR_META_LOCK_RELEASE_FAILED", "Could not release Job meta lock", { cause: error?.code });
     }
+}
+
+function ownsMetaLock(lockPath, lock) {
+    if (!lock) return false;
+    let current;
+    try { current = parseMetaLockRecord(lockPath); } catch { return false; }
+    return Boolean(current && current.ownerToken === lock.ownerToken &&
+        Number(current.pid) === process.pid &&
+        sameProcessIdentity(current.processIdentity, lock.record.processIdentity));
 }
 
 async function withJobMetaLock(jobRoot, jobId, operation, options = {}) {
@@ -657,8 +1008,28 @@ async function withJobMetaLock(jobRoot, jobId, operation, options = {}) {
         operationFailed = true;
         throw error;
     } finally {
-        const released = releaseMetaLock(lockPath, lock);
-        if (!released && !operationFailed) throw new SidecarError("SIDECAR_META_LOCK_RELEASE_FAILED", "Could not release Job meta lock");
+        let released = false;
+        let releaseFailure = null;
+        try {
+            released = typeof options.hooks?.releaseMetaLock === "function"
+                ? await options.hooks.releaseMetaLock(lockPath, lock, releaseMetaLock)
+                : releaseMetaLock(lockPath, lock);
+        } catch (error) {
+            releaseFailure = error;
+        }
+        if (!released && !operationFailed) {
+            let rolledBack = false;
+            if (typeof options.onMetaLockReleaseFailure === "function") {
+                try {
+                    rolledBack = await options.onMetaLockReleaseFailure({ lockPath, lock }) === true;
+                } catch {}
+            }
+            if (rolledBack && ownsMetaLock(lockPath, lock)) {
+                try { releaseMetaLock(lockPath, lock); } catch {}
+            }
+            if (releaseFailure instanceof SidecarError) throw releaseFailure;
+            throw new SidecarError("SIDECAR_META_LOCK_RELEASE_FAILED", "Could not release Job meta lock", { cause: releaseFailure?.code });
+        }
     }
 }
 
@@ -673,6 +1044,21 @@ async function updateJobMetaLocked(jobRoot, jobId, suppliedMetaPath, updater, op
     const hooks = options.hooks || {};
     const readMeta = hooks.readJson || readJson;
     const writeMeta = hooks.writeJsonAtomic || writeJsonAtomic;
+    let previousMeta = null;
+    let wroteMeta = false;
+    const lockOptions = {
+        ...options,
+        async onMetaLockReleaseFailure({ lockPath, lock }) {
+            if (!wroteMeta || !previousMeta || !ownsMetaLock(lockPath, lock)) return false;
+            try {
+                writeMeta(metaPath, previousMeta);
+                wroteMeta = false;
+                return true;
+            } catch {
+                return false;
+            }
+        }
+    };
     return withJobMetaLock(normalizedJobRoot, id, async () => {
         let current;
         try {
@@ -686,6 +1072,7 @@ async function updateJobMetaLocked(jobRoot, jobId, suppliedMetaPath, updater, op
         }
         const revision = current.metaRevision === undefined ? 0 : Number(current.metaRevision);
         if (!Number.isSafeInteger(revision) || revision < 0) throw new SidecarError("META_INVALID", "Job metaRevision is invalid");
+        previousMeta = JSON.parse(JSON.stringify(current));
         const candidate = await updater(current);
         if (candidate === META_UPDATE_SKIPPED) return { updated: false, meta: current };
         if (candidate !== undefined && (!candidate || typeof candidate !== "object" || Array.isArray(candidate))) {
@@ -695,8 +1082,9 @@ async function updateJobMetaLocked(jobRoot, jobId, suppliedMetaPath, updater, op
         if (String(next.jobId || "") !== id) throw new SidecarError("META_JOB_MISMATCH", "Meta updater changed jobId");
         next.metaRevision = revision + 1;
         writeMeta(metaPath, next);
+        wroteMeta = true;
         return { updated: true, meta: next };
-    }, options);
+    }, lockOptions);
 }
 
 module.exports = {
@@ -707,7 +1095,18 @@ module.exports = {
     assertWithinDirectory,
     jobPaths,
     validateJobPaths,
+    validatePatchJobPaths,
     ensureDirectory,
+    PATCH_ARTIFACT_IDENTITY_VERSION,
+    pinPatchArtifactDirectory,
+    verifyPatchArtifactDirectory,
+    createPatchArtifactNonce,
+    patchCandidatePath,
+    sameArtifactIdentity,
+    sameArtifactObjectIdentity,
+    inspectPatchArtifactFile,
+    removePatchArtifactExact,
+    inspectAuthorizedPatchArtifact,
     atomicWriteFile,
     writeJsonAtomic,
     createJsonExclusive,
