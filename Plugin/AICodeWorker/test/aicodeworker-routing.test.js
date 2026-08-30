@@ -44,6 +44,16 @@ function validPatch(replacement = "gamma", relative = "tracked.txt") {
     ].join("\n");
 }
 
+function patchProtocolProof() {
+    return {
+        patchProtocolSupported: true,
+        patchContractVersion: 1,
+        patchMaxBytes: 524288,
+        patchRepositoryPolicy: "clean-git-root",
+        patchOperations: ["modify-existing-tracked-file"]
+    };
+}
+
 function runFixtureGit(projectRoot, args) {
     const result = spawnSync("git", args, {
         cwd: projectRoot,
@@ -104,6 +114,18 @@ async function createEnvironment(options = {}) {
     fs.mkdirSync(projectRoot, { recursive: true });
     fs.mkdirSync(codexHome, { recursive: true });
     fs.cpSync(sourceAppServerDir, appserverDir, { recursive: true });
+    if (options.legacyPatchProtocol) {
+        const sidecarServerPath = path.join(appserverDir, "sidecarServer.js");
+        const sidecarServerSource = fs.readFileSync(sidecarServerPath, "utf8");
+        const legacySidecarServerSource = sidecarServerSource.replace(
+            /^\s*\.\.\.getPatchProtocolProof\(\),?\r?\n/gm,
+            ""
+        );
+        if (legacySidecarServerSource === sidecarServerSource) {
+            throw new Error("routing fixture could not create legacy Sidecar protocol");
+        }
+        fs.writeFileSync(sidecarServerPath, legacySidecarServerSource, "utf8");
+    }
     fs.copyFileSync(path.join(sourcePluginDir, "runner.js"), path.join(pluginDir, "runner.js"));
     fs.copyFileSync(sourceFixture, path.join(pluginDir, "fake-codex-app-server.js"));
     fs.writeFileSync(
@@ -268,6 +290,19 @@ function metaPath(environment, jobId) {
     return path.join(environment.jobRoot, "meta", `${jobId}.json`);
 }
 
+function cleanupPaths(environment, jobId) {
+    const protocolPaths = require(path.join(environment.pluginDir, "appserver", "protocol.js"))
+        .jobPaths(environment.jobRoot, jobId);
+    return {
+        metaPath: protocolPaths.metaPath,
+        argsPath: path.join(environment.jobRoot, "meta", `${jobId}.args.json`),
+        outputPath: protocolPaths.outputPath,
+        logPath: path.join(environment.jobRoot, "logs", `${jobId}.log`),
+        patchPath: protocolPaths.patchPath,
+        codexOutputPath: protocolPaths.codexOutputPath
+    };
+}
+
 async function waitForMeta(environment, jobId, terminal = false) {
     await waitFor(() => {
         const meta = readJson(metaPath(environment, jobId));
@@ -325,6 +360,91 @@ function installAuthorizedAppServerPatch(environment, jobId, patchText = "diff -
     };
     protocol.writeJsonAtomic(paths.metaPath, meta);
     return { protocol, paths, meta, patchText };
+}
+
+function markArtifactOld(artifact, extra = {}) {
+    const meta = {
+        ...artifact.meta,
+        startedAt: "2000-01-01T00:00:00.000Z",
+        ...extra
+    };
+    artifact.protocol.writeJsonAtomic(artifact.paths.metaPath, meta);
+    artifact.meta = meta;
+    return meta;
+}
+
+const ARTIFACT_ROUTING_SENTINELS = Object.freeze([
+    "PATCH_BODY_SENTINEL diff --git a/secret-target.txt",
+    "COMMAND_OUTPUT_SENTINEL",
+    "secret-target.txt",
+    "TOOL_RESULT_SENTINEL"
+]);
+
+function writeArtifactRoutingSentinelOutput(environment, jobId) {
+    const paths = cleanupPaths(environment, jobId);
+    const codexJsonl = [
+        {
+            type: "item.completed",
+            item: {
+                type: "agent_message",
+                id: "agent-sentinel",
+                status: "completed",
+                text: "PATCH_BODY_SENTINEL diff --git a/secret-target.txt b/secret-target.txt"
+            }
+        },
+        {
+            type: "item.completed",
+            item: {
+                type: "command_execution",
+                id: "command-sentinel",
+                status: "completed",
+                command: "cat secret-target.txt",
+                exit_code: 0,
+                aggregated_output: "COMMAND_OUTPUT_SENTINEL"
+            }
+        },
+        {
+            type: "item.completed",
+            item: {
+                type: "file_change",
+                id: "file-change-sentinel",
+                status: "completed",
+                changes: [{ path: "secret-target.txt", kind: "update" }]
+            }
+        },
+        {
+            type: "item.completed",
+            item: {
+                type: "mcp_tool_call",
+                id: "tool-sentinel",
+                status: "completed",
+                name: "sentinel-tool",
+                result: "TOOL_RESULT_SENTINEL"
+            }
+        },
+        {
+            source: "codex-app-server",
+            method: "COMMAND_OUTPUT_SENTINEL",
+            params: {
+                threadId: "secret-target.txt",
+                turnId: "TOOL_RESULT_SENTINEL",
+                status: "PATCH_BODY_SENTINEL"
+            }
+        }
+    ].map(event => JSON.stringify(event)).join("\n") + "\n";
+
+    for (const filePath of [paths.outputPath, paths.codexOutputPath, paths.logPath]) {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, codexJsonl, "utf8");
+    }
+    return paths;
+}
+
+function assertNoArtifactRoutingSentinels(value, label) {
+    const serialized = JSON.stringify(value);
+    for (const sentinel of ARTIFACT_ROUTING_SENTINELS) {
+        assert.equal(serialized.includes(sentinel), false, `${label} leaked ${sentinel}`);
+    }
 }
 
 test("generateJobId stays unique in one second and matches the structured format", async () => {
@@ -1035,8 +1155,8 @@ test("capabilities observes without starting Sidecar and exposes both quotas", a
     }
 });
 
-test("live Sidecar status without patch protocol proof is never reported as supported", async () => {
-    const environment = await createEnvironment({ flag: "true", patchFlag: "true" });
+test("live old Sidecar status without patch protocol proof is never reported as supported", async () => {
+    const environment = await createEnvironment({ flag: "true", patchFlag: "true", legacyPatchProtocol: true });
     try {
         const run = await environment.invoke({
             command: "run",
@@ -1055,6 +1175,81 @@ test("live Sidecar status without patch protocol proof is never reported as supp
             capabilities.workers.find(worker => worker.name === "codex").supportsAppServerPatch,
             false
         );
+    } finally { await environment.cleanup(); }
+});
+
+test("new Sidecar proof is visible while patch flag is false and patch stays legacy", async () => {
+    const environment = await createEnvironment({ flag: "true", patchFlag: "false" });
+    try {
+        const analyze = await environment.invoke({
+            command: "run",
+            worker: "codex",
+            mode: "analyze",
+            projectPath: environment.projectRoot,
+            task: "[[FINAL=proof-visible]]"
+        });
+        assert.equal(analyze.status, "success");
+        await waitForMeta(environment, resultOf(analyze).jobId, true);
+
+        const capabilities = resultOf(await environment.invoke({ command: "capabilities" }));
+        assert.equal(capabilities.codexAppServerPatchProtocolSupport, true);
+        assert.equal(capabilities.codexAppServerPatchEnabled, false);
+        assert.equal(
+            capabilities.workers.find(worker => worker.name === "codex").supportsAppServerPatch,
+            false
+        );
+
+        const patch = await environment.invoke({
+            command: "run",
+            worker: "codex",
+            mode: "patch",
+            projectPath: environment.projectRoot,
+            task: "legacy patch remains selected"
+        });
+        assert.equal(patch.status, "success");
+        const meta = await waitForMeta(environment, resultOf(patch).jobId, true);
+        assert.equal(meta.executionBackend, "legacy-exec");
+        assert.equal(meta.requestedExecutionBackend, undefined);
+    } finally { await environment.cleanup(); }
+});
+
+test("complete proof plus patch flag is required before capabilities report support", async () => {
+    const environment = await createEnvironment({ flag: "true", patchFlag: "true" });
+    try {
+        const analyze = await environment.invoke({
+            command: "run",
+            worker: "codex",
+            mode: "analyze",
+            projectPath: environment.projectRoot,
+            task: "[[FINAL=proof-enabled]]"
+        });
+        assert.equal(analyze.status, "success");
+        await waitForMeta(environment, resultOf(analyze).jobId, true);
+
+        const capabilities = resultOf(await environment.invoke({ command: "capabilities" }));
+        assert.equal(capabilities.codexAppServerPatchProtocolSupport, true);
+        assert.equal(capabilities.codexAppServerPatchEnabled, true);
+        assert.equal(
+            capabilities.workers.find(worker => worker.name === "codex").supportsAppServerPatch,
+            true
+        );
+    } finally { await environment.cleanup(); }
+});
+
+test("old Sidecar proof rejects patch without creating a Job or falling back", async () => {
+    const environment = await createEnvironment({ flag: "false", patchFlag: "true", legacyPatchProtocol: true });
+    try {
+        const response = await environment.invoke({
+            command: "run",
+            worker: "codex",
+            mode: "patch",
+            projectPath: environment.projectRoot,
+            task: "old Sidecar must fail closed"
+        });
+        assert.equal(response.status, "error");
+        assert.equal(response.errorCode, "AICW_APP_SERVER_PATCH_UNSUPPORTED");
+        assert.equal(fs.existsSync(path.join(environment.jobRoot, "meta")), false);
+        assert.equal(response.fallbackFrom, undefined);
     } finally { await environment.cleanup(); }
 });
 
@@ -1188,7 +1383,7 @@ function fakePatchClient(submitState = {}, behavior = {}) {
         ensure: async () => {
             submitState.ensureCalls = (submitState.ensureCalls || 0) + 1;
             if (behavior.ensureError) throw behavior.ensureError;
-            return { status: "ready" };
+            return { status: "ready", ...patchProtocolProof() };
         },
         submitPatchJob: async params => {
             submitState.calls = (submitState.calls || 0) + 1;
@@ -1921,7 +2116,7 @@ test("patch trace, listJobs, and Monitor expose only safe patch status fields", 
             ...injected,
             patchFile: artifact.paths.patchPath,
             errorCode: "AICW_SAFE_ERROR"
-        }, `${artifact.meta.jobId}.json`);
+        }, artifact.paths.metaPath);
         assert.equal(payload.data.jobKind, "patch");
         assert.equal(payload.data.jobPhase, "completed");
         assert.equal(payload.data.patchAvailable, true);
@@ -1939,6 +2134,134 @@ test("patch trace, listJobs, and Monitor expose only safe patch status fields", 
             assert.equal(JSON.stringify(payload).includes(secret), false, `Monitor leaked ${secret}`);
         }
     } finally { await environment.cleanup(); }
+});
+
+test("Monitor fails closed when a completed public patch is tampered", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    try {
+        const artifact = installAuthorizedAppServerPatch(environment, "job_monitor_tampered");
+        fs.writeFileSync(artifact.paths.patchPath, "tampered monitor artifact", "utf8");
+        const monitor = require(sourceMonitor);
+        const payload = monitor.buildJobStatusPayload({
+            ...artifact.meta,
+            patchAvailable: true,
+            patchValidated: true,
+            applyCheckPassed: true,
+            baselineStable: true
+        }, artifact.paths.metaPath);
+        assert.equal(payload.data.patchAvailable, false);
+        assert.equal(payload.data.patchValidated, false);
+        assert.equal(payload.data.patchBytes, null);
+        assert.equal(payload.data.patchFileCount, null);
+        assert.equal(Object.prototype.hasOwnProperty.call(payload.data, "patchFile"), false);
+        assert.equal(JSON.stringify(payload).includes("tampered monitor artifact"), false);
+    } finally { await environment.cleanup(); }
+});
+
+test("Monitor verifier exceptions fail closed without affecting a legacy projection", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    try {
+        const monitorPath = require.resolve(sourceMonitor);
+        const protocolPath = require.resolve(path.join(sourcePluginDir, "appserver", "protocol.js"));
+        const protocol = require(protocolPath);
+        const originalMonitorModule = require.cache[monitorPath];
+        const originalVerifier = protocol.inspectAuthorizedPatchArtifact;
+        try {
+            const artifact = installAuthorizedAppServerPatch(environment, "job_monitor_verifier_error");
+            delete require.cache[monitorPath];
+            protocol.inspectAuthorizedPatchArtifact = () => {
+                throw new Error("injected verifier failure");
+            };
+            const monitor = require(sourceMonitor);
+            const patchPayload = monitor.buildJobStatusPayload(artifact.meta, artifact.paths.metaPath);
+            assert.equal(patchPayload.data.patchAvailable, false);
+            assert.equal(patchPayload.data.patchValidated, false);
+            assert.equal(patchPayload.data.patchBytes, null);
+
+            const legacyPayload = monitor.buildJobStatusPayload({
+                jobId: "job_monitor_legacy",
+                state: "completed",
+                worker: "codex",
+                mode: "patch",
+                executionBackend: "legacy-exec",
+                patchAvailable: true,
+                patchValidated: true,
+                applyCheckPassed: true,
+                baselineStable: true,
+                patchBytes: 12,
+                patchFileCount: 1
+            }, path.join(environment.jobRoot, "meta", "job_monitor_legacy.json"));
+            assert.equal(legacyPayload.data.patchAvailable, true);
+            assert.equal(legacyPayload.data.patchBytes, 12);
+        } finally {
+            protocol.inspectAuthorizedPatchArtifact = originalVerifier;
+            delete require.cache[monitorPath];
+            if (originalMonitorModule) require.cache[monitorPath] = originalMonitorModule;
+        }
+    } finally {
+        await environment.cleanup();
+    }
+});
+
+test("cleanupOldJobs precisely removes an authorized terminal app-server patch", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    try {
+        const artifact = installAuthorizedAppServerPatch(environment, "job_cleanup_authorized");
+        markArtifactOld(artifact);
+        const worker = require(environment.workerPath);
+        worker.cleanupOldJobs(7, 10);
+        assert.equal(fs.existsSync(artifact.paths.metaPath), false);
+        assert.equal(fs.existsSync(artifact.paths.patchPath), false);
+        assert.equal(fs.existsSync(artifact.paths.outputPath), false);
+        assert.equal(fs.existsSync(artifact.paths.codexOutputPath), false);
+    } finally { await environment.cleanup(); }
+});
+
+test("cleanupOldJobs keeps replaced, hash-mismatched, and drifted app-server artifacts", async () => {
+    for (const scenario of ["replacement", "hash-mismatch", "directory-drift"]) {
+        const environment = await createEnvironment({ patchFlag: "false" });
+        try {
+            const artifact = installAuthorizedAppServerPatch(environment, `job_cleanup_${scenario}`);
+            markArtifactOld(artifact);
+            if (scenario === "replacement") {
+                fs.renameSync(artifact.paths.patchPath, `${artifact.paths.patchPath}.original`);
+                fs.writeFileSync(artifact.paths.patchPath, "replacement artifact", "utf8");
+            } else if (scenario === "hash-mismatch") {
+                fs.writeFileSync(artifact.paths.patchPath, "hash-mismatch artifact", "utf8");
+            } else {
+                const patchDirectory = path.dirname(artifact.paths.patchPath);
+                fs.renameSync(patchDirectory, `${patchDirectory}.original`);
+                fs.mkdirSync(patchDirectory, { recursive: true });
+            }
+
+            const worker = require(environment.workerPath);
+            worker.cleanupOldJobs(7, 10);
+            assert.equal(fs.existsSync(artifact.paths.metaPath), true, `${scenario} must retain meta`);
+            if (scenario === "directory-drift") {
+                assert.equal(
+                    fs.existsSync(path.join(`${path.dirname(artifact.paths.patchPath)}.original`, path.basename(artifact.paths.patchPath))),
+                    true
+                );
+            } else {
+                assert.equal(fs.existsSync(artifact.paths.patchPath), true, `${scenario} must retain public artifact`);
+            }
+        } finally { await environment.cleanup(); }
+    }
+});
+
+test("cleanupOldJobs does not touch running or unknown app-server patch Jobs", async () => {
+    for (const state of ["running", "unknown"]) {
+        const environment = await createEnvironment({ patchFlag: "false" });
+        try {
+            const artifact = installAuthorizedAppServerPatch(environment, `job_cleanup_${state}`);
+            markArtifactOld(artifact, { state });
+            const worker = require(environment.workerPath);
+            worker.cleanupOldJobs(7, 10);
+            assert.equal(fs.existsSync(artifact.paths.metaPath), true);
+            assert.equal(fs.existsSync(artifact.paths.patchPath), true);
+            assert.equal(fs.existsSync(artifact.paths.outputPath), true);
+        } finally { await environment.cleanup(); }
+    }
 });
 
 test("completed app-server patch tamper or same-content replacement is unauthorized in full and compact", async () => {
@@ -2019,12 +2342,491 @@ test("legacy patch query keeps fixed-path compatibility in full and compact", as
         fs.writeFileSync(patchPath, "legacy patch", "utf8");
         fs.writeFileSync(metaPath(environment, jobId), JSON.stringify({
             jobId, state: "completed", worker: "codex", mode: "patch",
-            projectPath: environment.projectRoot, executionBackend: "legacy-exec", exitCode: 0
+            projectPath: environment.projectRoot, executionBackend: "legacy-exec", exitCode: 0,
+            startedAt: "2000-01-01T00:00:00.000Z"
         }), "utf8");
         for (const responseMode of ["full", "compact"]) {
             const result = resultOf(await environment.invoke({ command: "query", jobId, wait: false, responseMode }));
             assert.equal(result.patchFile, patchPath);
             assert.equal(result.patchAvailable, true);
         }
+        const monitor = require(sourceMonitor);
+        const monitorPayload = monitor.buildJobStatusPayload({
+            jobId,
+            state: "completed",
+            worker: "codex",
+            mode: "patch",
+            executionBackend: "legacy-exec",
+            patchAvailable: true,
+            patchValidated: false,
+            patchBytes: null,
+            patchFileCount: null
+        }, metaPath(environment, jobId));
+        assert.equal(monitorPayload.data.patchAvailable, true);
+        assert.equal(Object.prototype.hasOwnProperty.call(monitorPayload.data, "patchFile"), false);
+
+        const worker = require(environment.workerPath);
+        worker.cleanupOldJobs(7, 10);
+        assert.equal(fs.existsSync(patchPath), false);
+        assert.equal(fs.existsSync(metaPath(environment, jobId)), false);
+    } finally { await environment.cleanup(); }
+});
+
+test("classifyAppServerArtifactMeta is pure, marker-first, and fail closed", () => {
+    const protocol = require(path.join(sourceAppServerDir, "protocol.js"));
+    const classify = protocol.classifyAppServerArtifactMeta;
+    const markerFields = [
+        "patchContractVersion", "patchArtifactDirectoryIdentity", "patchArtifactPublicIdentity",
+        "patchArtifactNonce", "patchSha256", "patchBytes", "patchFileCount", "patchValidated",
+        "applyCheckPassed", "baselineStable", "gitRepoRoot", "baseHead", "baseTree", "baseStatusSha256"
+    ];
+
+    for (const field of markerFields) {
+        assert.equal(classify({ [field]: null }), "patch", field);
+    }
+    assert.equal(classify({ jobKind: "patch" }), "patch");
+    assert.equal(classify({ executionBackend: "codex-app-server", mode: "patch" }), "patch");
+    assert.equal(classify({
+        executionBackend: "legacy-exec",
+        requestedExecutionBackend: "codex-app-server",
+        mode: "patch"
+    }), "patch");
+    assert.equal(classify({ patchArtifactNonce: "bbbbbbbbbbbbbbbbbbbbbbbb" }), "patch");
+    assert.equal(classify({
+        executionBackend: "codex-app-server",
+        mode: "analyze",
+        patchSha256: "not-a-real-hash"
+    }), "patch");
+    assert.equal(classify({ executionBackend: "codex-app-server", mode: "analyze" }), "analyze");
+    assert.equal(classify({ executionBackend: "codex-app-server" }), "ambiguous");
+    assert.equal(classify({ requestedExecutionBackend: "codex-app-server", mode: "unknown" }), "ambiguous");
+    assert.equal(classify({
+        executionBackend: "codex-app-server",
+        mode: "analyze",
+        jobKind: "write"
+    }), "ambiguous");
+    assert.equal(classify({ mode: "patch" }), "legacy");
+    assert.equal(classify({ executionBackend: "legacy-exec", mode: "patch" }), "legacy");
+
+    const untouched = { executionBackend: "codex-app-server", mode: "analyze" };
+    const before = JSON.stringify(untouched);
+    assert.equal(classify(untouched), "analyze");
+    assert.equal(JSON.stringify(untouched), before);
+});
+
+test("query and listJobs keep missing-jobKind and rewritten-backend patches behind authorization", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    try {
+        const artifact = installAuthorizedAppServerPatch(environment, "job_routing_patch_classification");
+        const missingJobKind = { ...artifact.meta };
+        delete missingJobKind.jobKind;
+        artifact.protocol.writeJsonAtomic(artifact.paths.metaPath, missingJobKind);
+
+        for (const responseMode of ["full", "compact"]) {
+            const result = resultOf(await environment.invoke({
+                command: "query",
+                jobId: artifact.meta.jobId,
+                wait: false,
+                responseMode
+            }));
+            assert.equal(result.patchFile, artifact.paths.patchPath);
+            assert.equal(result.patchAvailable, true);
+            assert.equal(JSON.stringify(result).includes("MODEL_PATCH_BODY_MUST_NOT_RETURN"), false);
+        }
+
+        const listed = resultOf(await environment.invoke({ command: "listJobs", limit: 10 }));
+        const listedPatch = listed.jobs.find(job => job.jobId === artifact.meta.jobId);
+        assert.equal(listedPatch.patchAvailable, true);
+        assert.equal(listedPatch.patchValidated, true);
+
+        const rewrittenBackend = { ...missingJobKind, executionBackend: "legacy-exec" };
+        artifact.protocol.writeJsonAtomic(artifact.paths.metaPath, rewrittenBackend);
+        for (const responseMode of ["full", "compact"]) {
+            const result = resultOf(await environment.invoke({
+                command: "query",
+                jobId: artifact.meta.jobId,
+                wait: false,
+                responseMode
+            }));
+            assert.equal(result.patchFile, artifact.paths.patchPath);
+            assert.equal(result.patchAvailable, true);
+        }
+
+        fs.writeFileSync(artifact.paths.patchPath, "QUERY_TAMPERED_BODY", "utf8");
+        for (const responseMode of ["full", "compact"]) {
+            const result = resultOf(await environment.invoke({
+                command: "query",
+                jobId: artifact.meta.jobId,
+                wait: false,
+                responseMode
+            }));
+            assert.equal(result.patchFile, null);
+            assert.equal(result.patchAvailable, false);
+            assert.equal(JSON.stringify(result).includes("QUERY_TAMPERED_BODY"), false);
+        }
+    } finally { await environment.cleanup(); }
+});
+
+test("ambiguous app-server meta never projects a fixed patch in full, compact, or listJobs", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    try {
+        const protocol = require(path.join(environment.pluginDir, "appserver", "protocol.js"));
+        const jobId = "job_routing_ambiguous_projection";
+        const paths = protocol.jobPaths(environment.jobRoot, jobId);
+        fs.mkdirSync(path.dirname(paths.metaPath), { recursive: true });
+        fs.mkdirSync(path.dirname(paths.patchPath), { recursive: true });
+        fs.writeFileSync(paths.patchPath, "AMBIGUOUS_FIXED_PATH_BODY", "utf8");
+        fs.writeFileSync(paths.metaPath, JSON.stringify({
+            jobId,
+            state: "completed",
+            worker: "codex",
+            mode: "future-mode",
+            projectPath: environment.projectRoot,
+            executionBackend: "codex-app-server",
+            requestedExecutionBackend: "codex-app-server",
+            patchAvailable: true,
+            startedAt: "2000-01-01T00:00:00.000Z"
+        }), "utf8");
+
+        for (const responseMode of ["full", "compact"]) {
+            const result = resultOf(await environment.invoke({ command: "query", jobId, wait: false, responseMode }));
+            assert.equal(result.patchFile, null);
+            assert.equal(result.patchAvailable, false);
+            assert.equal(JSON.stringify(result).includes("AMBIGUOUS_FIXED_PATH_BODY"), false);
+        }
+        const listed = resultOf(await environment.invoke({ command: "listJobs", limit: 10 }));
+        const listedJob = listed.jobs.find(job => job.jobId === jobId);
+        assert.equal(listedJob.patchAvailable, false);
+        assert.equal(listedJob.patchValidated, false);
+        assert.equal(listedJob.patchBytes, null);
+        assert.equal(fs.existsSync(paths.patchPath), true);
+    } finally { await environment.cleanup(); }
+});
+
+test("Monitor sends missing-jobKind, rewritten-backend, and marker-only patches through the verifier", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    const monitorPath = require.resolve(sourceMonitor);
+    const protocolPath = require.resolve(path.join(sourcePluginDir, "appserver", "protocol.js"));
+    const protocol = require(protocolPath);
+    const originalMonitorModule = require.cache[monitorPath];
+    const originalVerifier = protocol.inspectAuthorizedPatchArtifact;
+    try {
+        const artifact = installAuthorizedAppServerPatch(environment, "job_monitor_classification");
+        delete require.cache[monitorPath];
+        let verifierCalls = 0;
+        protocol.inspectAuthorizedPatchArtifact = (...args) => {
+            verifierCalls++;
+            return originalVerifier(...args);
+        };
+        const monitor = require(sourceMonitor);
+        const missingJobKind = { ...artifact.meta };
+        delete missingJobKind.jobKind;
+        const rewrittenBackend = { ...missingJobKind, executionBackend: "legacy-exec" };
+        const markerOnly = { ...artifact.meta };
+        delete markerOnly.executionBackend;
+        delete markerOnly.requestedExecutionBackend;
+        delete markerOnly.mode;
+        delete markerOnly.jobKind;
+
+        for (const variant of [missingJobKind, rewrittenBackend, markerOnly]) {
+            const before = verifierCalls;
+            const payload = monitor.buildJobStatusPayload(variant, artifact.paths.metaPath);
+            assert.equal(payload.data.patchAvailable, true);
+            assert.equal(payload.data.patchValidated, true);
+            assert.ok(verifierCalls > before);
+            assert.equal(JSON.stringify(payload).includes(artifact.paths.patchPath), false);
+        }
+
+        const ambiguous = {
+            jobId: "job_monitor_ambiguous",
+            state: "completed",
+            worker: "codex",
+            mode: "future-mode",
+            executionBackend: "codex-app-server",
+            requestedExecutionBackend: "codex-app-server",
+            patchAvailable: true
+        };
+        const beforeAmbiguous = verifierCalls;
+        const ambiguousPayload = monitor.buildJobStatusPayload(ambiguous, artifact.paths.metaPath);
+        assert.equal(verifierCalls, beforeAmbiguous);
+        assert.equal(ambiguousPayload.data.patchAvailable, false);
+        assert.equal(ambiguousPayload.data.patchValidated, false);
+        assert.equal(ambiguousPayload.data.patchBytes, null);
+        assert.equal(ambiguousPayload.data.patchFileCount, null);
+    } finally {
+        protocol.inspectAuthorizedPatchArtifact = originalVerifier;
+        delete require.cache[monitorPath];
+        if (originalMonitorModule) require.cache[monitorPath] = originalMonitorModule;
+        await environment.cleanup();
+    }
+});
+
+test("cleanupOldJobs authorizes missing-jobKind patches and retains replacements or hash mismatches", async () => {
+    {
+        const environment = await createEnvironment({ patchFlag: "false" });
+        try {
+            const artifact = installAuthorizedAppServerPatch(environment, "job_cleanup_missing_jobKind");
+            delete artifact.meta.jobKind;
+            markArtifactOld(artifact);
+            const worker = require(environment.workerPath);
+            worker.cleanupOldJobs(7, 10);
+            assert.equal(fs.existsSync(artifact.paths.metaPath), false);
+            assert.equal(fs.existsSync(artifact.paths.patchPath), false);
+            assert.equal(fs.existsSync(artifact.paths.outputPath), false);
+            assert.equal(fs.existsSync(artifact.paths.codexOutputPath), false);
+        } finally { await environment.cleanup(); }
+    }
+
+    for (const scenario of ["replacement", "hash-mismatch"]) {
+        const environment = await createEnvironment({ patchFlag: "false" });
+        try {
+            const artifact = installAuthorizedAppServerPatch(environment, `job_cleanup_missing_jobKind_${scenario}`);
+            delete artifact.meta.jobKind;
+            markArtifactOld(artifact);
+            if (scenario === "replacement") {
+                fs.renameSync(artifact.paths.patchPath, `${artifact.paths.patchPath}.original`);
+                fs.writeFileSync(artifact.paths.patchPath, "MISSING_JOBKIND_REPLACEMENT", "utf8");
+            } else {
+                fs.writeFileSync(artifact.paths.patchPath, "MISSING_JOBKIND_HASH_MISMATCH", "utf8");
+            }
+            const worker = require(environment.workerPath);
+            worker.cleanupOldJobs(7, 10);
+            assert.equal(fs.existsSync(artifact.paths.metaPath), true, `${scenario} must retain meta`);
+            assert.equal(fs.existsSync(artifact.paths.patchPath), true, `${scenario} must retain public artifact`);
+        } finally { await environment.cleanup(); }
+    }
+});
+
+test("cleanupOldJobs skips ambiguous meta and never unlinks its fixed patch", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    try {
+        const jobId = "job_cleanup_ambiguous_projection";
+        const paths = cleanupPaths(environment, jobId);
+        for (const filePath of [paths.metaPath, paths.argsPath, paths.outputPath, paths.logPath, paths.patchPath, paths.codexOutputPath]) {
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            fs.writeFileSync(filePath, `AMBIGUOUS_${path.basename(filePath)}`, "utf8");
+        }
+        fs.writeFileSync(paths.metaPath, JSON.stringify({
+            jobId,
+            state: "completed",
+            worker: "codex",
+            mode: "future-mode",
+            executionBackend: "codex-app-server",
+            requestedExecutionBackend: "codex-app-server",
+            patchAvailable: true,
+            startedAt: "2000-01-01T00:00:00.000Z"
+        }), "utf8");
+        const worker = require(environment.workerPath);
+        worker.cleanupOldJobs(7, 10);
+        for (const filePath of [paths.metaPath, paths.argsPath, paths.outputPath, paths.logPath, paths.patchPath, paths.codexOutputPath]) {
+            assert.equal(fs.existsSync(filePath), true, `ambiguous cleanup retained ${path.basename(filePath)}`);
+        }
+    } finally { await environment.cleanup(); }
+});
+
+test("cleanupOldJobs analyzes without deleting an analyze Job fixed patch", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    try {
+        const jobId = "job_cleanup_analyze_projection";
+        const paths = cleanupPaths(environment, jobId);
+        for (const filePath of [paths.metaPath, paths.argsPath, paths.outputPath, paths.logPath, paths.patchPath, paths.codexOutputPath]) {
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            fs.writeFileSync(filePath, `ANALYZE_${path.basename(filePath)}`, "utf8");
+        }
+        fs.writeFileSync(paths.metaPath, JSON.stringify({
+            jobId,
+            state: "completed",
+            worker: "codex",
+            mode: "analyze",
+            executionBackend: "codex-app-server",
+            requestedExecutionBackend: "codex-app-server",
+            startedAt: "2000-01-01T00:00:00.000Z"
+        }), "utf8");
+        const worker = require(environment.workerPath);
+        worker.cleanupOldJobs(7, 10);
+        for (const filePath of [paths.metaPath, paths.argsPath, paths.outputPath, paths.logPath, paths.codexOutputPath]) {
+            assert.equal(fs.existsSync(filePath), false, `analyze cleanup removed ${path.basename(filePath)}`);
+        }
+        assert.equal(fs.existsSync(paths.patchPath), true);
+    } finally { await environment.cleanup(); }
+});
+
+test("cleanupOldJobs preserves all artifacts when meta filename and jobId disagree", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    try {
+        const localId = "job_cleanup_filename_binding";
+        const otherId = "job_cleanup_other_job";
+        const localPaths = cleanupPaths(environment, localId);
+        const otherPaths = cleanupPaths(environment, otherId);
+        for (const filePath of [localPaths.metaPath, localPaths.argsPath, localPaths.outputPath, localPaths.logPath, localPaths.patchPath, localPaths.codexOutputPath,
+            otherPaths.metaPath, otherPaths.argsPath, otherPaths.outputPath, otherPaths.logPath, otherPaths.patchPath, otherPaths.codexOutputPath]) {
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            fs.writeFileSync(filePath, `BINDING_${path.basename(filePath)}`, "utf8");
+        }
+        fs.writeFileSync(localPaths.metaPath, JSON.stringify({
+            jobId: otherId,
+            state: "completed",
+            worker: "codex",
+            mode: "future-mode",
+            executionBackend: "codex-app-server",
+            requestedExecutionBackend: "codex-app-server",
+            patchAvailable: true,
+            startedAt: "2000-01-01T00:00:00.000Z"
+        }), "utf8");
+        fs.writeFileSync(otherPaths.metaPath, JSON.stringify({
+            jobId: otherId,
+            state: "completed",
+            worker: "codex",
+            mode: "patch",
+            executionBackend: "legacy-exec",
+            startedAt: new Date().toISOString()
+        }), "utf8");
+        const worker = require(environment.workerPath);
+        worker.cleanupOldJobs(7, 10);
+        for (const filePath of [localPaths.metaPath, localPaths.argsPath, localPaths.outputPath, localPaths.logPath, localPaths.patchPath, localPaths.codexOutputPath,
+            otherPaths.metaPath, otherPaths.argsPath, otherPaths.outputPath, otherPaths.logPath, otherPaths.patchPath, otherPaths.codexOutputPath]) {
+            assert.equal(fs.existsSync(filePath), true, `filename binding retained ${path.basename(filePath)}`);
+        }
+    } finally { await environment.cleanup(); }
+});
+
+test("marker-only app-server patches never downgrade to legacy output or JSONL parsing", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    try {
+        const artifact = installAuthorizedAppServerPatch(environment, "job_routing_marker_only", "diff --git a/authorized.txt b/authorized.txt\n");
+        const paths = writeArtifactRoutingSentinelOutput(environment, artifact.meta.jobId);
+        const markerOnly = {
+            ...artifact.meta,
+            startedAt: "2026-08-30T00:00:00.000Z",
+            completedAt: "2026-08-30T00:00:01.000Z"
+        };
+        for (const field of ["executionBackend", "requestedExecutionBackend", "mode", "jobKind"]) {
+            delete markerOnly[field];
+        }
+
+        const variants = [
+            ["both-backends-deleted", markerOnly],
+            ["both-backends-rewritten", {
+                ...markerOnly,
+                executionBackend: "legacy-exec",
+                requestedExecutionBackend: "legacy-exec"
+            }]
+        ];
+        for (const [variantName, meta] of variants) {
+            artifact.protocol.writeJsonAtomic(artifact.paths.metaPath, meta);
+            for (const traceMode of ["events", "raw"]) {
+                const trace = resultOf(await environment.invoke({
+                    command: "trace",
+                    jobId: artifact.meta.jobId,
+                    traceMode
+                }));
+                assertNoArtifactRoutingSentinels(trace, `${variantName} trace ${traceMode}`);
+                assert.equal(trace.jobPhase, "completed");
+            }
+            for (const responseMode of ["full", "compact"]) {
+                const result = resultOf(await environment.invoke({
+                    command: "query",
+                    jobId: artifact.meta.jobId,
+                    wait: false,
+                    responseMode,
+                    ...(responseMode === "full" ? { traceMode: "events" } : {})
+                }));
+                assertNoArtifactRoutingSentinels(result, `${variantName} query ${responseMode}`);
+                assert.equal(result.patchFile, paths.patchPath);
+                assert.equal(result.patchAvailable, true);
+                if (responseMode === "full") {
+                    assert.equal(result.output, "");
+                    assert.equal(result.logSummary, "");
+                }
+            }
+        }
+
+        const running = { ...markerOnly, state: "running", completedAt: null };
+        artifact.protocol.writeJsonAtomic(artifact.paths.metaPath, running);
+        for (const traceMode of ["events", "raw"]) {
+            const trace = resultOf(await environment.invoke({
+                command: "trace",
+                jobId: artifact.meta.jobId,
+                traceMode
+            }));
+            assertNoArtifactRoutingSentinels(trace, `marker-only running trace ${traceMode}`);
+        }
+        for (const responseMode of ["full", "compact"]) {
+            const result = resultOf(await environment.invoke({
+                command: "query",
+                jobId: artifact.meta.jobId,
+                wait: false,
+                responseMode,
+                ...(responseMode === "full" ? { traceMode: "raw" } : {})
+            }));
+            assertNoArtifactRoutingSentinels(result, `marker-only running query ${responseMode}`);
+            assert.equal(result.patchFile, null);
+            assert.equal(result.patchAvailable, false);
+            if (responseMode === "full") {
+                assert.equal(Object.prototype.hasOwnProperty.call(result, "output"), false);
+                assert.equal(Object.prototype.hasOwnProperty.call(result, "logSummary"), false);
+            }
+        }
+    } finally { await environment.cleanup(); }
+});
+
+test("ambiguous app-server artifacts fail closed across full, compact, and trace surfaces", async () => {
+    const environment = await createEnvironment({ patchFlag: "false" });
+    try {
+        const jobId = "job_routing_ambiguous_output";
+        const paths = writeArtifactRoutingSentinelOutput(environment, jobId);
+        fs.mkdirSync(path.dirname(paths.patchPath), { recursive: true });
+        fs.writeFileSync(paths.patchPath, "AMBIGUOUS_FIXED_PATH_BODY", "utf8");
+        const meta = {
+            jobId,
+            state: "completed",
+            worker: "codex",
+            mode: "future-mode",
+            projectPath: environment.projectRoot,
+            executionBackend: "codex-app-server",
+            requestedExecutionBackend: "codex-app-server",
+            patchAvailable: true,
+            warnings: [{ message: "COMMAND_OUTPUT_SENTINEL" }],
+            startedAt: "2026-08-30T00:00:00.000Z",
+            completedAt: "2026-08-30T00:00:01.000Z"
+        };
+        const protocol = require(path.join(environment.pluginDir, "appserver", "protocol.js"));
+        protocol.writeJsonAtomic(paths.metaPath, meta);
+
+        for (const traceMode of ["events", "raw"]) {
+            const trace = resultOf(await environment.invoke({
+                command: "trace",
+                jobId,
+                traceMode
+            }));
+            assertNoArtifactRoutingSentinels(trace, `ambiguous trace ${traceMode}`);
+            assert.equal(trace.patchFile, null);
+            assert.equal(trace.patchAvailable, false);
+            assert.equal(trace.jobPhase, null);
+        }
+        for (const traceMode of ["events", "raw"]) {
+            const full = resultOf(await environment.invoke({
+                command: "query",
+                jobId,
+                wait: false,
+                responseMode: "full",
+                traceMode
+            }));
+            assertNoArtifactRoutingSentinels(full, `ambiguous full ${traceMode}`);
+            assert.equal(full.patchFile, null);
+            assert.equal(full.patchAvailable, false);
+            assert.equal(full.output, "");
+            assert.equal(full.logSummary, "");
+        }
+        const compact = resultOf(await environment.invoke({
+            command: "query",
+            jobId,
+            wait: false,
+            responseMode: "compact"
+        }));
+        assertNoArtifactRoutingSentinels(compact, "ambiguous compact");
+        assert.equal(compact.patchFile, null);
+        assert.equal(compact.patchAvailable, false);
+        assert.equal(fs.existsSync(paths.patchPath), true);
     } finally { await environment.cleanup(); }
 });

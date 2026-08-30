@@ -20,7 +20,11 @@ const {
     updateJobMetaLocked,
     writeJsonAtomic,
     createJsonExclusive,
-    inspectAuthorizedPatchArtifact
+    inspectAuthorizedPatchArtifact,
+    removePatchArtifactExact,
+    classifyAppServerArtifactMeta,
+    assertJobId,
+    isPatchProtocolProof
 } = require("./appserver/protocol");
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -120,10 +124,7 @@ function createSidecarClient(options = {}) {
 }
 
 function isAppServerMeta(meta) {
-    if (Object.prototype.hasOwnProperty.call(meta || {}, "executionBackend")) {
-        return meta.executionBackend === APP_SERVER_BACKEND;
-    }
-    return meta?.requestedExecutionBackend === APP_SERVER_BACKEND;
+    return classifyAppServerArtifactMeta(meta) !== "legacy";
 }
 
 function isCodexAppServerAnalyzeRoute(worker, mode) {
@@ -1374,9 +1375,62 @@ function buildAppServerPatchTracePayload(meta, traceMode) {
     };
 }
 
+function normalizeSafeArtifactState(meta) {
+    const state = String(meta?.state || "").trim().toLowerCase();
+    return ["running", ...TERMINAL_STATES].includes(state) ? state : null;
+}
+
+function safeArtifactErrorCode(meta) {
+    const errorCode = String(meta?.errorCode || "").trim();
+    return /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/.test(errorCode) ? errorCode : null;
+}
+
+function safeArtifactTimestamp(value) {
+    const timestamp = String(value || "").trim();
+    return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(timestamp)
+        ? timestamp
+        : null;
+}
+
+function buildAmbiguousAppServerTracePayload(meta, traceMode) {
+    const payload = { traceMode };
+    if (traceMode === "summary") return payload;
+
+    const event = {
+        type: "artifact_state",
+        state: normalizeSafeArtifactState(meta),
+        phase: null,
+        errorCode: safeArtifactErrorCode(meta),
+        startedAt: safeArtifactTimestamp(meta?.startedAt),
+        completedAt: safeArtifactTimestamp(meta?.completedAt),
+        sequence: 1
+    };
+    if (traceMode === "raw") {
+        return {
+            ...payload,
+            rawTrace: JSON.stringify(event),
+            traceNote: "app-server 元数据分类不明确，已拒绝读取输出并仅返回安全状态字段。"
+        };
+    }
+    return {
+        ...payload,
+        executionTrace: [event],
+        traceText: `[app-server] state=${event.state || "unknown"}${event.errorCode ? ` (${event.errorCode})` : ""}`,
+        traceNote: "app-server 元数据分类不明确，已拒绝读取输出并仅返回安全状态字段。"
+    };
+}
+
 function buildTracePayload(jobId, meta, overrideMode = null) {
     const traceMode = normalizeTraceMode(overrideMode, meta?.traceMode || CFG.defaultTraceMode) || "summary";
     const payload = { traceMode };
+    const artifactClass = classifyAppServerArtifactMeta(meta);
+
+    if (artifactClass === "patch") {
+        return buildAppServerPatchTracePayload(meta, traceMode);
+    }
+    if (artifactClass === "ambiguous") {
+        return buildAmbiguousAppServerTracePayload(meta, traceMode);
+    }
 
     if (traceMode === "summary") return payload;
 
@@ -1388,10 +1442,7 @@ function buildTracePayload(jobId, meta, overrideMode = null) {
     }
 
     const p = jobPaths(jobId);
-    if (isAppServerMeta(meta)) {
-        if (isAppServerPatchMeta(meta)) {
-            return buildAppServerPatchTracePayload(meta, traceMode);
-        }
+    if (artifactClass === "analyze") {
         if (traceMode === "raw") {
             return {
                 ...payload,
@@ -1426,18 +1477,20 @@ function buildTracePayload(jobId, meta, overrideMode = null) {
 
 function buildResult(jobId, meta, traceModeOverride = null) {
     const p = jobPaths(jobId);
-    const appServerPatch = isAppServerPatchMeta(meta);
+    const artifactClass = classifyAppServerArtifactMeta(meta);
     const patchProjection = buildPatchArtifactProjection(jobId, meta);
+    const canReadOutput = artifactClass === "legacy" || artifactClass === "analyze";
 
     let output = "";
     // Codex 的 stdout 是 JSONL 事件流，直接从中提取报告会混入转义符和事件外壳。
     // 对 Codex 优先使用 --output-last-message 生成的纯文本最终报告；
     // 原始 JSONL 仍保留在 outputFile 中，供故障排查与完整审计。
-    const preferredOutputPath =
-        meta?.worker === "codex" && fs.existsSync(p.codexOutput)
+    const preferredOutputPath = canReadOutput
+        ? (meta?.worker === "codex" && fs.existsSync(p.codexOutput)
             ? p.codexOutput
-            : p.output;
-    if (!appServerPatch && fs.existsSync(preferredOutputPath)) {
+            : p.output)
+        : null;
+    if (preferredOutputPath && fs.existsSync(preferredOutputPath)) {
         const raw = fs.readFileSync(preferredOutputPath, "utf8");
         const masked = redact(raw);
         output = masked.length > 50000
@@ -1446,7 +1499,7 @@ function buildResult(jobId, meta, traceModeOverride = null) {
     }
 
     let logSummary = "";
-    if (!appServerPatch && fs.existsSync(p.log)) {
+    if (canReadOutput && fs.existsSync(p.log)) {
         const rawLog = fs.readFileSync(p.log, "utf8");
         const ml = redact(rawLog);
         logSummary = ml.length > 5000 ? "[日志已截断]\n" + ml.slice(-5000) : ml;
@@ -1527,7 +1580,7 @@ function buildResult(jobId, meta, traceModeOverride = null) {
 }
 
 function checkAndMarkDead(meta, jobId, source) {
-    if (isAppServerMeta(meta)) return meta;
+    if (classifyAppServerArtifactMeta(meta) !== "legacy") return meta;
     if (meta.state === "running" && meta.pid && !isProcessRunning(meta.pid)) {
         const workerPid = meta.workerPid || meta.opencodePid;
         if (workerPid && isProcessRunning(workerPid)) {
@@ -1559,34 +1612,104 @@ function countActiveJobs() {
         try {
             let m = JSON.parse(fs.readFileSync(path.join(metaDir, file), "utf8"));
             m = checkAndMarkDead(m, m.jobId, "concurrencyGuard");
-            if (m.state === "running" && !isAppServerMeta(m) &&
+            if (m.state === "running" && classifyAppServerArtifactMeta(m) === "legacy" &&
                 (!m.executionBackend || m.executionBackend === LEGACY_BACKEND)) count++;
         } catch {}
     }
     return count;
 }
 
+function hasPathEntry(filePath) {
+    try {
+        fs.lstatSync(filePath);
+        return true;
+    } catch (error) {
+        return error?.code !== "ENOENT";
+    }
+}
+
+function recordPatchCleanupFailure(jobId, code) {
+    const safeJobId = String(jobId || "unknown")
+        .replace(/[^A-Za-z0-9_-]/g, "_")
+        .slice(0, 128);
+    const safeCode = String(code || "AICW_PATCH_ARTIFACT_CLEANUP_FAILED").slice(0, 96);
+    console.error(`[AICodeWorker] app-server patch cleanup skipped job=${safeJobId} code=${safeCode}`);
+}
+
+function removeAuthorizedAppServerPatch(jobId, meta, patchPath) {
+    if (!hasPathEntry(patchPath)) {
+        recordPatchCleanupFailure(jobId, "AICW_PATCH_PUBLIC_ARTIFACT_MISSING");
+        return false;
+    }
+
+    let authorization;
+    try {
+        authorization = inspectAuthorizedPatchArtifact(CFG.jobRoot, jobId, meta);
+    } catch {
+        authorization = { authorized: false };
+    }
+    if (authorization?.authorized !== true) {
+        recordPatchCleanupFailure(jobId, authorization?.code || "AICW_PATCH_PUBLIC_ARTIFACT_UNAUTHORIZED");
+        return false;
+    }
+
+    let removed = false;
+    try {
+        removed = removePatchArtifactExact(patchPath, meta.patchArtifactDirectoryIdentity, {
+            jobRoot: CFG.jobRoot,
+            expectedIdentity: meta.patchArtifactPublicIdentity,
+            expectedSha256: meta.patchSha256,
+            expectedBytes: meta.patchBytes,
+            failureCode: "AICW_PATCH_ARTIFACT_CLEANUP_FAILED"
+        });
+    } catch {}
+    if (!removed) recordPatchCleanupFailure(jobId, "AICW_PATCH_ARTIFACT_CLEANUP_FAILED");
+    return removed;
+}
+
 /** 清理旧 job 文件：删除超过 retainDays 天且状态非 running 的全部文件。
- *  在 listJobs 和 run 时触发，每次最多清理 50 个，避免阻塞主流程。 */
+ *  在 listJobs 和 run 时触发，每次最多清理 maxClean 个，避免阻塞主流程。 */
 function cleanupOldJobs(retainDays = 7, maxClean = 50) {
     const metaDir = path.join(CFG.jobRoot, "meta");
     let files = [];
     try { files = fs.readdirSync(metaDir).filter(f => f.endsWith(".json") && !f.endsWith(".args.json")); }
     catch { return; }
     const cutoff = Date.now() - retainDays * 86400 * 1000;
+    const cleanLimit = Math.max(0, Number.isFinite(Number(maxClean)) ? Math.floor(Number(maxClean)) : 50);
     let cleaned = 0;
     for (const file of files) {
-        if (cleaned >= 50) break;
+        if (cleaned >= cleanLimit) break;
         const metaPath = path.join(metaDir, file);
         try {
             const m = JSON.parse(fs.readFileSync(metaPath, "utf8"));
-            if (m.state === "running") continue; // 跑着的绝不清
+            const metaFileJobId = file.slice(0, -".json".length);
+            const artifactClass = classifyAppServerArtifactMeta(m);
+            if (m?.jobId !== metaFileJobId) {
+                if (artifactClass !== "legacy") {
+                    recordPatchCleanupFailure(metaFileJobId || file, "AICW_PATCH_JOB_ID_MISMATCH");
+                }
+                continue;
+            }
+            if (artifactClass === "ambiguous") continue;
+            const jobId = metaFileJobId;
+            const appServerPatch = artifactClass === "patch";
+            const appServerAnalyze = artifactClass === "analyze";
+            if (appServerPatch && !TERMINAL_STATES.has(m.state)) continue;
+            if (artifactClass === "legacy" && m.state === "running") continue; // 跑着的绝不清
             // 优先用 meta.startedAt（不受 rsync/cp 刷新 mtime），回落到文件 mtime
             const jobTime = m.startedAt ? new Date(m.startedAt).getTime() : fs.statSync(metaPath).mtimeMs;
-            if (jobTime > cutoff) continue;
-            // 删 meta、args、output、log、patch 五个关联文件
-            const p = jobPaths(m.jobId);
-            for (const fp of [metaPath, p.args, p.output, p.log, p.patch, p.codexOutput]) {
+            if (!Number.isFinite(jobTime) || jobTime > cutoff) continue;
+            let p;
+            try { assertJobId(jobId); p = jobPaths(jobId); } catch (error) {
+                if (appServerPatch) recordPatchCleanupFailure(jobId || file, error?.code || "AICW_PATCH_JOB_ID_INVALID");
+                continue;
+            }
+            if (appServerPatch && !removeAuthorizedAppServerPatch(jobId, m, p.patch)) continue;
+            // app-server patch 的 public artifact 已由共享 verifier 精确删除；legacy 仍沿用原清理集合。
+            const relatedFiles = appServerPatch || appServerAnalyze
+                ? [metaPath, p.args, p.output, p.log, p.codexOutput]
+                : [metaPath, p.args, p.output, p.log, p.patch, p.codexOutput];
+            for (const fp of relatedFiles) {
                 try { if (fp && fs.existsSync(fp)) fs.unlinkSync(fp); } catch {}
             }
             cleaned++;
@@ -1690,7 +1813,8 @@ function isMachineCompactSummaryLine(line) {
 }
 
 function readCompactSummary(jobId, meta) {
-    if (isAppServerPatchMeta(meta)) {
+    const artifactClass = classifyAppServerArtifactMeta(meta);
+    if (artifactClass !== "legacy" && artifactClass !== "analyze") {
         return compactStateSummary(meta);
     }
     const p = jobPaths(jobId);
@@ -1751,12 +1875,13 @@ function isCodexAppServerPatchRoute(worker, mode) {
 }
 
 function isAppServerPatchMeta(meta) {
-    return isAppServerMeta(meta) && meta?.jobKind === "patch";
+    return classifyAppServerArtifactMeta(meta) === "patch";
 }
 
 function buildPatchArtifactProjection(jobId, meta) {
-    const p = jobPaths(jobId);
-    if (isAppServerPatchMeta(meta)) {
+    const artifactClass = classifyAppServerArtifactMeta(meta);
+    if (artifactClass === "patch") {
+        const p = jobPaths(jobId);
         let inspected = { authorized: false };
         try {
             inspected = inspectAuthorizedPatchArtifact(CFG.jobRoot, jobId, meta);
@@ -1780,12 +1905,29 @@ function buildPatchArtifactProjection(jobId, meta) {
             jobPhase: normalizePatchTracePhase(meta)
         };
     }
+    if (artifactClass === "analyze" || artifactClass === "ambiguous") {
+        return {
+            patchFile: null,
+            patchAvailable: false,
+            patchSha256: null,
+            patchBytes: null,
+            patchFileCount: null,
+            patchContractVersion: null,
+            baseHead: null,
+            baselineStable: false,
+            applyCheckPassed: false,
+            patchValidated: false,
+            jobPhase: null
+        };
+    }
+    const p = jobPaths(jobId);
     const patchFile = fs.existsSync(p.patch) ? p.patch : null;
     return { patchFile, patchAvailable: Boolean(patchFile) };
 }
 
 function buildCompactQueryResult(jobId, meta, options = {}) {
     const p = jobPaths(jobId);
+    const artifactClass = classifyAppServerArtifactMeta(meta);
     const terminal = TERMINAL_STATES.has(meta?.state);
     let summary = options.summary;
     if (summary === undefined) summary = readCompactSummary(jobId, meta);
@@ -1802,7 +1944,7 @@ function buildCompactQueryResult(jobId, meta, options = {}) {
         codexModel: meta?.codexModel || null,
         reasoningEffortEffective:
             meta?.reasoningEffortEffective || meta?.reasoningEffort || null,
-        warnings: isAppServerPatchMeta(meta) ? [] : compactWarnings(meta?.warnings),
+        warnings: artifactClass === "legacy" ? compactWarnings(meta?.warnings) : [],
         summary: String(summary || "").slice(0, 240),
         outputFile: p.output,
         codexOutputFile: fs.existsSync(p.codexOutput) ? p.codexOutput : null,
@@ -1856,13 +1998,10 @@ function compactCapabilitiesResult(full) {
     };
 }
 
-function inspectPatchProtocolSupport(inspection) {
-    if (!CFG.enableCodexAppServerPatch) return false;
-    if (inspection?.patchProtocolSupported === true &&
-        Number(inspection?.patchContractVersion) === PATCH_CONTRACT_VERSION) {
-        return true;
-    }
-    return "unknown";
+function inspectPatchProtocolSupport(inspection, patchRouteEnabled = true) {
+    if (isPatchProtocolProof(inspection)) return true;
+    if (inspection?.patchProtocolSupported === false) return false;
+    return patchRouteEnabled ? "unknown" : false;
 }
 
 async function cmdCapabilities(input = {}) {
@@ -1876,7 +2015,8 @@ async function cmdCapabilities(input = {}) {
         maxConcurrency: CFG.appServerMaxConcurrentJobs,
         instanceId: null,
         pid: null,
-        errorCode: null
+        errorCode: null,
+        patchProtocolSupported: false
     };
     const appServerConfigured = CFG.enableCodexAppServerAnalyze || CFG.enableCodexAppServerPatch;
     if (appServerConfigured) {
@@ -1889,7 +2029,8 @@ async function cmdCapabilities(input = {}) {
                 maxConcurrency: CFG.appServerMaxConcurrentJobs,
                 instanceId: null,
                 pid: null,
-                errorCode: error?.code || "SIDECAR_INSPECTION_FAILED"
+                errorCode: error?.code || "SIDECAR_INSPECTION_FAILED",
+                patchProtocolSupported: "unknown"
             };
         }
     }
@@ -1909,7 +2050,10 @@ async function cmdCapabilities(input = {}) {
             : "";
     const codexCapabilities =
         resolveCodexModelCapabilities(requestedModel);
-    const patchProtocolSupport = inspectPatchProtocolSupport(appServerInspection);
+    const patchProtocolSupport = inspectPatchProtocolSupport(
+        appServerInspection,
+        CFG.enableCodexAppServerPatch
+    );
 
     const result = {
         status: "success",
@@ -1936,7 +2080,7 @@ async function cmdCapabilities(input = {}) {
                 supportsPerTaskModel: true,
                 supportsLegacyExec: true,
                 supportsAppServerAnalyze: CFG.enableCodexAppServerAnalyze,
-                supportsAppServerPatch: patchProtocolSupport === true,
+                supportsAppServerPatch: CFG.enableCodexAppServerPatch && patchProtocolSupport === true,
                 legacyMaxConcurrentJobs: CFG.maxConcurrentJobs,
                 appServerMaxConcurrentJobs: CFG.appServerMaxConcurrentJobs,
                 sandboxModes: [
@@ -2127,9 +2271,10 @@ function normalizeRunRequest(input = {}) {
 }
 
 function appServerSubmissionResult(jobId, meta) {
+    const artifactClass = classifyAppServerArtifactMeta(meta);
     if (TERMINAL_STATES.has(meta?.state)) {
         const result = buildResult(jobId, meta);
-        result.warnings = isAppServerPatchMeta(meta) ? [] : (meta.warnings || []);
+        result.warnings = artifactClass === "legacy" ? (meta.warnings || []) : [];
         return result;
     }
     const p = jobPaths(jobId);
@@ -2147,12 +2292,12 @@ function appServerSubmissionResult(jobId, meta) {
         reasoningEffortSupported: meta?.reasoningEffortSupported || [],
         modelDefaultReasoningEffort: meta?.modelDefaultReasoningEffort || null,
         configuredReasoningEffort: meta?.configuredReasoningEffort || null,
-        warnings: isAppServerPatchMeta(meta) ? [] : (meta?.warnings || []),
+        warnings: artifactClass === "legacy" ? (meta?.warnings || []) : [],
         outputFile: p.output,
         logFile: p.log,
-        ...(isAppServerPatchMeta(meta)
-            ? buildPatchArtifactProjection(jobId, meta)
-            : { patchFile: null }),
+        ...(artifactClass === "legacy"
+            ? { patchFile: null }
+            : buildPatchArtifactProjection(jobId, meta)),
         codexOutputFile: fs.existsSync(p.codexOutput) ? p.codexOutput : null,
         ...executionMetaPayload(meta),
         message: `任务已提交。使用 query 命令查询进度：command=query, jobId=${jobId}`
@@ -2604,7 +2749,13 @@ async function cmdRunAppServerPatch(prepared, dependencies = {}) {
 
     const client = dependencies.client || createSidecarClient();
     try {
-        await client.ensure();
+        const sidecarState = await client.ensure();
+        if (!isPatchProtocolProof(sidecarState)) {
+            return appServerErrorResult(null, {
+                error: "Codex app-server patch 协议未得到完整 Sidecar status proof，已安全拒绝。",
+                errorCode: "AICW_APP_SERVER_PATCH_UNSUPPORTED"
+            });
+        }
     } catch (error) {
         return appServerErrorResult(error, {
             error: "Codex app-server patch 当前不可用，未创建任务且未回退到 legacy。",
@@ -3132,7 +3283,7 @@ async function resolveRunAndWaitAfterWait(jobId, input = {}, dependencies = {}) 
     }
     if (meta && TERMINAL_STATES.has(meta.state)) {
         const result = build(jobId, meta);
-        result.warnings = isAppServerPatchMeta(meta) ? [] : (meta.warnings || []);
+        result.warnings = classifyAppServerArtifactMeta(meta) === "legacy" ? (meta.warnings || []) : [];
         return result;
     }
     return {
@@ -3140,7 +3291,7 @@ async function resolveRunAndWaitAfterWait(jobId, input = {}, dependencies = {}) 
         jobId,
         state: meta?.state || "unknown",
         errorCode: "AICW_RUN_AND_WAIT_CANCEL_UNCONFIRMED",
-        warnings: isAppServerPatchMeta(meta) ? [] : (meta?.warnings || []),
+        warnings: classifyAppServerArtifactMeta(meta) === "legacy" ? (meta?.warnings || []) : [],
         ...(meta?.startedAt ? { startedAt: meta.startedAt } : {}),
         hint: cancelResult?.error
             ? `任务等待耗尽，取消未确认：${String(cancelResult.error).slice(0, 200)}；未生成第二个 Job。`
@@ -3164,7 +3315,7 @@ async function cmdRunAndWait(input) {
         meta = checkAndMarkDead(meta, jobId, "run_and_wait");
         if (meta.state !== "running") {
             const result = buildResult(jobId, meta);
-            result.warnings = isAppServerPatchMeta(meta) ? [] : (meta.warnings || []);
+            result.warnings = classifyAppServerArtifactMeta(meta) === "legacy" ? (meta.warnings || []) : [];
             return result;
         }
     }
@@ -3229,12 +3380,12 @@ async function cmdQuery(input) {
         }
         return {
             status: "success", jobId, state: "running",
-            warnings: isAppServerPatchMeta(meta) ? [] : (meta.warnings || []),
+            warnings: classifyAppServerArtifactMeta(meta) === "legacy" ? (meta.warnings || []) : [],
             startedAt: meta.startedAt, suggestedWaitSec: 0,
             hint: shouldWait
                 ? "任务仍在运行，请再调用一次 query；也可用 command=trace 即时查看已有执行轨迹。"
                 : "任务仍在运行。本次 wait=false，已立即返回当前状态与已有轨迹。",
-            ...(isAppServerPatchMeta(meta) ? buildPatchArtifactProjection(jobId, meta) : {}),
+            ...(classifyAppServerArtifactMeta(meta) === "legacy" ? {} : buildPatchArtifactProjection(jobId, meta)),
             ...buildTracePayload(jobId, meta, traceModeOverride)
         };
     }
@@ -3256,8 +3407,9 @@ async function cmdTrace(input) {
     let meta = readMeta(jobId);
     if (!meta) return { status: "error", error: `Job "${jobId}" 不存在。` };
     meta = checkAndMarkDead(meta, jobId, "trace");
+    const artifactClass = classifyAppServerArtifactMeta(meta);
 
-    if (isAppServerPatchMeta(meta)) {
+    if (artifactClass === "patch") {
         return {
             status: "success",
             jobId,
@@ -3269,6 +3421,20 @@ async function cmdTrace(input) {
             errorCode: meta.errorCode || null,
             startedAt: meta.startedAt || null,
             completedAt: meta.completedAt || null,
+            ...buildTracePayload(jobId, meta, traceMode)
+        };
+    }
+    if (artifactClass === "ambiguous") {
+        return {
+            status: "success",
+            jobId,
+            state: normalizeSafeArtifactState(meta),
+            jobPhase: null,
+            errorCode: safeArtifactErrorCode(meta),
+            startedAt: safeArtifactTimestamp(meta?.startedAt),
+            completedAt: safeArtifactTimestamp(meta?.completedAt),
+            patchFile: null,
+            patchAvailable: false,
             ...buildTracePayload(jobId, meta, traceMode)
         };
     }
@@ -3318,12 +3484,15 @@ async function cmdListJobs(input) {
     for (const file of files) {
         try {
             let m = JSON.parse(fs.readFileSync(path.join(metaDir, file), "utf8"));
-            m = checkAndMarkDead(m, m.jobId, "listJobs");
-            const patchProjection = isAppServerPatchMeta(m)
-                ? buildPatchArtifactProjection(m.jobId, m)
-                : null;
+            const metaFileJobId = file.slice(0, -".json".length);
+            const artifactClass = classifyAppServerArtifactMeta(m);
+            if (m?.jobId !== metaFileJobId) continue;
+            m = checkAndMarkDead(m, metaFileJobId, "listJobs");
+            const patchProjection = artifactClass === "legacy"
+                ? null
+                : buildPatchArtifactProjection(metaFileJobId, m);
             jobs.push({
-                jobId: m.jobId, state: m.state, worker: m.worker,
+                jobId: metaFileJobId, state: m.state, worker: m.worker,
                 mode: m.mode, projectPath: m.projectPath,
                 jobKind: m.jobKind || null,
                 ...(patchProjection ? {
@@ -3550,6 +3719,7 @@ module.exports = {
     buildPatchArtifactProjection,
     buildCompactQueryResult,
     compactCapabilitiesResult,
+    cleanupOldJobs,
     executionMetaPayload,
     capTraceEvents,
     resolveRunAndWaitAfterWait,

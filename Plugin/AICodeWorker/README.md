@@ -159,6 +159,13 @@ mode: analyze
   更不开放 app-server write。
 - analyze 与 patch 共用 Sidecar 的 `maxConcurrency=2` 和 activeJobs 池。
 
+patch 路由还需要实际 Sidecar status 提供完整的正向 proof：
+`patchProtocolSupported=true`、`patchContractVersion=1`、`patchMaxBytes=524288`、
+`patchRepositoryPolicy="clean-git-root"`、`patchOperations=["modify-existing-tracked-file"]`。
+因此 `codexAppServerPatchProtocolSupport` 表示实际协议证明，
+`supportsAppServerPatch` 还会额外要求 patch flag=true；flag=false 时可以观察到新协议，
+但绝不宣称 patch route 已启用。缺字段或旧 Sidecar 只能是 unknown/false，不能乐观升级。
+
 app-server patch 只接受干净 Git 仓库根目录，并只允许修改现有、已 tracked 的 regular
 file。create/delete/rename、mode change、binary、submodule 一律拒绝。内核固定使用
 read-only sandbox、approval policy `never` 与禁用网络；调用方不能覆盖 cwd、sandbox、
@@ -182,6 +189,13 @@ closed/error、畸形响应或 request mismatch 都视为 submission unknown，�
 bytes 持续复验通过时，才返回 `patchFile`、SHA-256、字节数、文件数、base HEAD 和验证状态；
 否则 `patchFile=null, patchAvailable=false`。trace 仅返回安全阶段与错误码，不返回 delta、
 目标文件、Git stderr/status、candidate/nonce 或 artifact identity。
+
+Monitor 不信任 meta 中自行写入的 `patchAvailable`；每次投影都会对 app-server patch
+重新调用同一只读授权 verifier，只暴露 `patchAvailable`、验证布尔值、bytes 和 fileCount。
+制品缺失、篡改、目录漂移或 verifier 异常均降级为 false，不返回 patch 正文、target path、
+真实 artifact identity、nonce 或 Git 诊断。过期 Job 清理只处理 terminal Job，并用同一套
+固定目录、regular-file identity、hash 和 bytes 规则精确删除 public patch；证明不足时保留制品
+并记录有界安全错误，legacy 清理保持原兼容行为。
 
 即使 query 已授权，真正应用 patch 前仍必须重新确认仓库 HEAD 与工作树基线未变化，并再次
 执行 apply/check；query 的授权结果不是自动应用许可。

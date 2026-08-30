@@ -15,6 +15,60 @@ class SidecarError extends Error {
     }
 }
 
+const PATCH_PROTOCOL_PROOF = Object.freeze({
+    patchProtocolSupported: true,
+    patchContractVersion: 1,
+    patchMaxBytes: 524288,
+    patchRepositoryPolicy: "clean-git-root",
+    patchOperations: Object.freeze(["modify-existing-tracked-file"])
+});
+
+function getPatchProtocolProof() {
+    return {
+        ...PATCH_PROTOCOL_PROOF,
+        patchOperations: [...PATCH_PROTOCOL_PROOF.patchOperations]
+    };
+}
+
+function isPatchProtocolProof(value) {
+    return Boolean(value && typeof value === "object" && !Array.isArray(value) &&
+        value.patchProtocolSupported === true &&
+        value.patchContractVersion === PATCH_PROTOCOL_PROOF.patchContractVersion &&
+        value.patchMaxBytes === PATCH_PROTOCOL_PROOF.patchMaxBytes &&
+        value.patchRepositoryPolicy === PATCH_PROTOCOL_PROOF.patchRepositoryPolicy &&
+        Array.isArray(value.patchOperations) &&
+        value.patchOperations.length === PATCH_PROTOCOL_PROOF.patchOperations.length &&
+        value.patchOperations[0] === PATCH_PROTOCOL_PROOF.patchOperations[0]);
+}
+
+function projectPatchProtocolProof(value, missingState = "unknown") {
+    const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    const hasSupportedField = Object.prototype.hasOwnProperty.call(source, "patchProtocolSupported");
+    const supported = isPatchProtocolProof(source)
+        ? true
+        : source.patchProtocolSupported === false || hasSupportedField
+            ? false
+            : missingState === false
+                ? false
+                : "unknown";
+    return {
+        patchProtocolSupported: supported,
+        patchContractVersion: Number.isSafeInteger(source.patchContractVersion)
+            ? source.patchContractVersion
+            : null,
+        patchMaxBytes: Number.isSafeInteger(source.patchMaxBytes)
+            ? source.patchMaxBytes
+            : null,
+        patchRepositoryPolicy: typeof source.patchRepositoryPolicy === "string"
+            ? source.patchRepositoryPolicy
+            : null,
+        patchOperations: Array.isArray(source.patchOperations) &&
+            source.patchOperations.every(operation => typeof operation === "string")
+            ? source.patchOperations.slice(0, 8)
+            : null
+    };
+}
+
 function normalizeDirectory(value, name) {
     if (typeof value !== "string" || !value.trim()) {
         throw new SidecarError("INVALID_PATH", `${name} is required`);
@@ -48,6 +102,53 @@ function runtimePaths(pluginDir, jobRoot) {
 
 const JOB_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const META_UPDATE_SKIPPED = Symbol("META_UPDATE_SKIPPED");
+
+const PATCH_META_MARKER_FIELDS = Object.freeze([
+    "patchContractVersion",
+    "patchArtifactDirectoryIdentity",
+    "patchArtifactPublicIdentity",
+    "patchArtifactNonce",
+    "patchSha256",
+    "patchBytes",
+    "patchFileCount",
+    "patchValidated",
+    "applyCheckPassed",
+    "baselineStable",
+    "gitRepoRoot",
+    "baseHead",
+    "baseTree",
+    "baseStatusSha256"
+]);
+const LEGACY_PATCH_PROJECTION_FIELDS = Object.freeze([
+    "patchBytes",
+    "patchFileCount",
+    "patchValidated",
+    "applyCheckPassed",
+    "baselineStable"
+]);
+
+function classifyAppServerArtifactMeta(meta) {
+    const source = meta && typeof meta === "object" && !Array.isArray(meta) ? meta : {};
+    const hasOwn = field => Object.prototype.hasOwnProperty.call(source, field);
+    const hasPatchMarker = PATCH_META_MARKER_FIELDS.some(hasOwn);
+    const hasExplicitLegacyBackend = source.executionBackend === "legacy-exec" &&
+        source.requestedExecutionBackend !== "codex-app-server";
+    const legacyProjectionOnly = hasExplicitLegacyBackend && source.jobKind !== "patch" &&
+        PATCH_META_MARKER_FIELDS.some(hasOwn) &&
+        PATCH_META_MARKER_FIELDS.filter(hasOwn).every(field => LEGACY_PATCH_PROJECTION_FIELDS.includes(field));
+
+    if (!legacyProjectionOnly && (hasPatchMarker || source.jobKind === "patch")) return "patch";
+
+    const hasBackendMarker = source.executionBackend === "codex-app-server" ||
+        source.requestedExecutionBackend === "codex-app-server";
+    if (!hasBackendMarker) return "legacy";
+
+    if (source.mode === "patch") return "patch";
+    if (source.mode === "analyze" && (source.jobKind === undefined || source.jobKind === "analyze")) {
+        return "analyze";
+    }
+    return "ambiguous";
+}
 
 function assertJobId(jobId) {
     if (typeof jobId !== "string" || !JOB_ID_RE.test(jobId)) {
@@ -331,32 +432,89 @@ function patchCandidatePath(jobRoot, jobId, sidecarInstanceId, patchArtifactNonc
 function inspectPatchArtifactFile(filePath, directoryIdentity, options = {}) {
     const hooks = options.hooks || options;
     const expectedPath = path.resolve(filePath);
+    const failureCode = options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH";
+    const maxBytes = Number.isSafeInteger(options.maxBytes)
+        ? options.maxBytes
+        : PATCH_PROTOCOL_PROOF.patchMaxBytes;
+    if (maxBytes < 0) throw artifactError(failureCode, "Patch artifact byte limit is invalid");
     verifyPatchArtifactDirectory(options.jobRoot, directoryIdentity, { hooks });
-    const identity = readReliableIdentity(expectedPath, "file", options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", hooks);
+    const identity = readReliableIdentity(expectedPath, "file", failureCode, hooks);
     const canonicalExpectedPath = path.join(path.resolve(directoryIdentity.realpath), path.basename(expectedPath));
     if (!samePath(identity.realpath, canonicalExpectedPath) || !samePath(path.dirname(identity.realpath), directoryIdentity.realpath)) {
-        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact file escaped its pinned directory");
+        throw artifactError(failureCode, "Patch artifact file escaped its pinned directory");
     }
     if (options.expectedIdentity && !sameArtifactObjectIdentity(identity, options.expectedIdentity)) {
-        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact file identity changed");
+        throw artifactError(failureCode, "Patch artifact file identity changed");
     }
-    let content;
-    try { content = (hooks.readFileSync || fs.readFileSync)(expectedPath); } catch (error) {
-        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact file could not be read", { cause: error?.code });
-    }
-    const afterRead = readReliableIdentity(expectedPath, "file", options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", hooks);
+    const inspected = hashPatchArtifactFile(expectedPath, maxBytes, options.expectedBytes, hooks, failureCode);
+    const afterRead = readReliableIdentity(expectedPath, "file", failureCode, hooks);
     verifyPatchArtifactDirectory(options.jobRoot, directoryIdentity, { hooks });
     if (!sameArtifactIdentity(identity, afterRead)) {
-        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact file changed while being read");
+        throw artifactError(failureCode, "Patch artifact file changed while being read");
     }
-    const actualSha256 = crypto.createHash("sha256").update(content).digest("hex");
+    const actualSha256 = inspected.sha256;
     if (options.expectedSha256 !== undefined && actualSha256 !== options.expectedSha256) {
-        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact hash mismatch");
+        throw artifactError(failureCode, "Patch artifact hash mismatch");
     }
-    if (options.expectedBytes !== undefined && content.length !== options.expectedBytes) {
-        throw artifactError(options.failureCode || "AICW_PATCH_PUBLIC_ARTIFACT_MISMATCH", "Patch artifact byte length mismatch");
+    if (options.expectedBytes !== undefined && inspected.bytes !== options.expectedBytes) {
+        throw artifactError(failureCode, "Patch artifact byte length mismatch");
     }
-    return { identity: afterRead, sha256: actualSha256, bytes: content.length };
+    return { identity: afterRead, sha256: actualSha256, bytes: inspected.bytes };
+}
+
+function hashPatchArtifactFile(filePath, maxBytes, expectedBytes, hooks = {}, failureCode) {
+    let initialStat;
+    try {
+        initialStat = (hooks.lstatSync || fs.lstatSync)(filePath, { bigint: true });
+        if (initialStat.isSymbolicLink() || !initialStat.isFile() || typeof initialStat.size !== "bigint" || initialStat.size < 0n) {
+            throw artifactError(failureCode, "Patch artifact file is unsafe");
+        }
+    } catch (error) {
+        if (error instanceof SidecarError) throw error;
+        throw artifactError(failureCode, "Patch artifact file size is unavailable", { cause: error?.code });
+    }
+    if (initialStat.size > BigInt(maxBytes) || initialStat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw artifactError(failureCode, "Patch artifact exceeds the bounded byte limit");
+    }
+    const bytes = Number(initialStat.size);
+    if (expectedBytes !== undefined && (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0 || bytes !== expectedBytes)) {
+        throw artifactError(failureCode, "Patch artifact byte length mismatch");
+    }
+
+    const hash = crypto.createHash("sha256");
+    const chunk = Buffer.alloc(Math.max(1, Math.min(64 * 1024, maxBytes || 1)));
+    let fd;
+    let offset = 0;
+    try {
+        fd = (hooks.openSync || fs.openSync)(filePath, "r");
+        while (offset < bytes) {
+            const requested = Math.min(chunk.length, bytes - offset);
+            const read = (hooks.readSync || fs.readSync)(fd, chunk, 0, requested, offset);
+            if (!Number.isInteger(read) || read <= 0 || read > requested) {
+                throw artifactError(failureCode, "Patch artifact file read was incomplete");
+            }
+            hash.update(chunk.subarray(0, read));
+            offset += read;
+        }
+    } catch (error) {
+        if (error instanceof SidecarError) throw error;
+        throw artifactError(failureCode, "Patch artifact file could not be read", { cause: error?.code });
+    } finally {
+        if (fd !== undefined) {
+            try { (hooks.closeSync || fs.closeSync)(fd); } catch (error) {
+                throw artifactError(failureCode, "Patch artifact file could not be closed", { cause: error?.code });
+            }
+        }
+    }
+
+    let afterStat;
+    try { afterStat = (hooks.lstatSync || fs.lstatSync)(filePath, { bigint: true }); } catch (error) {
+        throw artifactError(failureCode, "Patch artifact file disappeared while being read", { cause: error?.code });
+    }
+    if (afterStat.isSymbolicLink() || !afterStat.isFile() || afterStat.size !== initialStat.size) {
+        throw artifactError(failureCode, "Patch artifact file changed while being read");
+    }
+    return { sha256: hash.digest("hex"), bytes };
 }
 
 function removePatchArtifactExact(filePath, directoryIdentity, options = {}) {
@@ -396,10 +554,13 @@ function inspectAuthorizedPatchArtifact(jobRoot, jobId, meta, options = {}) {
     try {
         const id = assertJobId(jobId);
         if (!meta || typeof meta !== "object" || Array.isArray(meta) || String(meta.jobId || "") !== id ||
-            meta.executionBackend !== "codex-app-server" || meta.jobKind !== "patch" || meta.state !== "completed" ||
+            classifyAppServerArtifactMeta(meta) !== "patch" ||
+            meta.patchContractVersion !== PATCH_PROTOCOL_PROOF.patchContractVersion ||
+            meta.state !== "completed" ||
             meta.patchValidated !== true || meta.applyCheckPassed !== true || meta.baselineStable !== true ||
             typeof meta.patchSha256 !== "string" || !/^[0-9a-f]{64}$/.test(meta.patchSha256) ||
-            !Number.isSafeInteger(meta.patchBytes) || meta.patchBytes < 0) {
+            !Number.isSafeInteger(meta.patchBytes) || meta.patchBytes < 0 ||
+            meta.patchBytes > PATCH_PROTOCOL_PROOF.patchMaxBytes) {
             return unauthorized();
         }
         const expectedPath = jobPaths(jobRoot, id).patchPath;
@@ -1089,6 +1250,10 @@ async function updateJobMetaLocked(jobRoot, jobId, suppliedMetaPath, updater, op
 
 module.exports = {
     SidecarError,
+    PATCH_PROTOCOL_PROOF,
+    getPatchProtocolProof,
+    isPatchProtocolProof,
+    projectPatchProtocolProof,
     runtimePaths,
     assertJobId,
     assertAbsolutePath,
@@ -1098,6 +1263,7 @@ module.exports = {
     validatePatchJobPaths,
     ensureDirectory,
     PATCH_ARTIFACT_IDENTITY_VERSION,
+    classifyAppServerArtifactMeta,
     pinPatchArtifactDirectory,
     verifyPatchArtifactDirectory,
     createPatchArtifactNonce,

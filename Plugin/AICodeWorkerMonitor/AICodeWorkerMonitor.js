@@ -5,6 +5,10 @@
 
 const fs = require('fs');
 const path = require('path');
+const {
+    inspectAuthorizedPatchArtifact,
+    classifyAppServerArtifactMeta
+} = require('../AICodeWorker/appserver/protocol');
 
 let chokidarWatcher = null;
 let pluginManagerRef = null; // 来自 Plugin.js 无条件注入的 dependencies.pluginManager
@@ -46,7 +50,78 @@ function readMetaWithRetry(filePath, attempt = 0) {
     }
 }
 
+function samePath(left, right) {
+    const a = path.resolve(left);
+    const b = path.resolve(right);
+    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function resolveJobRootForMeta(filePath) {
+    const absoluteFile = typeof filePath === 'string' && path.isAbsolute(filePath)
+        ? path.resolve(filePath)
+        : null;
+    const configuredMetaDir = watchedMetaDir && path.resolve(watchedMetaDir);
+    if (configuredMetaDir) {
+        if (absoluteFile && !samePath(path.dirname(absoluteFile), configuredMetaDir)) return null;
+        return path.dirname(configuredMetaDir);
+    }
+    if (!absoluteFile || path.basename(path.dirname(absoluteFile)).toLowerCase() !== 'meta') return null;
+    return path.dirname(path.dirname(absoluteFile));
+}
+
+function authorizedPatchProjection(meta, filePath) {
+    const unauthorized = {
+        patchAvailable: false,
+        patchValidated: false,
+        applyCheckPassed: false,
+        baselineStable: false,
+        patchBytes: null,
+        patchFileCount: null
+    };
+    if (classifyAppServerArtifactMeta(meta) !== 'patch') return unauthorized;
+    const fileName = typeof filePath === 'string' ? path.basename(filePath) : '';
+    const jobId = fileName.endsWith('.json') && !fileName.endsWith('.args.json')
+        ? fileName.slice(0, -5)
+        : '';
+    const jobRoot = resolveJobRootForMeta(filePath);
+    if (!jobId || !jobRoot) return unauthorized;
+    try {
+        const inspected = inspectAuthorizedPatchArtifact(jobRoot, jobId, meta);
+        if (inspected?.authorized !== true) return unauthorized;
+        return {
+            patchAvailable: true,
+            patchValidated: true,
+            applyCheckPassed: true,
+            baselineStable: true,
+            patchBytes: inspected.patchBytes,
+            patchFileCount: inspected.patchFileCount
+        };
+    } catch {
+        return unauthorized;
+    }
+}
+
 function buildJobStatusPayload(meta, filePath) {
+    const artifactClass = classifyAppServerArtifactMeta(meta);
+    const patchProjection = artifactClass === 'patch'
+        ? authorizedPatchProjection(meta, filePath)
+        : artifactClass === 'analyze' || artifactClass === 'ambiguous'
+            ? {
+                patchAvailable: false,
+                patchValidated: false,
+                applyCheckPassed: false,
+                baselineStable: false,
+                patchBytes: null,
+                patchFileCount: null
+            }
+            : {
+            patchAvailable: meta.patchAvailable === true,
+            patchValidated: meta.patchValidated === true,
+            applyCheckPassed: meta.applyCheckPassed === true,
+            baselineStable: meta.baselineStable === true,
+            patchBytes: Number.isSafeInteger(meta.patchBytes) ? meta.patchBytes : null,
+            patchFileCount: Number.isSafeInteger(meta.patchFileCount) ? meta.patchFileCount : null
+            };
     return {
         type: 'job_status_update',
         data: {
@@ -56,12 +131,7 @@ function buildJobStatusPayload(meta, filePath) {
             mode: meta.mode || null,
             jobKind: meta.jobKind || null,
             jobPhase: meta.jobPhase || null,
-            patchAvailable: meta.patchAvailable === true,
-            patchValidated: meta.patchValidated === true,
-            applyCheckPassed: meta.applyCheckPassed === true,
-            baselineStable: meta.baselineStable === true,
-            patchBytes: Number.isSafeInteger(meta.patchBytes) ? meta.patchBytes : null,
-            patchFileCount: Number.isSafeInteger(meta.patchFileCount) ? meta.patchFileCount : null,
+            ...patchProjection,
             pid: meta.workerPid || meta.pid || meta.sidecarPid || null,
             startedAt: meta.startedAt || null,
             completedAt: meta.completedAt || null,
@@ -104,10 +174,11 @@ async function readRecentJobSnapshot(limit = 20, requestIp = null) {
     );
     const jobs = Array.isArray(result && result.jobs) ? result.jobs : [];
 
-    return jobs.slice(0, boundedLimit).map(job => {
+    return Promise.all(jobs.slice(0, boundedLimit).map(async job => {
         const fallbackPath = path.join(watchedMetaDir || '', `${job.jobId || 'unknown'}.json`);
-        return buildJobStatusPayload(job, fallbackPath).data;
-    });
+        const meta = await readMetaWithRetry(fallbackPath);
+        return buildJobStatusPayload(meta || job, fallbackPath).data;
+    }));
 }
 
 async function sendSnapshot(ws, limit = 20) {

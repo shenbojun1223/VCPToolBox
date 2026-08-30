@@ -120,6 +120,7 @@ function completedPatchMeta(jobId, fixture, patchText, extra = {}) {
         state: "completed",
         executionBackend: "codex-app-server",
         jobKind: "patch",
+        patchContractVersion: 1,
         patchValidated: true,
         applyCheckPassed: true,
         baselineStable: true,

@@ -25,7 +25,8 @@ const {
     removePatchArtifactExact,
     removeEndpoint,
     getLocalProcessIdentityConfirmed,
-    getProcessIdentity
+    getProcessIdentity,
+    getPatchProtocolProof
 } = require("./protocol");
 const {
     MAX_PATCH_BYTES,
@@ -149,6 +150,7 @@ class SidecarServer extends EventEmitter {
             startedAt: new Date().toISOString(),
             processStartedAt: new Date().toISOString(),
             processIdentity,
+            ...getPatchProtocolProof(),
             status: "starting",
             codexBin: this.codexBin,
             codexVersion: null,
@@ -298,7 +300,8 @@ class SidecarServer extends EventEmitter {
                 finalizationFailed: Boolean(job.finalizationFailed),
                 errorCode: job.finalizationError?.code || null
             })),
-            maxConcurrency: this.maxConcurrency
+            maxConcurrency: this.maxConcurrency,
+            ...getPatchProtocolProof()
         };
     }
 

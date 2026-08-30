@@ -21,7 +21,8 @@ const {
     removeEndpoint,
     writeJsonAtomic,
     assertJobId,
-    jobPaths
+    jobPaths,
+    projectPatchProtocolProof
 } = require("./protocol");
 
 const OWNED_CHILD_TERMINATION_PROOFS = new WeakSet();
@@ -212,13 +213,19 @@ class SidecarClient {
             } catch (error) {
                 return this._inspectionError(error);
             }
-            if (!lock) return { status: "absent", activeJobs: 0, maxConcurrency: this.maxConcurrency };
+            if (!lock) return {
+                status: "absent",
+                activeJobs: 0,
+                maxConcurrency: this.maxConcurrency,
+                ...projectPatchProtocolProof(null)
+            };
             const lockStatus = this._inspectStartupLock(lock);
             return {
                 status: lockStatus.status,
                 pid: lock.pid,
                 activeJobs: 0,
                 maxConcurrency: this.maxConcurrency,
+                ...projectPatchProtocolProof(null),
                 ...(lockStatus.errorCode ? { errorCode: lockStatus.errorCode } : {})
             };
         }
@@ -278,7 +285,12 @@ class SidecarClient {
         } catch (error) {
             return this._inspectionError(error);
         }
-        if (!state) return { status: "absent", activeJobs: 0, maxConcurrency: this.maxConcurrency };
+        if (!state) return {
+            status: "absent",
+            activeJobs: 0,
+            maxConcurrency: this.maxConcurrency,
+            ...projectPatchProtocolProof(null)
+        };
 
         try {
             const cleaned = await this._cleanDeadState(state);
@@ -290,7 +302,13 @@ class SidecarClient {
             const replacement = this._readState();
             return replacement
                 ? this.inspectNoStart()
-                : { status: "absent", activeJobs: 0, maxConcurrency: this.maxConcurrency, reconciled: true };
+                : {
+                    status: "absent",
+                    activeJobs: 0,
+                    maxConcurrency: this.maxConcurrency,
+                    reconciled: true,
+                    ...projectPatchProtocolProof(null)
+                };
         } catch (error) {
             const replacement = this._readState();
             if (replacement && !this._sameStateIdentity(replacement, state)) return this.inspectNoStart();
@@ -312,7 +330,11 @@ class SidecarClient {
             await this._cleanDeadState(state);
             throw new SidecarError("SIDECAR_NOT_RUNNING", "Sidecar process is not running");
         }
-        return this._callWithState(state, "status", {});
+        const status = await this._callWithState(state, "status", {});
+        return {
+            ...status,
+            ...projectPatchProtocolProof(status)
+        };
     }
 
     async cancel(params) {
@@ -344,6 +366,9 @@ class SidecarClient {
                     : 0,
             maxConcurrency: Number(statusResult?.maxConcurrency || this.maxConcurrency)
         };
+        Object.assign(result, projectPatchProtocolProof(
+            statusResult === null || statusResult === undefined ? state : statusResult
+        ));
         if (statusResult?.errorCode) result.errorCode = statusResult.errorCode;
         if (warnings) result.warnings = [warnings];
         return result;
@@ -564,7 +589,10 @@ class SidecarClient {
                 actual: Number.isFinite(Number(status?.maxConcurrency)) ? Number(status.maxConcurrency) : null
             });
         }
-        return state;
+        return {
+            ...state,
+            ...projectPatchProtocolProof(status)
+        };
     }
 
     async _waitForLock() {

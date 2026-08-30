@@ -31,7 +31,8 @@ const {
     pinPatchArtifactDirectory,
     createPatchArtifactNonce,
     patchCandidatePath,
-    inspectAuthorizedPatchArtifact
+    inspectAuthorizedPatchArtifact,
+    getPatchProtocolProof
 } = require("../appserver/protocol");
 const { captureGitBaseline, startGitBaselineMonitor, sha256 } = require("../appserver/patchValidator");
 const { JsonLineRpcConnection } = require("../appserver/jsonLineRpcConnection");
@@ -583,6 +584,101 @@ test("Sidecar start writes non-null local identity", async () => {
         } finally {
             await environment.close();
         }
+    }
+});
+
+test("Sidecar status returns the exact patch protocol proof", async () => {
+    const environment = await createEnvironment();
+    const server = new SidecarServer({
+        pluginDir: environment.pluginDir,
+        jobRoot: environment.jobRoot,
+        maxConcurrency: 2
+    });
+    server.state = { status: "ready", instanceId: "proof-instance", pid: process.pid, codexPid: null };
+    try {
+        const status = server.status();
+        assert.deepEqual({
+            patchProtocolSupported: status.patchProtocolSupported,
+            patchContractVersion: status.patchContractVersion,
+            patchMaxBytes: status.patchMaxBytes,
+            patchRepositoryPolicy: status.patchRepositoryPolicy,
+            patchOperations: status.patchOperations
+        }, getPatchProtocolProof());
+        assert.equal(status.status, "ready");
+        assert.equal(status.maxConcurrency, 2);
+        assert.equal(status.instanceId, "proof-instance");
+        assert.equal(status.pid, process.pid);
+        assert.equal(status.codexPid, null);
+        assert.ok(Array.isArray(status.activeJobs));
+    } finally { await environment.close(); }
+});
+
+test("SidecarClient inspection and status preserve the exact patch protocol proof", async () => {
+    const environment = await createEnvironment();
+    try {
+        const state = await environment.client.ensure();
+        const inspection = await environment.client.inspectNoStart();
+        const status = await environment.client.status();
+        for (const projected of [state, inspection, status]) {
+            assert.deepEqual({
+                patchProtocolSupported: projected.patchProtocolSupported,
+                patchContractVersion: projected.patchContractVersion,
+                patchMaxBytes: projected.patchMaxBytes,
+                patchRepositoryPolicy: projected.patchRepositoryPolicy,
+                patchOperations: projected.patchOperations
+            }, getPatchProtocolProof());
+        }
+        assert.equal(inspection.status, "ready");
+        assert.equal(status.status, "ready");
+        assert.equal(status.maxConcurrency, 2);
+        assert.equal(status.instanceId, state.instanceId);
+        assert.equal(status.pid, state.pid);
+        assert.ok(Array.isArray(status.activeJobs));
+    } finally { await environment.close(); }
+});
+
+test("old Sidecar status without patch proof remains unknown and cannot be upgraded", async () => {
+    const environment = await createEnvironment();
+    const oldEndpoint = process.platform === "win32"
+        ? `\\\\.\\pipe\\vcp-aicodeworker-old-${process.pid}-${Date.now()}`
+        : path.join(environment.tempRoot, "old-sidecar.sock");
+    const client = clientFor(environment);
+    client._inspectStateProcess = () => ({ alive: true, confirmed: true, mismatch: false, unknown: false });
+    const oldState = stateFixture(environment, {
+        pid: 2147483647,
+        endpoint: oldEndpoint,
+        status: "ready"
+    });
+    writeJsonAtomic(environment.paths.statePath, oldState);
+    const fixture = await listenIpcFixture(oldEndpoint, request => ({
+        requestId: request.requestId,
+        ok: true,
+        result: {
+            instanceId: oldState.instanceId,
+            status: "ready",
+            pid: oldState.pid,
+            codexPid: null,
+            activeJobs: [],
+            maxConcurrency: 2
+        }
+    }));
+    try {
+        const status = await client.status();
+        const inspection = await client.inspectNoStart();
+        for (const projected of [status, inspection]) {
+            assert.equal(projected.patchProtocolSupported, "unknown");
+            assert.equal(projected.patchContractVersion, null);
+            assert.equal(projected.patchMaxBytes, null);
+            assert.equal(projected.patchRepositoryPolicy, null);
+            assert.equal(projected.patchOperations, null);
+        }
+        assert.equal(status.status, "ready");
+        assert.equal(status.maxConcurrency, 2);
+        assert.equal(inspection.activeJobs, 0);
+        assertSafeInspection(inspection);
+    } finally {
+        await closeIpcFixture(fixture);
+        await environment.close();
     }
 });
 
