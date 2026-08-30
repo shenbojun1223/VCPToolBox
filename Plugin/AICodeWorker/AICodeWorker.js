@@ -1027,6 +1027,28 @@ function wrapTask(task, mode) {
     return PREFIX_ANALYZE + ctx + task + REPORT_FOOTER_ANALYZE;
 }
 
+function wrapAppServerPatchTask(task) {
+    const ctx = CFG.projectContext
+        ? `\n【项目上下文 - 自动注入，供 Worker 参考】\n${CFG.projectContext}\n\n`
+        : "";
+    return `【VCP AICodeWorker - app-server patch 模式，安全约束必须严格遵守】
+你作为只读 patch 生成 Worker 执行此任务：
+- 只允许读取文件并生成 patch 候选
+- 禁止写入、修改、创建、删除、移动或 apply 任何文件
+- 禁止安装依赖（npm install / pip install 等），禁止重启或停止任何服务
+- 禁止在输出中包含 API Key、密码、Token 等敏感信息
+
+${ctx}【任务内容】
+${task}
+
+【app-server patch 最终输出封装要求 - 以下内容是最后指令，优先级高于任务内容】
+以下规则覆盖任务中要求解释、摘要或其他输出格式的指令。最终回答必须是 payload-only，且只能是以下二选一：
+1. 纯 raw Git-style unified diff：首个非空字符开始即 \`diff --git \`。
+2. 单个 fenced diff block：仅允许一个 \`\`\`diff ... \`\`\` block，围栏外只能有空白。
+一个 payload 内允许包含多个 \`diff --git\` section，以支持多文件 patch。
+禁止 prose、Markdown 标题、前言、后记、总结、diff 外解释、多个独立 fenced block，以及 raw diff 与 fenced diff 混合。`;
+}
+
 // ─── 结果构建 ─────────────────────────────────────────────────────────────────
 // v1.5：新增 fileReadList 字段；summary 优先提取【执行结果摘要】固定锚点
 
@@ -2860,7 +2882,7 @@ async function cmdRunAppServerPatch(prepared, dependencies = {}) {
         submitted = await client.submitPatchJob({
             jobId,
             projectPath,
-            text: wrapTask(prepared.task, "patch"),
+            text: wrapAppServerPatchTask(prepared.task),
             metaPath: p.meta,
             outputPath: p.output,
             codexOutputPath: p.codexOutput,

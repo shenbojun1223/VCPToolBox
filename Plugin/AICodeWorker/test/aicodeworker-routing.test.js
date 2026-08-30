@@ -1371,8 +1371,9 @@ function fakeAppServerClient(submitState = {}) {
     return {
         inspectNoStart: async () => ({ status: "absent" }),
         ensure: async () => ({ status: "ready" }),
-        submitAnalyzeJob: async () => {
+        submitAnalyzeJob: async params => {
             submitState.calls = (submitState.calls || 0) + 1;
+            submitState.params = params;
             return { accepted: true };
         }
     };
@@ -1634,7 +1635,12 @@ test("accepted patch submits once with only fixed contract fields and no public 
         const worker = require(environment.workerPath);
         const submitState = {};
         const response = await worker.cmdRunAppServerPatch(
-            appServerPatchPrepared(worker, environment, "accepted once", { timeoutSec: 7 }),
+            appServerPatchPrepared(
+                worker,
+                environment,
+                "accepted once; 请在 diff 前后解释并输出摘要、文件清单和多个 fenced diff 块。",
+                { timeoutSec: 7 }
+            ),
             { client: fakePatchClient(submitState) }
         );
         assert.equal(response.status, "success");
@@ -1654,6 +1660,30 @@ test("accepted patch submits once with only fixed contract fields and no public 
         assert.equal(submitState.params.model, "gpt-5-codex");
         assert.equal(submitState.params.effort, "medium");
         assert.equal(submitState.params.patchContractVersion, 1);
+        const submittedText = submitState.params.text;
+        assert.match(submittedText, /app-server patch 最终输出封装要求/);
+        assert.match(submittedText, /首个非空字符开始即 `diff --git `/);
+        assert.match(submittedText, /单个 fenced diff block/);
+        assert.match(submittedText, /一个 payload 内允许包含多个 `diff --git` section/);
+        assert.ok(
+            submittedText.lastIndexOf("【app-server patch 最终输出封装要求") >
+                submittedText.indexOf("accepted once;"),
+            "payload-only contract must be the final instruction after the user task"
+        );
+        assert.equal(
+            submittedText.trim().endsWith(
+                "禁止 prose、Markdown 标题、前言、后记、总结、diff 外解释、多个独立 fenced block，以及 raw diff 与 fenced diff 混合。"
+            ),
+            true
+        );
+        for (const forbiddenText of [
+            "【读取文件清单】",
+            "【变更摘要】",
+            "【执行结果摘要】",
+            "每个 diff 块前说明"
+        ]) {
+            assert.equal(submittedText.includes(forbiddenText), false, `app-server patch text leaked legacy footer: ${forbiddenText}`);
+        }
         for (const forbidden of ["sandbox", "cwd", "approvalPolicy", "networkAccess", "artifactDirectory"]) {
             assert.equal(Object.prototype.hasOwnProperty.call(submitState.params, forbidden), false);
         }
