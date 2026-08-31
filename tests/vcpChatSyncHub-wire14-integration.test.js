@@ -71,22 +71,54 @@ test("Wire 1.4 handshake, compound manifest, diff and unified HTTP routes", { ti
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vcp-sync-14-"));
   const appDataPath = path.join(tempRoot, "AppData");
   const ownerId = "agent-wire14";
+  const secondOwnerId = "agent-wire14-second";
   const topicId = "topic-wire14";
+  const sharedTopicId = "default";
   const message = {
     id: "message-wire14",
     role: "user",
     content: "wire 1.4",
     timestamp: 123,
   };
+  const sharedMessages = [
+    { id: "default-first-message", role: "user", content: "first owner", timestamp: 201 },
+    { id: "default-second-message", role: "user", content: "second owner", timestamp: 202 },
+  ];
   await fs.mkdir(path.join(appDataPath, "Agents", ownerId), { recursive: true });
+  await fs.mkdir(path.join(appDataPath, "Agents", secondOwnerId), { recursive: true });
   await fs.mkdir(path.join(appDataPath, "UserData", ownerId, "topics", topicId), { recursive: true });
+  await fs.mkdir(path.join(appDataPath, "UserData", ownerId, "topics", sharedTopicId), { recursive: true });
+  await fs.mkdir(path.join(appDataPath, "UserData", secondOwnerId, "topics", sharedTopicId), { recursive: true });
   await fs.writeFile(
     path.join(appDataPath, "Agents", ownerId, "config.json"),
-    JSON.stringify({ id: ownerId, name: "Wire 14", topics: [{ id: topicId, name: "Topic", createdAt: 1 }] }),
+    JSON.stringify({
+      id: ownerId,
+      name: "Wire 14",
+      topics: [
+        { id: topicId, name: "Topic", createdAt: 1 },
+        { id: sharedTopicId, name: "First default", createdAt: 2 },
+      ],
+    }),
+  );
+  await fs.writeFile(
+    path.join(appDataPath, "Agents", secondOwnerId, "config.json"),
+    JSON.stringify({
+      id: secondOwnerId,
+      name: "Wire 14 Second",
+      topics: [{ id: sharedTopicId, name: "Second default", createdAt: 3 }],
+    }),
   );
   await fs.writeFile(
     path.join(appDataPath, "UserData", ownerId, "topics", topicId, "history.json"),
     JSON.stringify([message]),
+  );
+  await fs.writeFile(
+    path.join(appDataPath, "UserData", ownerId, "topics", sharedTopicId, "history.json"),
+    JSON.stringify([sharedMessages[0]]),
+  );
+  await fs.writeFile(
+    path.join(appDataPath, "UserData", secondOwnerId, "topics", sharedTopicId, "history.json"),
+    JSON.stringify([sharedMessages[1]]),
   );
 
   const app = express();
@@ -142,17 +174,30 @@ test("Wire 1.4 handshake, compound manifest, diff and unified HTTP routes", { ti
     manifestType: "owner",
     items: [],
   }, "SYNC_MANIFEST_RESULT");
-  assert.deepEqual(ownerManifest.results.map((item) => item.ownerId), [ownerId]);
-  assert.equal(ownerManifest.results[0].action, "PULL");
+  assert.deepEqual(
+    ownerManifest.results.map((item) => item.ownerId).sort(),
+    [ownerId, secondOwnerId].sort(),
+  );
+  assert.equal(ownerManifest.results.every((item) => item.action === "PULL"), true);
 
   const topicManifest = await wsRequest(socket, {
     type: "SYNC_MANIFEST_REQUEST",
     manifestType: "topic",
-    targetedOwners: [{ ownerType: "agent", ownerId }],
+    targetedOwners: [
+      { ownerType: "agent", ownerId },
+      { ownerType: "agent", ownerId: secondOwnerId },
+    ],
     items: [],
   }, "SYNC_MANIFEST_RESULT");
-  assert.equal(topicManifest.results[0].topicId, topicId);
-  assert.equal(topicManifest.results[0].action, "PULL");
+  assert.equal(topicManifest.results.some((item) => item.topicId === topicId && item.ownerId === ownerId), true);
+  assert.deepEqual(
+    topicManifest.results
+      .filter((item) => item.topicId === sharedTopicId)
+      .map((item) => item.ownerId)
+      .sort(),
+    [ownerId, secondOwnerId].sort(),
+  );
+  assert.equal(topicManifest.results.every((item) => item.action === "PULL"), true);
 
   const missingTopicId = "topic-wire14-deleted-before-seen";
   await wsRequest(socket, {
@@ -283,4 +328,118 @@ test("Wire 1.4 handshake, compound manifest, diff and unified HTTP routes", { ti
     "utf8",
   ));
   assert.equal(persisted.some((item) => item.id === pushedMessage.id), true);
+
+  const compoundTopicPush = await fetch(`${baseUrl}/entities/push`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      items: [
+        {
+          entityType: "topic",
+          ownerType: "agent",
+          ownerId,
+          topicId: sharedTopicId,
+          data: { id: sharedTopicId, name: "First default updated", createdAt: 2, locked: true, unread: false },
+        },
+        {
+          entityType: "topic",
+          ownerType: "agent",
+          ownerId: secondOwnerId,
+          topicId: sharedTopicId,
+          data: { id: sharedTopicId, name: "Second default updated", createdAt: 3, locked: true, unread: false },
+        },
+      ],
+    }),
+  });
+  assert.equal(compoundTopicPush.status, 200);
+  const compoundTopicPushBody = await compoundTopicPush.json();
+  assert.equal(compoundTopicPushBody.results.every((item) => item.ok), true);
+  const firstConfig = JSON.parse(await fs.readFile(
+    path.join(appDataPath, "Agents", ownerId, "config.json"),
+    "utf8",
+  ));
+  const secondConfig = JSON.parse(await fs.readFile(
+    path.join(appDataPath, "Agents", secondOwnerId, "config.json"),
+    "utf8",
+  ));
+  assert.equal(firstConfig.topics.find((item) => item.id === sharedTopicId).name, "First default updated");
+  assert.equal(secondConfig.topics.find((item) => item.id === sharedTopicId).name, "Second default updated");
+
+  const compoundMessageDiff = await wsRequest(socket, {
+    type: "SYNC_MESSAGE_DIFF_REQUEST",
+    topics: sharedMessages.map((sharedMessage, index) => ({
+      topicId: sharedTopicId,
+      ownerType: "agent",
+      ownerId: index === 0 ? ownerId : secondOwnerId,
+      contentHash: aggregateHashes14([messageHash14(sharedMessage)]),
+      messages: {
+        [sharedMessage.id]: {
+          messageHash: messageHash14(sharedMessage),
+          updatedAt: sharedMessage.timestamp,
+        },
+      },
+    })),
+  }, "SYNC_MESSAGE_DIFF_RESULT");
+  assert.equal(compoundMessageDiff.results.length, 2);
+  assert.equal(compoundMessageDiff.results.every((item) => item.ok), true);
+  assert.deepEqual(
+    compoundMessageDiff.results.map((item) => item.ownerId).sort(),
+    [ownerId, secondOwnerId].sort(),
+  );
+
+  const compoundMessagePull = await fetch(`${baseUrl}/messages/pull`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      topics: sharedMessages.map((sharedMessage, index) => ({
+        topicId: sharedTopicId,
+        ownerType: "agent",
+        ownerId: index === 0 ? ownerId : secondOwnerId,
+        messageIds: [sharedMessage.id],
+      })),
+    }),
+  });
+  assert.equal(compoundMessagePull.status, 200);
+  const compoundMessageFrames = (await compoundMessagePull.text())
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(
+    compoundMessageFrames.map((frame) => [frame.ownerId, frame.messages[0].content]).sort(),
+    [[ownerId, "first owner"], [secondOwnerId, "second owner"]].sort(),
+  );
+
+  const compoundPushMessages = [
+    { id: "default-first-pushed", role: "assistant", content: "first push", timestamp: 203 },
+    { id: "default-second-pushed", role: "assistant", content: "second push", timestamp: 204 },
+  ];
+  const compoundMessagePush = await fetch(`${baseUrl}/messages/push`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/x-ndjson",
+    },
+    body: compoundPushMessages.map((pushed, index) => JSON.stringify({
+      kind: "topic",
+      topicId: sharedTopicId,
+      ownerType: "agent",
+      ownerId: index === 0 ? ownerId : secondOwnerId,
+      messages: [pushed],
+      deletedMessages: [],
+    })).join("\n") + "\n",
+  });
+  assert.equal(compoundMessagePush.status, 200);
+  const compoundPushFrames = (await compoundMessagePush.text())
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => JSON.parse(line));
+  assert.equal(compoundPushFrames.every((frame) => frame.ok), true);
+  for (const [index, compoundOwnerId] of [ownerId, secondOwnerId].entries()) {
+    const compoundHistory = JSON.parse(await fs.readFile(
+      path.join(appDataPath, "UserData", compoundOwnerId, "topics", sharedTopicId, "history.json"),
+      "utf8",
+    ));
+    assert.equal(compoundHistory.some((item) => item.id === compoundPushMessages[index].id), true);
+    assert.equal(compoundHistory.some((item) => item.id === compoundPushMessages[1 - index].id), false);
+  }
 });

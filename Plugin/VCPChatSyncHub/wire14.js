@@ -1,10 +1,12 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const fs = require("node:fs").promises;
 const path = require("node:path");
 const express = require("express");
 
-const { getDb, getEntityIndex } = require("./core/db");
+const { getDb } = require("./core/db");
+const { computeDtoHash } = require("./core/hash");
 const {
   normalizeSyncError,
   createHttpErrorBody,
@@ -15,26 +17,30 @@ const {
   uploadDesktopConfigs,
 } = require("./sync/desktop-config");
 const {
-  downloadEntities,
-  uploadEntitiesBatch,
   downloadAvatar,
   uploadAvatar,
   deleteEntity,
-  deleteMessage,
   sanitizeId,
 } = require("./sync/entity");
 const {
-  downloadMessagesStreamRaw,
-  uploadMessagesBatchRaw,
   readHistoryStrict,
-  assertHistoryTopicHealthy,
+  writeHistoryAtomic,
 } = require("./sync/message");
 const { canonicalizeHistory } = require("./sync/canonical");
+const { projectMobileTopic } = require("./sync/projection");
+const { acquireLock } = require("./utils/lock");
+const {
+  AGENT_TOPIC_SYNC_FIELDS,
+  GROUP_TOPIC_SYNC_FIELDS,
+  extractTopicDTO,
+  applyTopicDTO,
+} = require("./dto");
 const {
   readNdjsonLines,
   decodeNdjsonLine,
 } = require("./transport/ndjson");
 const { parseJsonWithoutDuplicateKeys } = require("./protocol");
+const { getLogger } = require("./core/logger");
 
 const MAX_MANIFEST_ITEMS = 10_000;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
@@ -95,29 +101,147 @@ function requireExactKeys(value, keys, label) {
   }
 }
 
-function topicOwner(filePath) {
-  const normalized = path.normalize(String(filePath || ""));
-  const ownerId = path.basename(path.dirname(normalized));
-  const marker = `${path.sep}AgentGroups${path.sep}`;
-  return {
-    ownerType: normalized.includes(marker) ? "group" : "agent",
+function ownerConfigPath(appDataPath, ownerType, ownerId) {
+  return path.join(
+    appDataPath,
+    ownerType === "group" ? "AgentGroups" : "Agents",
     ownerId,
-  };
+    "config.json",
+  );
 }
 
-function assertTopicOwner(row, ownerType, ownerId, topicId) {
-  if (!row || row.deleted_at != null) {
-    throw Object.assign(new Error(`Topic ${topicId} was not found in the desktop index`), {
-      code: "TOPIC_NOT_FOUND",
-    });
+function topicHistoryPath(appDataPath, ownerId, topicId) {
+  return path.join(
+    appDataPath,
+    "UserData",
+    ownerId,
+    "topics",
+    topicId,
+    "history.json",
+  );
+}
+
+async function readPhysicalTopic(appDataPath, ownerType, ownerId, topicId) {
+  requireOwner(ownerType, ownerId);
+  requireId(topicId, "topicId");
+  const configPath = ownerConfigPath(appDataPath, ownerType, ownerId);
+  let raw;
+  try {
+    raw = await fs.readFile(configPath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
   }
-  const actual = topicOwner(row.file_path);
-  if (actual.ownerType !== ownerType || actual.ownerId !== ownerId) {
-    throw Object.assign(new Error(`Topic ${topicId} owner identity conflicts with the desktop index`), {
-      code: "SYNC_OWNER_CONFLICT",
-    });
+  const config = JSON.parse(raw);
+  const topics = Array.isArray(config.topics) ? config.topics : [];
+  const topic = topics.find((item) => item?.id === topicId);
+  if (!topic) return null;
+  return { config, configPath, topic };
+}
+
+async function scanPhysicalTopics(appDataPath) {
+  const results = [];
+  for (const [ownerType, folder] of [["agent", "Agents"], ["group", "AgentGroups"]]) {
+    const basePath = path.join(appDataPath, folder);
+    let entries = [];
+    try {
+      entries = await fs.readdir(basePath, { withFileTypes: true });
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || sanitizeId(entry.name) !== entry.name) continue;
+      const ownerId = entry.name;
+      const configPath = path.join(basePath, ownerId, "config.json");
+      try {
+        const [raw, stats] = await Promise.all([
+          fs.readFile(configPath, "utf8"),
+          fs.stat(configPath),
+        ]);
+        const config = JSON.parse(raw);
+        for (const topic of Array.isArray(config.topics) ? config.topics : []) {
+          if (!topic?.id || sanitizeId(topic.id) !== topic.id) continue;
+          const dto = extractTopicDTO(topic, ownerId, ownerType);
+          results.push({
+            ownerType,
+            ownerId,
+            topicId: topic.id,
+            configHash: computeDtoHash(
+              dto,
+              ownerType === "group"
+                ? GROUP_TOPIC_SYNC_FIELDS
+                : AGENT_TOPIC_SYNC_FIELDS,
+            ),
+            contentHash: "",
+            updatedAt: Math.trunc(stats.mtimeMs || Date.now()),
+            dto,
+          });
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT") {
+          getLogger().logOperation(
+            "topic_metadata",
+            "wire14_scan",
+            `${ownerType}/${ownerId}`,
+            "error",
+            error.message,
+          );
+        }
+      }
+    }
   }
-  return actual;
+  return results;
+}
+
+async function writePhysicalTopic(appDataPath, item) {
+  const configPath = ownerConfigPath(
+    appDataPath,
+    item.ownerType,
+    item.ownerId,
+  );
+  const release = await acquireLock(configPath);
+  try {
+    const config = JSON.parse(await fs.readFile(configPath, "utf8"));
+    if (!Array.isArray(config.topics)) config.topics = [];
+    const index = config.topics.findIndex((topic) => topic?.id === item.topicId);
+    const current = index >= 0 ? config.topics[index] : { id: item.topicId };
+    const dto = { ...item.data, id: item.topicId };
+    const updated = applyTopicDTO(current, dto, item.ownerType);
+    if (index >= 0) config.topics[index] = updated;
+    else config.topics.push(updated);
+    const temporary = `${configPath}.tmp_${process.pid}_${Date.now()}`;
+    await fs.writeFile(temporary, JSON.stringify(config, null, 2), "utf8");
+    await fs.rename(temporary, configPath);
+    return { success: true };
+  } finally {
+    release();
+  }
+}
+
+async function deletePhysicalTopic(appDataPath, ownerType, ownerId, topicId) {
+  const configPath = ownerConfigPath(appDataPath, ownerType, ownerId);
+  const release = await acquireLock(configPath);
+  try {
+    try {
+      const config = JSON.parse(await fs.readFile(configPath, "utf8"));
+      if (Array.isArray(config.topics)) {
+        const remaining = config.topics.filter((topic) => topic?.id !== topicId);
+        if (remaining.length !== config.topics.length) {
+          config.topics = remaining;
+          const temporary = `${configPath}.tmp_${process.pid}_${Date.now()}`;
+          await fs.writeFile(temporary, JSON.stringify(config, null, 2), "utf8");
+          await fs.rename(temporary, configPath);
+        }
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  } finally {
+    release();
+  }
+  const topicDirectory = path.dirname(topicHistoryPath(appDataPath, ownerId, topicId));
+  await fs.rm(topicDirectory, { recursive: true, force: true });
+  return { success: true };
 }
 
 function ensureWire14Tombstones(db = getDb()) {
@@ -294,22 +418,9 @@ async function localManifest14(manifestType, targetedOwners, appDataPath) {
     return [...byIdentity.values()];
   }
 
-  const rows = db.prepare(
-    "SELECT * FROM entity_index WHERE type = 'topic' OR type = 'agent_topic' OR type = 'group_topic'",
-  ).all();
-  const items = rows.flatMap((row) => {
-    const owner = topicOwner(row.file_path);
-    if (targetedOwners && !targetedOwners.has(identityKey(owner, "owner"))) return [];
-    return [row.deleted_at == null
-      ? {
-          ...owner,
-          topicId: row.id,
-          configHash: requireHash(row.hash, `Topic ${row.id} configHash`),
-          contentHash: typeof row.aggregated_hash === "string" ? row.aggregated_hash : "",
-          updatedAt: requireTimestamp(row.updated_at, `Topic ${row.id} updatedAt`),
-        }
-      : { ...owner, topicId: row.id, deletedAt: row.deleted_at }];
-  });
+  const items = (await scanPhysicalTopics(appDataPath)).filter((item) =>
+    !targetedOwners || targetedOwners.has(identityKey(item, "owner"))
+  );
   const byIdentity = new Map(items.map((item) => [identityKey(item, "topic"), item]));
   for (const tombstone of wire14Tombstones("topic")) {
     const item = {
@@ -412,14 +523,29 @@ async function handleTopicDiff14(payload, appDataPath) {
     const key = identityKey(state, "topic");
     if (seen.has(key)) throw contractError("Duplicate compound topic hash state");
     seen.add(key);
-    const row = getEntityIndex(state.topicId, "topic");
-    if (!row || row.deleted_at != null) {
+    const physical = await readPhysicalTopic(
+      appDataPath,
+      state.ownerType,
+      state.ownerId,
+      state.topicId,
+    );
+    if (!physical) {
       changedTopics.push(actionIdentity(state, "topic"));
       continue;
     }
-    assertTopicOwner(row, state.ownerType, state.ownerId, state.topicId);
+    const dto = extractTopicDTO(
+      physical.topic,
+      state.ownerId,
+      state.ownerType,
+    );
+    const configHash = computeDtoHash(
+      dto,
+      state.ownerType === "group"
+        ? GROUP_TOPIC_SYNC_FIELDS
+        : AGENT_TOPIC_SYNC_FIELDS,
+    );
     const desktop = await desktopMessageState14(appDataPath, state);
-    if (row.hash !== state.configHash || desktop.contentHash !== state.contentHash) {
+    if (configHash !== state.configHash || desktop.contentHash !== state.contentHash) {
       changedTopics.push(actionIdentity(state, "topic"));
     }
   }
@@ -479,45 +605,32 @@ function validateMessageState(value) {
 }
 
 async function desktopMessageState14(appDataPath, state) {
-  const db = getDb();
-  const row = getEntityIndex(state.topicId, "topic");
-  assertTopicOwner(row, state.ownerType, state.ownerId, state.topicId);
-  assertHistoryTopicHealthy(state.topicId);
-  const historyPath = path.join(
+  const physical = await readPhysicalTopic(
     appDataPath,
-    "UserData",
+    state.ownerType,
     state.ownerId,
-    "topics",
     state.topicId,
-    "history.json",
   );
+  if (!physical) {
+    throw Object.assign(
+      new Error(`Topic ${state.topicId} was not found for ${state.ownerType}/${state.ownerId}`),
+      { code: "TOPIC_NOT_FOUND" },
+    );
+  }
+  const historyPath = topicHistoryPath(appDataPath, state.ownerId, state.topicId);
   const { history } = await readHistoryStrict(historyPath);
   const canonical = canonicalizeHistory(history, state.topicId).frame.messages;
-  const indexRows = db.prepare(
-    "SELECT msg_id, updated_at, deleted_at FROM message_index WHERE topic_id = ?",
-  ).all(state.topicId);
-  const indexed = new Map(indexRows.map((item) => [item.msg_id, item]));
   const messages = new Map();
   for (const message of canonical) {
-    const index = indexed.get(message.id);
     messages.set(message.id, {
       hash: messageHash14(message),
-      updatedAt: Number.isSafeInteger(index?.updated_at)
-        ? index.updated_at
-        : Number.isSafeInteger(message.updatedAt)
-          ? message.updatedAt
-          : message.timestamp,
+      updatedAt: Number.isSafeInteger(message.updatedAt)
+        ? message.updatedAt
+        : Number.isSafeInteger(message.timestamp)
+          ? message.timestamp
+          : 0,
       deletedAt: null,
     });
-  }
-  for (const index of indexRows) {
-    if (index.deleted_at != null) {
-      messages.set(index.msg_id, {
-        hash: null,
-        updatedAt: index.updated_at,
-        deletedAt: index.deleted_at,
-      });
-    }
   }
   for (const tombstone of wire14Tombstones("message")) {
     if (
@@ -616,6 +729,13 @@ async function handleMessageDiff14(payload, appDataPath) {
       deleteMessages.sort((left, right) => left.msgId.localeCompare(right.msgId));
       results.push({ ...identity, ok: true, pullMessageIds, pushTopic, deleteMessages });
     } catch (error) {
+      getLogger().logOperation(
+        "messages",
+        "wire14_diff",
+        `${state.ownerType}/${state.ownerId}/${topicId}`,
+        "error",
+        error.message,
+      );
       results.push({
         ...identity,
         ok: false,
@@ -641,19 +761,35 @@ async function handleDelete14(payload, appDataPath) {
     result = await deleteEntity({ id: ownerId, type: "avatar", ownerType, deletedAt, appDataPath });
   } else if (targetType === "topic") {
     requireId(topicId, "SYNC_ENTITY_DELETE.topicId");
-    const row = getEntityIndex(topicId, "topic");
-    if (row) assertTopicOwner(row, ownerType, ownerId, topicId);
-    result = row
-      ? await deleteEntity({ id: topicId, type: `${ownerType}_topic`, deletedAt, appDataPath })
-      : { success: true };
+    result = await deletePhysicalTopic(
+      appDataPath,
+      ownerType,
+      ownerId,
+      topicId,
+    );
   } else if (targetType === "message") {
     requireId(topicId, "SYNC_ENTITY_DELETE.topicId");
     requireId(msgId, "SYNC_ENTITY_DELETE.msgId");
-    const row = getEntityIndex(topicId, "topic");
-    if (row) assertTopicOwner(row, ownerType, ownerId, topicId);
-    result = row
-      ? await deleteMessage({ msgId, topicId, deletedAt, appDataPath })
-      : { success: true };
+    const physical = await readPhysicalTopic(
+      appDataPath,
+      ownerType,
+      ownerId,
+      topicId,
+    );
+    if (physical) {
+      const historyPath = topicHistoryPath(appDataPath, ownerId, topicId);
+      const release = await acquireLock(historyPath);
+      try {
+        const { history, sourceHash } = await readHistoryStrict(historyPath);
+        const filtered = history.filter((message) => message?.id !== msgId);
+        if (filtered.length !== history.length) {
+          await writeHistoryAtomic(historyPath, filtered, sourceHash);
+        }
+      } finally {
+        release();
+      }
+    }
+    result = { success: true };
   } else {
     throw contractError("Invalid delete targetType", "SYNC_DELETE_INVALID");
   }
@@ -722,13 +858,44 @@ async function pullEntities14(items, appDataPath) {
     }
   }
   if (topics.length) {
-    const raw = await downloadEntities(topics.map((item) => ({ id: item.topicId, type: `${item.ownerType}_topic` })));
-    const found = new Map(raw.map((item) => [`${item.type}\0${item.id}`, item]));
     for (const item of topics) {
-      const value = found.get(`${item.ownerType}_topic\0${item.topicId}`);
-      results.push(value?.success
-        ? { ...entityPublic(item), ok: true, data: value.data }
-        : { ...entityPublic(item), ok: false, error: resultError(value?.error || "entity not found", { code: "SYNC_ENTITY_READ_FAILED", stage: "topic_metadata", failedTopicIds: [item.topicId] }) });
+      try {
+        const physical = await readPhysicalTopic(
+          appDataPath,
+          item.ownerType,
+          item.ownerId,
+          item.topicId,
+        );
+        results.push(physical
+          ? {
+              ...entityPublic(item),
+              ok: true,
+              data: extractTopicDTO(
+                physical.topic,
+                item.ownerId,
+                item.ownerType,
+              ),
+            }
+          : {
+              ...entityPublic(item),
+              ok: false,
+              error: resultError("entity not found", {
+                code: "SYNC_ENTITY_NOT_FOUND",
+                stage: "topic_metadata",
+                failedTopicIds: [item.topicId],
+              }),
+            });
+      } catch (error) {
+        results.push({
+          ...entityPublic(item),
+          ok: false,
+          error: resultError(error, {
+            code: "SYNC_ENTITY_READ_FAILED",
+            stage: "topic_metadata",
+            failedTopicIds: [item.topicId],
+          }),
+        });
+      }
     }
   }
   return results;
@@ -754,42 +921,166 @@ async function pushEntities14(items, appDataPath) {
     }
   }
   if (topics.length) {
-    const raw = await uploadEntitiesBatch(topics.map((item) => ({
-      id: item.topicId,
-      type: `${item.ownerType}_topic`,
-      data: { ...item.data, ownerType: item.ownerType, ownerId: item.ownerId },
-    })), appDataPath);
-    const found = new Map(raw.map((item) => [item.id, item]));
     for (const item of topics) {
-      const value = found.get(item.topicId);
-      results.push(value?.success
-        ? { ...entityPublic(item), ok: true }
-        : { ...entityPublic(item), ok: false, error: resultError(value?.error || "entity write failed", { code: "SYNC_ENTITY_WRITE_FAILED", stage: "topic_metadata", failedTopicIds: [item.topicId] }) });
+      try {
+        await writePhysicalTopic(appDataPath, item);
+        results.push({ ...entityPublic(item), ok: true });
+      } catch (error) {
+        getLogger().logOperation(
+          "topic_metadata",
+          "wire14_push",
+          `${item.ownerType}/${item.ownerId}/${item.topicId}`,
+          "error",
+          error.message,
+        );
+        results.push({
+          ...entityPublic(item),
+          ok: false,
+          error: resultError(error, {
+            code: "SYNC_ENTITY_WRITE_FAILED",
+            stage: "topic_metadata",
+            failedTopicIds: [item.topicId],
+          }),
+        });
+      }
     }
   }
   return results;
 }
 
-class BufferedResponse {
-  constructor() {
-    this.headers = new Map();
-    this.lines = [];
-    this.statusCode = 200;
-    this.jsonBody = undefined;
-    this.writableEnded = false;
-    this.writableFinished = false;
-    this.destroyed = false;
-    this.closed = false;
+async function pullMessages14(topic, appDataPath) {
+  const physical = await readPhysicalTopic(
+    appDataPath,
+    topic.ownerType,
+    topic.ownerId,
+    topic.topicId,
+  );
+  if (!physical) {
+    throw Object.assign(new Error("topic not found"), {
+      code: "TOPIC_NOT_FOUND",
+    });
   }
-  setHeader(key, value) { this.headers.set(key, value); }
-  flushHeaders() {}
-  status(value) { this.statusCode = value; return this; }
-  json(value) { this.jsonBody = value; this.writableEnded = true; return this; }
-  write(value) { this.lines.push(String(value)); return true; }
-  end() { this.writableEnded = true; this.writableFinished = true; }
+  const historyPath = topicHistoryPath(
+    appDataPath,
+    topic.ownerId,
+    topic.topicId,
+  );
+  const { history } = await readHistoryStrict(historyPath);
+  const canonical = canonicalizeHistory(history, topic.topicId).frame.messages;
+  const wanted = new Set(topic.messageIds);
+  const selected = wanted.size === 0
+    ? canonical
+    : canonical.filter((message) => wanted.has(message.id));
+  if (
+    wanted.size > 0 &&
+    (selected.length !== wanted.size ||
+      selected.some((message) => !wanted.has(message.id)))
+  ) {
+    throw Object.assign(new Error("requested message set is incomplete"), {
+      code: "SYNC_MESSAGE_READ_FAILED",
+    });
+  }
+  const messages = selected.map((message) => {
+    const { contentHash, ...value } = message;
+    value.updatedAt = Number.isSafeInteger(value.updatedAt)
+      ? value.updatedAt
+      : Number.isSafeInteger(value.timestamp)
+        ? value.timestamp
+        : 0;
+    return value;
+  });
+  return {
+    kind: "topic",
+    topicId: topic.topicId,
+    ownerType: topic.ownerType,
+    ownerId: topic.ownerId,
+    ok: true,
+    messages,
+  };
 }
 
-async function* validatedMessagePush(input, captured) {
+async function pushMessages14(frame, appDataPath) {
+  const physical = await readPhysicalTopic(
+    appDataPath,
+    frame.ownerType,
+    frame.ownerId,
+    frame.topicId,
+  );
+  if (!physical) {
+    throw Object.assign(new Error("topic not found"), {
+      code: "TOPIC_NOT_FOUND",
+    });
+  }
+  const historyPath = topicHistoryPath(
+    appDataPath,
+    frame.ownerId,
+    frame.topicId,
+  );
+  const release = await acquireLock(historyPath);
+  try {
+    await fs.mkdir(path.dirname(historyPath), { recursive: true });
+    const { history, sourceHash } = await readHistoryStrict(historyPath);
+    const persistedTombstones = new Set(
+      wire14Tombstones("message")
+        .filter((item) =>
+          item.owner_type === frame.ownerType &&
+          item.owner_id === frame.ownerId &&
+          item.topic_id === frame.topicId
+        )
+        .map((item) => item.msg_id),
+    );
+    const staleLive = frame.messages.find((message) =>
+      persistedTombstones.has(message?.id)
+    );
+    if (staleLive) {
+      throw Object.assign(
+        new Error(`Mobile push contains tombstoned message ${frame.topicId}/${staleLive.id}`),
+        { code: "SYNC_SNAPSHOT_STALE" },
+      );
+    }
+    const projected = await projectMobileTopic({
+      topicId: frame.topicId,
+      ownerType: frame.ownerType,
+      ownerId: frame.ownerId,
+      messages: frame.messages,
+      db: getDb(),
+      appDataPath,
+    });
+    const messageMap = new Map(
+      history
+        .filter((message) => !persistedTombstones.has(message?.id))
+        .map((message) => [message.id, message]),
+    );
+    for (const message of projected.messages) messageMap.set(message.id, message);
+    for (const tombstone of frame.deletedMessages) {
+      messageMap.delete(tombstone.msgId);
+      recordWire14Tombstone({
+        targetType: "message",
+        ownerType: frame.ownerType,
+        ownerId: frame.ownerId,
+        topicId: frame.topicId,
+        msgId: tombstone.msgId,
+        deletedAt: tombstone.deletedAt,
+      });
+    }
+    const finalHistory = [...messageMap.values()].sort(
+      (left, right) => (left.timestamp || 0) - (right.timestamp || 0),
+    );
+    await writeHistoryAtomic(historyPath, finalHistory, sourceHash);
+    return {
+      kind: "topic",
+      topicId: frame.topicId,
+      ownerType: frame.ownerType,
+      ownerId: frame.ownerId,
+      ok: true,
+      neededAttachmentHashes: projected.neededAttachmentHashes,
+    };
+  } finally {
+    release();
+  }
+}
+
+async function* validatedMessagePush(input) {
   let topicCount = 0;
   let messageCount = 0;
   const seen = new Set();
@@ -824,25 +1115,8 @@ async function* validatedMessagePush(input, captured) {
       if (deleted.has(tombstone.msgId)) throw contractError("Duplicate message tombstone", "SYNC_REQUEST_INVALID");
       deleted.add(tombstone.msgId);
     }
-    captured.push(frame);
-    yield Buffer.from(`${JSON.stringify({
-      topicId: frame.topicId,
-      ownerType: frame.ownerType,
-      ownerId: frame.ownerId,
-      messages: frame.messages,
-    })}\n`);
+    yield frame;
   }
-}
-
-function parseBufferedLines(buffer) {
-  return buffer.lines.flatMap((chunk) => chunk.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line)));
-}
-
-function sendBufferedNdjson(res, buffer, frames) {
-  res.status(buffer.statusCode || 200);
-  res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
-  for (const frame of frames) res.write(`${JSON.stringify(frame)}\n`);
-  res.end();
 }
 
 function sendRouteError(res, status, error, fallback) {
@@ -907,41 +1181,26 @@ function registerWire14Routes(router, { appDataPath }) {
         requireOwner(topic.ownerType, topic.ownerId);
         if (!Array.isArray(topic.messageIds)) throw contractError("messageIds must be an array", "SYNC_REQUEST_INVALID");
       }
-      const buffer = new BufferedResponse();
-      await downloadMessagesStreamRaw(topics.map((topic) => ({
-        topicId: topic.topicId,
-        ownerType: topic.ownerType,
-        ownerId: topic.ownerId,
-        msgIds: topic.messageIds,
-      })), appDataPath, buffer);
-      if (buffer.jsonBody !== undefined) return res.status(buffer.statusCode).json(buffer.jsonBody);
-      const db = getDb();
-      const frames = parseBufferedLines(buffer).map((frame) => {
-        if (frame._error) {
-          return {
+      res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+      for (const topic of topics) {
+        try {
+          res.write(`${JSON.stringify(await pullMessages14(topic, appDataPath))}\n`);
+        } catch (error) {
+          res.write(`${JSON.stringify({
             kind: "topic",
-            topicId: frame.topicId,
-            ownerType: frame.ownerType,
-            ownerId: frame.ownerId,
+            topicId: topic.topicId,
+            ownerType: topic.ownerType,
+            ownerId: topic.ownerId,
             ok: false,
-            error: typeof frame._error === "object" ? frame._error : resultError(frame._error, { code: "SYNC_MESSAGE_READ_FAILED", stage: "messages", failedTopicIds: [frame.topicId] }),
-          };
+            error: resultError(error, {
+              code: error.code || "SYNC_MESSAGE_READ_FAILED",
+              stage: "messages",
+              failedTopicIds: [topic.topicId],
+            }),
+          })}\n`);
         }
-        const messages = (frame.messages || []).map((message) => {
-          const indexed = db?.prepare(
-            "SELECT updated_at FROM message_index WHERE topic_id = ? AND msg_id = ? AND deleted_at IS NULL",
-          ).get(frame.topicId, message.id);
-          const { contentHash, ...value } = message;
-          value.updatedAt = Number.isSafeInteger(indexed?.updated_at)
-            ? indexed.updated_at
-            : Number.isSafeInteger(value.updatedAt)
-              ? value.updatedAt
-              : value.timestamp;
-          return value;
-        });
-        return { kind: "topic", topicId: frame.topicId, ownerType: frame.ownerType, ownerId: frame.ownerId, ok: true, messages };
-      });
-      sendBufferedNdjson(res, buffer, frames);
+      }
+      res.end();
     } catch (error) {
       sendRouteError(res, error.code === "SYNC_REQUEST_INVALID" || error.code === "SYNC_PROTOCOL_INVALID" ? 400 : 500, error, {
         code: error.code || "SYNC_MESSAGE_READ_FAILED",
@@ -952,43 +1211,37 @@ function registerWire14Routes(router, { appDataPath }) {
 
   router.post("/messages/push", async (req, res) => {
     try {
-      const inputFrames = [];
-      const buffer = new BufferedResponse();
-      await uploadMessagesBatchRaw(validatedMessagePush(req, inputFrames), appDataPath, buffer);
-      if (buffer.jsonBody !== undefined) return res.status(buffer.statusCode).json(buffer.jsonBody);
-      const rawResults = parseBufferedLines(buffer);
-      const byTopic = new Map(rawResults.filter((item) => item.topicId).map((item) => [item.topicId, item]));
-      for (const frame of inputFrames) {
-        const raw = byTopic.get(frame.topicId);
-        if (!raw?.success || frame.deletedMessages.length === 0) continue;
-        for (const tombstone of frame.deletedMessages) {
-          const result = await deleteMessage({
-            msgId: tombstone.msgId,
+      res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+      for await (const frame of validatedMessagePush(req)) {
+        try {
+          res.write(`${JSON.stringify(await pushMessages14(frame, appDataPath))}\n`);
+        } catch (error) {
+          res.write(`${JSON.stringify({
+            kind: "topic",
             topicId: frame.topicId,
-            deletedAt: tombstone.deletedAt,
-            appDataPath,
-          });
-          if (!result?.success) {
-            raw.success = false;
-            raw.error = resultError(result?.error || "message delete failed", {
-              code: "SYNC_DELETE_FAILED",
+            ownerType: frame.ownerType,
+            ownerId: frame.ownerId,
+            ok: false,
+            error: resultError(error, {
+              code: error.code || "SYNC_MESSAGE_WRITE_FAILED",
               stage: "messages",
               failedTopicIds: [frame.topicId],
-            });
-            break;
-          }
+            }),
+          })}\n`);
         }
       }
-      const frames = rawResults.map((raw) => {
-        if (raw._stream_error || raw.kind === "error") {
-          return { kind: "error", error: raw.error || resultError(raw._stream_error, { code: "SYNC_STREAM_FAILED", stage: "messages" }) };
-        }
-        return raw.success
-          ? { kind: "topic", topicId: raw.topicId, ok: true, neededAttachmentHashes: raw.neededAttachmentHashes || [] }
-          : { kind: "topic", topicId: raw.topicId, ok: false, error: typeof raw.error === "object" ? raw.error : resultError(raw.error, { code: "SYNC_MESSAGE_WRITE_FAILED", stage: "messages", failedTopicIds: [raw.topicId] }) };
-      });
-      sendBufferedNdjson(res, buffer, frames);
+      res.end();
     } catch (error) {
+      if (res.headersSent) {
+        res.write(`${JSON.stringify({
+          kind: "error",
+          error: resultError(error, {
+            code: error.code || "SYNC_MESSAGE_WRITE_FAILED",
+            stage: "messages",
+          }),
+        })}\n`);
+        return res.end();
+      }
       sendRouteError(res, error.code === "SYNC_REQUEST_INVALID" || error.code === "SYNC_PROTOCOL_INVALID" ? 400 : 500, error, {
         code: error.code || "SYNC_MESSAGE_WRITE_FAILED",
         stage: "messages",
