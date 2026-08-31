@@ -7,6 +7,7 @@ const {
   LEGACY_WIRE_PROTOCOL_VERSION,
   parseJsonWithoutDuplicateKeys,
   resolveWireProtocol,
+  validateSyncRequestFrame,
 } = require("../protocol");
 const {
   createSyncError,
@@ -31,18 +32,28 @@ function errorStageForPayload(payload, versionAccepted, currentStage) {
   if (!versionAccepted || payload?.type === "VERSION_CHECK") return "handshake";
   if (payload?.type === "SYNC_ERROR") return "shutdown";
   if (
+    payload?.type === "SYNC_MESSAGE_DIFF_REQUEST" ||
     payload?.type === "SYNC_MESSAGE_DIFF_BATCH" ||
     payload?.type === "GET_MESSAGE_MANIFEST"
   ) {
     return "messages";
   }
   if (
+    payload?.type === "SYNC_TOPIC_DIFF_REQUEST" ||
     payload?.type === "SYNC_TOPIC_HASH_BATCH" ||
     payload?.type === "SYNC_TOPIC_HASH_BATCH_V2"
   ) {
     return "topic_validation";
   }
-  if (payload?.type === "SYNC_MANIFEST") {
+  if (
+    payload?.type === "SYNC_MANIFEST" ||
+    payload?.type === "SYNC_MANIFEST_REQUEST"
+  ) {
+    if (payload?.manifestType) {
+      return payload.manifestType === "topic"
+        ? "topic_metadata"
+        : "owner_metadata";
+    }
     return ["topic", "agent_topic", "group_topic"].includes(payload.dataType)
       ? "topic_metadata"
       : "owner_metadata";
@@ -51,7 +62,10 @@ function errorStageForPayload(payload, versionAccepted, currentStage) {
     payload?.type === "SYNC_ENTITY_UPDATE" ||
     payload?.type === "SYNC_ENTITY_DELETE"
   ) {
-    if (payload.dataType === "message") return "messages";
+    if (payload.dataType === "message" || payload.targetType === "message") {
+      return "messages";
+    }
+    if (payload.targetType === "topic") return "topic_metadata";
     return ["topic", "agent_topic", "group_topic"].includes(payload.dataType)
       ? "topic_metadata"
       : "owner_metadata";
@@ -228,6 +242,7 @@ function startWsServer({ port, syncToken, onMessage }) {
         const frameProtocolVersion = payload.type === "VERSION_CHECK"
           ? resolveWireProtocol(payload)
           : protocolVersion;
+        validateSyncRequestFrame(payload, frameProtocolVersion);
         if (payload.type === "SYNC_ERROR") {
           throw withSyncErrorContext(
             parseClientSyncFailure(payload.error, frameProtocolVersion),

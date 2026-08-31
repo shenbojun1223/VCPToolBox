@@ -37,6 +37,7 @@ const {
   downloadDesktopConfigs,
   uploadDesktopConfigs,
 } = require("../sync/desktop-config");
+const { registerWire14Routes } = require("../wire14");
 
 function entityStage(type) {
   return ["topic", "agent_topic", "group_topic"].includes(type)
@@ -134,6 +135,11 @@ function registerRoutes(app, { syncToken, appDataPath, centralSync = null }) {
 
     next();
   });
+
+  // Wire 1.4 uses compound owner/topic identities and unified resource paths.
+  // These routes share the same authentication middleware while the legacy
+  // Wire 1.1/1.2 endpoints below remain available to VCPMobile.
+  registerWire14Routes(router, { appDataPath });
 
   // Desktop-only extension. Mobile DTOs stay on the negotiated Wire 1.1/1.2 contract,
   // while desktop clients can additionally synchronize complete configs.

@@ -6,14 +6,16 @@ const { test } = require("node:test");
 const manifest = require("../Plugin/VCPChatSyncHub/plugin-manifest.json");
 const {
   LEGACY_WIRE_PROTOCOL_VERSION,
+  WIRE_14_PROTOCOL_VERSION,
   createPhaseAck,
   createVersionAck,
   parseJsonWithoutDuplicateKeys,
   resolveDeleteTimestamp,
+  validateSyncRequestFrame,
 } = require("../Plugin/VCPChatSyncHub/protocol");
 
-test("VCPMobileSync 错误契约版本与移动端 1.2.0 对齐", () => {
-  assert.equal(manifest.version, "1.2.0");
+test("插件包升级到 1.4，同时保持 Wire 1.2 的广告版本", () => {
+  assert.equal(manifest.version, "1.4.0");
   assert.deepEqual(
     createVersionAck(
       {
@@ -29,6 +31,41 @@ test("VCPMobileSync 错误契约版本与移动端 1.2.0 对齐", () => {
       pluginVersion: "1.2.0",
       protocolVersion: "1.2",
     },
+  );
+});
+
+test("VCPChat desktop 协商 Wire 1.4", () => {
+  assert.equal(WIRE_14_PROTOCOL_VERSION, "1.4");
+  assert.deepEqual(
+    createVersionAck(
+      {
+        type: "VERSION_CHECK",
+        mobileVersion: "vcpchat-desktop-sync-1.4",
+        protocolVersion: "1.4",
+      },
+      manifest.version,
+    ),
+    {
+      type: "VERSION_ACK",
+      pluginVersion: "1.4.0",
+      protocolVersion: "1.4",
+    },
+  );
+});
+
+test("Wire 1.4 request frame 使用精确字段，旧协议不受影响", () => {
+  const valid = {
+    type: "SYNC_MANIFEST_REQUEST",
+    manifestType: "owner",
+    items: [],
+  };
+  assert.equal(validateSyncRequestFrame(valid, "1.4"), valid);
+  assert.throws(
+    () => validateSyncRequestFrame({ ...valid, phase: 1 }, "1.4"),
+    (error) => error.code === "PROTOCOL_INVALID",
+  );
+  assert.doesNotThrow(() =>
+    validateSyncRequestFrame({ ...valid, phase: 1 }, "1.2"),
   );
 });
 test("官方 VCPMobile 1.1.3 省略 protocolVersion 时保持兼容", () => {

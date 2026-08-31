@@ -41,6 +41,12 @@ const {
 } = require("./protocol");
 const { withSyncErrorContext } = require("./error-contract");
 const {
+  handleDelete14,
+  handleManifest14,
+  handleMessageDiff14,
+  handleTopicDiff14,
+} = require("./wire14");
+const {
   AGENT_SYNC_FIELDS,
   GROUP_SYNC_FIELDS,
   AGENT_TOPIC_SYNC_FIELDS,
@@ -101,6 +107,26 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
       };
 
       switch (payload.type) {
+        case "SYNC_MANIFEST_REQUEST": {
+          logger.logOperation(
+            "websocket",
+            "message",
+            payload.type,
+            "info",
+            `manifestType=${payload.manifestType}`,
+          );
+          return handleManifest14(payload, appDataPath);
+        }
+        case "SYNC_TOPIC_DIFF_REQUEST": {
+          const topicCount = Array.isArray(payload.topics) ? payload.topics.length : 0;
+          logger.logOperation("websocket", "message", payload.type, "info", `topics=${topicCount}`);
+          return handleTopicDiff14(payload, appDataPath);
+        }
+        case "SYNC_MESSAGE_DIFF_REQUEST": {
+          const topicCount = Array.isArray(payload.topics) ? payload.topics.length : 0;
+          logger.logOperation("websocket", "message", payload.type, "info", `topics=${topicCount}`);
+          return handleMessageDiff14(payload, appDataPath);
+        }
         case "SYNC_MANIFEST": {
           logger.logOperation("websocket", "message", payload.type, "info", `dataType=${payload.dataType}`);
 
@@ -208,6 +234,9 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
           return createVersionAck(payload, manifest.version);
         }
         case "SYNC_ENTITY_DELETE": {
+          if (connection.protocolVersion === "1.4") {
+            return handleDelete14(payload, appDataPath);
+          }
           const { id: rawId, dataType, topicId } = payload;
           let safeId = "";
           let avatarOwnerType = null;

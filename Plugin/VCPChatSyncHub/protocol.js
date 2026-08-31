@@ -5,10 +5,18 @@ const LEGACY_WIRE_PROTOCOL_VERSION = "1.1";
 const LEGACY_PLUGIN_VERSION = "1.1.0";
 const LEGACY_MOBILE_COMPAT_VERSION = "1.0.0";
 const WIRE_PROTOCOL_VERSION = "1.2";
-const EXPECTED_PLUGIN_VERSION = "1.2.0";
+const STRICT_PLUGIN_VERSION = "1.2.0";
+const WIRE_14_PROTOCOL_VERSION = "1.4";
+const EXPECTED_PLUGIN_VERSION = "1.4.0";
 const SUPPORTED_WIRE_PROTOCOL_VERSIONS = new Set([
   LEGACY_WIRE_PROTOCOL_VERSION,
   WIRE_PROTOCOL_VERSION,
+  WIRE_14_PROTOCOL_VERSION,
+]);
+const WIRE_14_PHASES = new Set([
+  "owner_metadata",
+  "topic_metadata",
+  "messages",
 ]);
 
 function parseJsonWithoutDuplicateKeys(text) {
@@ -143,7 +151,7 @@ function resolveWireProtocol(payload) {
     );
   if (!SUPPORTED_WIRE_PROTOCOL_VERSIONS.has(protocolVersion)) {
     const error = new Error(
-      `wire protocol mismatch: supported ${LEGACY_WIRE_PROTOCOL_VERSION} or ${WIRE_PROTOCOL_VERSION}, received ${protocolVersion}`,
+      `wire protocol mismatch: supported ${LEGACY_WIRE_PROTOCOL_VERSION}, ${WIRE_PROTOCOL_VERSION}, or ${WIRE_14_PROTOCOL_VERSION}, received ${protocolVersion}`,
     );
     error.code = "PROTOCOL_MISMATCH";
     throw error;
@@ -174,12 +182,143 @@ function createVersionAck(payload, pluginVersion) {
       protocolVersion: LEGACY_WIRE_PROTOCOL_VERSION,
     };
   }
+  if (protocolVersion === WIRE_PROTOCOL_VERSION) {
+    return {
+      type: "VERSION_ACK",
+      version: STRICT_PLUGIN_VERSION,
+      pluginVersion: STRICT_PLUGIN_VERSION,
+      protocolVersion: WIRE_PROTOCOL_VERSION,
+    };
+  }
   return {
     type: "VERSION_ACK",
-    version: pluginVersion,
     pluginVersion,
-    protocolVersion: WIRE_PROTOCOL_VERSION,
+    protocolVersion: WIRE_14_PROTOCOL_VERSION,
   };
+}
+
+function requireExactKeys(payload, fields, label) {
+  const expected = new Set(fields);
+  const actual = Object.keys(payload);
+  if (
+    actual.length !== expected.size ||
+    actual.some((field) => !expected.has(field))
+  ) {
+    const error = new Error(`${label} has unexpected or missing fields`);
+    error.code = "PROTOCOL_INVALID";
+    throw error;
+  }
+}
+
+/**
+ * Wire 1.4 deliberately uses exact request shapes and compound identities.
+ * Older negotiated connections keep their existing permissive frame contract.
+ */
+function validateSyncRequestFrame(payload, protocolVersion) {
+  if (protocolVersion !== WIRE_14_PROTOCOL_VERSION) return payload;
+
+  switch (payload.type) {
+    case "VERSION_CHECK":
+      requireExactKeys(
+        payload,
+        ["type", "mobileVersion", "protocolVersion"],
+        payload.type,
+      );
+      break;
+    case "PHASE_START":
+      requireExactKeys(payload, ["type", "phase"], payload.type);
+      if (!WIRE_14_PHASES.has(payload.phase)) {
+        const error = new Error(
+          "phase must be owner_metadata, topic_metadata or messages",
+        );
+        error.code = "PROTOCOL_INVALID";
+        throw error;
+      }
+      break;
+    case "PHASE_COMPLETED":
+      requireExactKeys(
+        payload,
+        payload.phase === "messages"
+          ? ["type", "phase", "sessionId", "attemptId", "nonce"]
+          : ["type", "phase"],
+        payload.type,
+      );
+      if (!WIRE_14_PHASES.has(payload.phase)) {
+        const error = new Error(
+          "phase must be owner_metadata, topic_metadata or messages",
+        );
+        error.code = "PROTOCOL_INVALID";
+        throw error;
+      }
+      if (
+        payload.phase === "messages" &&
+        (!Number.isSafeInteger(payload.sessionId) ||
+          !Number.isSafeInteger(payload.attemptId) ||
+          typeof payload.nonce !== "string" ||
+          payload.nonce.length === 0)
+      ) {
+        const error = new Error(
+          "messages PHASE_COMPLETED requires sessionId, attemptId and nonce",
+        );
+        error.code = "PROTOCOL_INVALID";
+        throw error;
+      }
+      break;
+    case "SYNC_MANIFEST_REQUEST":
+      if (!["owner", "topic", "avatar"].includes(payload.manifestType)) {
+        const error = new Error("Invalid manifestType");
+        error.code = "PROTOCOL_INVALID";
+        throw error;
+      }
+      requireExactKeys(
+        payload,
+        payload.manifestType === "topic"
+          ? ["type", "manifestType", "items", "targetedOwners"]
+          : ["type", "manifestType", "items"],
+        payload.type,
+      );
+      break;
+    case "SYNC_TOPIC_DIFF_REQUEST":
+    case "SYNC_MESSAGE_DIFF_REQUEST":
+      requireExactKeys(payload, ["type", "topics"], payload.type);
+      break;
+    case "SYNC_ENTITY_DELETE": {
+      const fields = {
+        owner: ["type", "targetType", "ownerType", "ownerId", "deletedAt"],
+        topic: [
+          "type",
+          "targetType",
+          "ownerType",
+          "ownerId",
+          "topicId",
+          "deletedAt",
+        ],
+        avatar: ["type", "targetType", "ownerType", "ownerId", "deletedAt"],
+        message: [
+          "type",
+          "targetType",
+          "ownerType",
+          "ownerId",
+          "topicId",
+          "msgId",
+          "deletedAt",
+        ],
+      }[payload.targetType];
+      if (!fields) {
+        const error = new Error("Invalid delete targetType");
+        error.code = "PROTOCOL_INVALID";
+        throw error;
+      }
+      requireExactKeys(payload, fields, payload.type);
+      break;
+    }
+    case "SYNC_ERROR":
+      requireExactKeys(payload, ["type", "error"], payload.type);
+      break;
+    default:
+      break;
+  }
+  return payload;
 }
 
 function resolveDeleteTimestamp(value, protocolVersion, now = Date.now) {
@@ -226,10 +365,13 @@ module.exports = {
   LEGACY_MOBILE_COMPAT_VERSION,
   LEGACY_PLUGIN_VERSION,
   LEGACY_WIRE_PROTOCOL_VERSION,
+  STRICT_PLUGIN_VERSION,
   WIRE_PROTOCOL_VERSION,
+  WIRE_14_PROTOCOL_VERSION,
   createPhaseAck,
   createVersionAck,
   parseJsonWithoutDuplicateKeys,
   resolveDeleteTimestamp,
   resolveWireProtocol,
+  validateSyncRequestFrame,
 };

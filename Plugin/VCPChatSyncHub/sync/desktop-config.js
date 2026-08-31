@@ -232,6 +232,7 @@ async function uploadDesktopConfigs(appDataPath, items) {
 module.exports = {
   sanitizeDesktopConfig,
   computeDesktopConfigHash,
+  refreshDesktopConfigIndex,
   compareDesktopConfigManifest,
   downloadDesktopConfigs,
   uploadDesktopConfigs,

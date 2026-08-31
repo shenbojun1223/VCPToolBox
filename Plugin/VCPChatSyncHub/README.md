@@ -2,7 +2,8 @@
 
 VCPChatSyncHub turns VCPToolBox into a central data plane shared by multiple
 VCPChat desktop clients and VCPMobile. It supports released VCPMobile 1.1.3 on
-legacy Wire 1.1 and protocol-aware clients on strict Wire 1.2 while keeping one
+legacy Wire 1.1, protocol-aware VCPMobile clients on strict Wire 1.2, and
+desktop clients on compound-identity Wire 1.4 while keeping one
 AppData-compatible entity layout for agents, groups, topics, messages, avatars,
 attachments and deletion tombstones.
 
@@ -34,7 +35,9 @@ frame must be `VERSION_CHECK`. A missing `protocolVersion`, as emitted by the
 released VCPMobile 1.1.3 APK, negotiates legacy Wire 1.1 and receives
 `version: "1.0.0"`, `pluginVersion: "1.1.0"`, and `protocolVersion: "1.1"`.
 An explicit `protocolVersion: "1.2"` receives the strict 1.2 contract and
-plugin version 1.2.0. Other versions fail closed.
+advertised plugin version 1.2.0. Wire 1.4 receives plugin version 1.4.0 plus
+the unified `/entities/*`, `/messages/*`, and `/avatars/*` HTTP contract.
+Other versions fail closed.
 
 Compatibility is scoped to the negotiated connection. Wire 1.1 accepts the
 known 1.1.3 omissions: topic `ownerId`, the Phase 2.5 compound `topics` array,
