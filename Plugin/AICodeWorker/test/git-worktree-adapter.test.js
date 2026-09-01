@@ -133,6 +133,13 @@ async function cleanupFixture(fixture) {
     let entries = await fixture.adapter.list(fixture.repoRoot);
     for (const entry of entries) {
         if (samePath(entry.path, fixture.repoRoot)) continue;
+        const trackedPath = [...fixture.worktrees].find(target => samePath(target, entry.path));
+        assert.ok(trackedPath, "cleanup refuses an untracked fixture Worktree");
+        const relative = path.relative(fixture.workspaceBaseRoot, entry.path);
+        assert.notEqual(relative, "");
+        assert.equal(relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative), false);
+        assert.deepEqual(officialWorktreeEntry(fixture, entry.path), entry,
+            "cleanup requires the direct Git registration to match Adapter observation");
         if (entry.locked) await fixture.adapter.unlock(fixture.repoRoot, entry.path);
         git(entry.path, ["reset", "--hard", "HEAD"], true);
         git(entry.path, ["clean", "-fd"], true);
@@ -354,6 +361,75 @@ test("remove rejects a dirty Worktree, preserves it, then succeeds after it is c
     assert.equal(fs.existsSync(created.target), false);
 });
 
+test("discardExpected fails closed on a foreign lock identity and preserves the registration", async () => {
+    const fixture = createFixture();
+    const created = await addWorktree(fixture, "discard-foreign", "session reason");
+    const otherAdapter = new GitWorktreeAdapter({ workspaceBaseRoot: fixture.workspaceBaseRoot });
+    const expected = {
+        path: created.entry.path,
+        head: created.entry.head,
+        branch: created.entry.branch,
+        locked: true,
+        lockReason: created.entry.lockReason
+    };
+    await otherAdapter.unlock(fixture.repoRoot, created.target);
+    await otherAdapter.lock(fixture.repoRoot, created.target, "foreign reason");
+
+    await rejectsCode(() => fixture.adapter.discardExpected({
+        repoRoot: fixture.repoRoot,
+        workspaceBaseRoot: fixture.workspaceBaseRoot,
+        expected
+    }), "WORKTREE_EXPECTED_IDENTITY_MISMATCH");
+
+    const preserved = officialWorktreeEntry(fixture, created.target);
+    assert.ok(preserved);
+    assert.equal(preserved.locked, true);
+    assert.equal(preserved.lockReason, "foreign reason");
+    assert.equal(preserved.head, expected.head);
+    await otherAdapter.unlock(fixture.repoRoot, created.target);
+    await otherAdapter.remove(fixture.repoRoot, created.target, fixture.workspaceBaseRoot);
+});
+
+test("discardExpected reports bounded dirty failure, restores the lock, and permits a clean retry", async () => {
+    const fixture = createFixture();
+    const created = await addWorktree(fixture, "discard-dirty", "restore this reason");
+    const expected = {
+        path: created.entry.path,
+        head: created.entry.head,
+        branch: created.entry.branch,
+        locked: true,
+        lockReason: created.entry.lockReason
+    };
+    fs.appendFileSync(path.join(created.target, "tracked.txt"), "dirty discard fixture\n");
+
+    let caught;
+    try {
+        await fixture.adapter.discardExpected({
+            repoRoot: fixture.repoRoot,
+            workspaceBaseRoot: fixture.workspaceBaseRoot,
+            expected
+        });
+    } catch (error) {
+        caught = error;
+    }
+    assert.ok(caught instanceof GitWorktreeError);
+    assert.equal(caught.code, "WORKTREE_DISCARD_BLOCKED");
+    assert.deepEqual(caught.details, { cause: "WORKTREE_REMOVE_FAILED", relocked: true });
+    assert.deepEqual(Object.keys(caught.details).sort(), ["cause", "relocked"]);
+    const relocked = officialWorktreeEntry(fixture, created.target);
+    assert.equal(relocked.locked, true);
+    assert.equal(relocked.lockReason, expected.lockReason);
+    assert.equal(relocked.head, expected.head);
+
+    git(created.target, ["reset", "--hard", "HEAD"]);
+    await fixture.adapter.discardExpected({
+        repoRoot: fixture.repoRoot,
+        workspaceBaseRoot: fixture.workspaceBaseRoot,
+        expected
+    });
+    assert.equal(officialWorktreeEntry(fixture, created.target), null);
+});
+
 test("repair restores a registration after a fixture-only manual directory move", async () => {
     const fixture = createFixture();
     const created = await addWorktree(fixture, "repair-old");
@@ -438,7 +514,74 @@ test("rejects absolute-path, base, identifier, reason, target, and revision viol
     const traversal = `${fixture.workspaceBaseRoot}${path.sep}..${path.sep}escape-target`;
     await rejectsCode(() => fixture.adapter.move(fixture.repoRoot, created.target, traversal, fixture.workspaceBaseRoot), "WORKTREE_PATH_INVALID");
     const unpinnedAdapter = new GitWorktreeAdapter();
-    await rejectsCode(() => unpinnedAdapter.repair(fixture.repoRoot, [created.target]), "WORKTREE_PATH_INVALID");
+    await rejectsCode(() => unpinnedAdapter.repair(fixture.repoRoot, [created.target]), "WORKTREE_WORKSPACE_ROOT_UNPINNED");
+});
+
+test("unpinned and mismatched roots reject add before creating a registration", async () => {
+    const fixture = createFixture();
+    const base = await fixture.adapter.captureBase(fixture.repoRoot);
+    const otherRoot = path.join(suiteRoot, `other-workspace-${nextFixture++}`);
+    fs.mkdirSync(otherRoot);
+    const canonicalOtherRoot = fs.realpathSync.native(otherRoot);
+    const before = await fixture.adapter.list(fixture.repoRoot);
+    const unpinnedAdapter = new GitWorktreeAdapter();
+    const mismatchedAdapter = new GitWorktreeAdapter({ workspaceBaseRoot: canonicalOtherRoot });
+
+    assert.throws(() => unpinnedAdapter.assertPinnedWorkspaceBaseRoot(fixture.workspaceBaseRoot), error => {
+        return error instanceof GitWorktreeError && error.code === "WORKTREE_WORKSPACE_ROOT_UNPINNED";
+    });
+    assert.throws(() => mismatchedAdapter.assertPinnedWorkspaceBaseRoot(fixture.workspaceBaseRoot), error => {
+        return error instanceof GitWorktreeError && error.code === "WORKTREE_WORKSPACE_ROOT_MISMATCH";
+    });
+    await rejectsCode(() => unpinnedAdapter.add({
+        base, workspaceBaseRoot: fixture.workspaceBaseRoot, workspaceId: "unpinned-add", lockReason: "reason"
+    }), "WORKTREE_WORKSPACE_ROOT_UNPINNED");
+    await rejectsCode(() => mismatchedAdapter.add({
+        base, workspaceBaseRoot: fixture.workspaceBaseRoot, workspaceId: "mismatch-add", lockReason: "reason"
+    }), "WORKTREE_WORKSPACE_ROOT_MISMATCH");
+    assert.deepEqual(await fixture.adapter.list(fixture.repoRoot), before);
+    assert.equal(fs.existsSync(path.join(fixture.workspaceBaseRoot, "unpinned-add")), false);
+    assert.equal(fs.existsSync(path.join(fixture.workspaceBaseRoot, "mismatch-add")), false);
+});
+
+test("all workspace-root mutation arguments reject a different pinned root without mutation", async () => {
+    const fixture = createFixture();
+    const created = await addWorktree(fixture, "root-argument-guard", "unchanged reason");
+    const otherRoot = path.join(suiteRoot, `mutation-root-${nextFixture++}`);
+    fs.mkdirSync(otherRoot);
+    const canonicalOtherRoot = fs.realpathSync.native(otherRoot);
+    const before = officialWorktreeEntry(fixture, created.target);
+    const expected = {
+        path: before.path,
+        head: before.head,
+        branch: before.branch,
+        locked: true,
+        lockReason: before.lockReason
+    };
+
+    await rejectsCode(() => fixture.adapter.add({
+        base: created.base,
+        workspaceBaseRoot: canonicalOtherRoot,
+        workspaceId: "wrong-root-add",
+        lockReason: "reason"
+    }), "WORKTREE_WORKSPACE_ROOT_MISMATCH");
+    await rejectsCode(() => fixture.adapter.move(
+        fixture.repoRoot, created.target, path.join(fixture.workspaceBaseRoot, "wrong-root-move"), canonicalOtherRoot
+    ), "WORKTREE_WORKSPACE_ROOT_MISMATCH");
+    await rejectsCode(() => fixture.adapter.remove(
+        fixture.repoRoot, created.target, canonicalOtherRoot
+    ), "WORKTREE_WORKSPACE_ROOT_MISMATCH");
+    await rejectsCode(() => fixture.adapter.repair(
+        fixture.repoRoot, [created.target], canonicalOtherRoot
+    ), "WORKTREE_WORKSPACE_ROOT_MISMATCH");
+    await rejectsCode(() => fixture.adapter.discardExpected({
+        repoRoot: fixture.repoRoot,
+        workspaceBaseRoot: canonicalOtherRoot,
+        expected
+    }), "WORKTREE_WORKSPACE_ROOT_MISMATCH");
+    assert.deepEqual(officialWorktreeEntry(fixture, created.target), before);
+    assert.equal(fs.existsSync(path.join(fixture.workspaceBaseRoot, "wrong-root-move")), false);
+    assert.equal(fs.existsSync(path.join(canonicalOtherRoot, "wrong-root-add")), false);
 });
 
 test("rejects symlink or junction aliases when the platform permits creating one", async t => {
@@ -454,9 +597,15 @@ test("rejects symlink or junction aliases when the platform permits creating one
         throw error;
     }
     const base = await fixture.adapter.captureBase(fixture.repoRoot);
+    const before = await fixture.adapter.list(fixture.repoRoot);
+    assert.throws(() => fixture.adapter.assertPinnedWorkspaceBaseRoot(alias), error => {
+        return error instanceof GitWorktreeError && error.code === "WORKTREE_PATH_INVALID";
+    });
     await rejectsCode(() => fixture.adapter.add({
         base, workspaceBaseRoot: alias, workspaceId: "alias", lockReason: "reason"
     }), "WORKTREE_PATH_INVALID");
+    assert.deepEqual(await fixture.adapter.list(fixture.repoRoot), before);
+    assert.equal(fs.existsSync(path.join(fixture.workspaceBaseRoot, "alias")), false);
 });
 
 test("production adapter source keeps Git execution fixed and passes static safety guards", () => {
@@ -477,6 +626,11 @@ test("production adapter source keeps Git execution fixed and passes static safe
     assert.equal(source.includes("args: object.freeze([...args])"), true);
     assert.equal(source.includes("shell: false"), true);
     assert.equal(source.includes("git_terminal_prompt"), true);
+    assert.equal(source.includes("const mutationgates = new map()"), true);
+    assert.equal(source.includes("withmutationgate(root"), true);
+    assert.equal(source.includes("asser pinnedworkspacebaseroot"), false);
+    assert.equal(source.includes("assertpinnedworkspacebaseroot"), true);
+    assert.equal(source.includes("discardexpected"), true);
     assert.equal(source.includes("--dry-run"), true);
     assert.equal(source.includes("dryrun !== true"), true);
     assert.equal(source.includes('["worktree", "prune", "--dry-run"'), true);

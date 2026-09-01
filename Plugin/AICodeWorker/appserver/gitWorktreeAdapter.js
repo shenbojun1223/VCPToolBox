@@ -12,6 +12,7 @@ const MIN_OUTPUT_LIMIT_BYTES = 1024;
 const MAX_OUTPUT_LIMIT_BYTES = 4 * 1024 * 1024;
 const SHA_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 const STATUS_SHA_RE = /^[0-9a-f]{64}$/i;
+const mutationGates = new Map();
 class GitWorktreeError extends Error {
     constructor(code, message, details) {
         super(String(message || code || "Git Worktree operation failed"));
@@ -56,6 +57,21 @@ function withinDirectory(target, root) {
     return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 function trustedWorkspaceRoot(value) { return canonicalExistingDirectory(value, "workspaceBaseRoot"); }
+
+function mutationGateKey(repoRoot) {
+    return process.platform === "win32" ? repoRoot.toLowerCase() : repoRoot;
+}
+
+function withMutationGate(repoRoot, operation) {
+    const key = mutationGateKey(repoRoot);
+    const previous = mutationGates.get(key) || Promise.resolve();
+    const result = previous.then(operation, operation);
+    const tail = result.then(() => undefined, () => undefined);
+    mutationGates.set(key, tail);
+    return result.finally(() => {
+        if (mutationGates.get(key) === tail) mutationGates.delete(key);
+    });
+}
 
 function safeWorktreePath(value, baseRoot, field, mustExist, mustNotExist) {
     const resolved = absolutePath(value, field);
@@ -103,6 +119,28 @@ function normalizeBaseRevision(value) {
         fail("WORKTREE_BASE_REVISION_INVALID", "baseRevision must be a complete object ID");
     }
     return value.toLowerCase();
+}
+function normalizeExpectedDiscard(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("WORKTREE_EXPECTED_IDENTITY_INVALID", "expected Worktree identity is invalid");
+    }
+    if (typeof value.branch !== "string" || !value.branch || value.branch.includes("\0") ||
+        /[\r\n]/.test(value.branch) || Buffer.byteLength(value.branch, "utf8") > 256 || value.locked !== true) {
+        fail("WORKTREE_EXPECTED_IDENTITY_INVALID", "expected Worktree identity is invalid");
+    }
+    return Object.freeze({
+        path: absolutePath(value.path, "expected.path"),
+        head: normalizeBaseRevision(value.head),
+        branch: value.branch,
+        locked: true,
+        lockReason: normalizeLockReason(value.lockReason)
+    });
+}
+function matchesExpectedIdentity(entry, expected, locked) {
+    return Boolean(entry) && samePath(entry.path, expected.path) &&
+        entry.branch === expected.branch && typeof entry.head === "string" &&
+        entry.head.toLowerCase() === expected.head && entry.locked === locked &&
+        (locked ? entry.lockReason === expected.lockReason : entry.lockReason === null);
 }
 function outputText(value) {
     return Buffer.from(value || "").toString("utf8").trim();
@@ -293,10 +331,19 @@ class GitWorktreeAdapter {
         if (!entry) fail("WORKTREE_NOT_REGISTERED", "The requested path is not a registered Git Worktree");
         return entry;
     }
-    #workspaceBaseRoot(workspaceBaseRoot) {
-        const candidate = this.#trustedWorkspaceBaseRoot || workspaceBaseRoot;
-        if (!candidate) fail("WORKTREE_PATH_INVALID", "workspaceBaseRoot is required");
-        return trustedWorkspaceRoot(candidate);
+    #requirePinnedWorkspaceBaseRoot() {
+        if (!this.#trustedWorkspaceBaseRoot) {
+            fail("WORKTREE_WORKSPACE_ROOT_UNPINNED", "Git Worktree mutations require a pinned workspaceBaseRoot");
+        }
+        return this.#trustedWorkspaceBaseRoot;
+    }
+    assertPinnedWorkspaceBaseRoot(workspaceBaseRoot) {
+        const pinned = this.#requirePinnedWorkspaceBaseRoot();
+        const candidate = trustedWorkspaceRoot(workspaceBaseRoot);
+        if (!samePath(candidate, pinned)) {
+            fail("WORKTREE_WORKSPACE_ROOT_MISMATCH", "workspaceBaseRoot does not match the pinned root");
+        }
+        return pinned;
     }
     async captureBase(repoRoot) {
         const root = await this.#repo(repoRoot);
@@ -339,95 +386,167 @@ class GitWorktreeAdapter {
         return (await this.#listRoot(root)).find(item => samePath(item.path, resolved)) || null;
     }
     async add({ base, workspaceBaseRoot, workspaceId, lockReason }) {
-        await this.assertBaseStable(base);
-        const root = await this.#repo(base.repoRoot);
-        const baseRoot = trustedWorkspaceRoot(workspaceBaseRoot);
+        const baseRoot = this.assertPinnedWorkspaceBaseRoot(workspaceBaseRoot);
         const id = normalizeWorktreeId(workspaceId);
         const reason = normalizeLockReason(lockReason);
-        const target = safeWorktreePath(path.join(baseRoot, id), baseRoot, "worktreePath", false, true);
+        const revision = normalizeBaseRevision(base?.baseRevision);
+        const root = await this.#repo(base.repoRoot);
         const branch = `vcp/aicw/${id}`;
-        await this.#run(
-            ["worktree", "add", "--lock", "--reason", reason, "-b", branch, target, normalizeBaseRevision(base.baseRevision)],
-            root, "WORKTREE_ADD_FAILED", "Git Worktree add failed"
-        );
-        await this.assertBaseStable(base);
-        const entry = (await this.#listRoot(root)).find(item => samePath(item.path, target));
-        if (!entry || entry.head?.toLowerCase() !== base.baseRevision.toLowerCase() || entry.branch !== branch ||
-            !entry.locked || entry.lockReason !== reason) {
-            fail("WORKTREE_ADD_VERIFY_FAILED", "Git Worktree add did not produce the expected registration");
-        }
-        return entry;
+        return withMutationGate(root, async () => {
+            await this.assertBaseStable(base);
+            const target = safeWorktreePath(path.join(baseRoot, id), baseRoot, "worktreePath", false, true);
+            await this.#run(
+                ["worktree", "add", "--lock", "--reason", reason, "-b", branch, target, revision],
+                root, "WORKTREE_ADD_FAILED", "Git Worktree add failed"
+            );
+            await this.assertBaseStable(base);
+            const entry = (await this.#listRoot(root)).find(item => samePath(item.path, target));
+            if (!entry || entry.head?.toLowerCase() !== revision || entry.branch !== branch ||
+                !entry.locked || entry.lockReason !== reason) {
+                fail("WORKTREE_ADD_VERIFY_FAILED", "Git Worktree add did not produce the expected registration");
+            }
+            return entry;
+        });
     }
     async lock(repoRoot, worktreePath, reason) {
-        const baseRoot = this.#workspaceBaseRoot();
-        const target = safeWorktreePath(worktreePath, baseRoot, "worktreePath", true, false);
+        const baseRoot = this.#requirePinnedWorkspaceBaseRoot();
         const normalizedReason = normalizeLockReason(reason);
         const root = await this.#repo(repoRoot);
-        await this.#registered(root, target);
-        await this.#run(
-            ["worktree", "lock", "--reason", normalizedReason, target], root, "WORKTREE_LOCK_FAILED", "Git Worktree lock failed"
-        );
-        const entry = await this.#registered(root, target);
-        if (!entry.locked || entry.lockReason !== normalizedReason) fail("WORKTREE_LOCK_VERIFY_FAILED", "Git Worktree lock was not verified");
-        return entry;
+        return withMutationGate(root, async () => {
+            const target = safeWorktreePath(worktreePath, baseRoot, "worktreePath", true, false);
+            await this.#registered(root, target);
+            await this.#run(
+                ["worktree", "lock", "--reason", normalizedReason, target], root, "WORKTREE_LOCK_FAILED", "Git Worktree lock failed"
+            );
+            const entry = await this.#registered(root, target);
+            if (!entry.locked || entry.lockReason !== normalizedReason) fail("WORKTREE_LOCK_VERIFY_FAILED", "Git Worktree lock was not verified");
+            return entry;
+        });
     }
     async unlock(repoRoot, worktreePath) {
-        const baseRoot = this.#workspaceBaseRoot();
-        const target = safeWorktreePath(worktreePath, baseRoot, "worktreePath", true, false);
+        const baseRoot = this.#requirePinnedWorkspaceBaseRoot();
         const root = await this.#repo(repoRoot);
-        await this.#registered(root, target);
-        await this.#run(["worktree", "unlock", target], root, "WORKTREE_UNLOCK_FAILED", "Git Worktree unlock failed");
-        const entry = await this.#registered(root, target);
-        if (entry.locked || entry.lockReason !== null) fail("WORKTREE_UNLOCK_VERIFY_FAILED", "Git Worktree unlock was not verified");
-        return entry;
+        return withMutationGate(root, async () => {
+            const target = safeWorktreePath(worktreePath, baseRoot, "worktreePath", true, false);
+            await this.#registered(root, target);
+            await this.#run(["worktree", "unlock", target], root, "WORKTREE_UNLOCK_FAILED", "Git Worktree unlock failed");
+            const entry = await this.#registered(root, target);
+            if (entry.locked || entry.lockReason !== null) fail("WORKTREE_UNLOCK_VERIFY_FAILED", "Git Worktree unlock was not verified");
+            return entry;
+        });
     }
     async move(repoRoot, oldPath, newPath, workspaceBaseRoot) {
+        const baseRoot = this.assertPinnedWorkspaceBaseRoot(workspaceBaseRoot);
         const root = await this.#repo(repoRoot);
-        const baseRoot = trustedWorkspaceRoot(workspaceBaseRoot);
-        const oldTarget = safeWorktreePath(oldPath, baseRoot, "oldPath", true, false);
-        const newTarget = safeWorktreePath(newPath, baseRoot, "newPath", false, true);
-        await this.#registered(root, oldTarget);
-        await this.#run(["worktree", "move", oldTarget, newTarget], root, "WORKTREE_MOVE_FAILED", "Git Worktree move failed");
-        if (await this.inspect(root, oldTarget)) fail("WORKTREE_MOVE_VERIFY_FAILED", "Old Git Worktree path remains registered");
-        const entry = await this.inspect(root, newTarget);
-        if (!entry) fail("WORKTREE_MOVE_VERIFY_FAILED", "New Git Worktree path was not registered");
-        return entry;
+        return withMutationGate(root, async () => {
+            const oldTarget = safeWorktreePath(oldPath, baseRoot, "oldPath", true, false);
+            const newTarget = safeWorktreePath(newPath, baseRoot, "newPath", false, true);
+            await this.#registered(root, oldTarget);
+            await this.#run(["worktree", "move", oldTarget, newTarget], root, "WORKTREE_MOVE_FAILED", "Git Worktree move failed");
+            if ((await this.#listRoot(root)).some(entry => samePath(entry.path, oldTarget))) {
+                fail("WORKTREE_MOVE_VERIFY_FAILED", "Old Git Worktree path remains registered");
+            }
+            const entry = (await this.#listRoot(root)).find(item => samePath(item.path, newTarget));
+            if (!entry) fail("WORKTREE_MOVE_VERIFY_FAILED", "New Git Worktree path was not registered");
+            return entry;
+        });
     }
     async remove(repoRoot, worktreePath, workspaceBaseRoot) {
+        const baseRoot = this.assertPinnedWorkspaceBaseRoot(workspaceBaseRoot);
         const root = await this.#repo(repoRoot);
-        const baseRoot = trustedWorkspaceRoot(workspaceBaseRoot);
-        const target = safeWorktreePath(worktreePath, baseRoot, "worktreePath", true, false);
-        const entry = await this.#registered(root, target);
-        if (entry.locked) fail("WORKTREE_LOCKED", "Unlock the Git Worktree before removal");
-        await this.#run(["worktree", "remove", target], root, "WORKTREE_REMOVE_FAILED", "Git Worktree remove failed");
-        if (await this.inspect(root, target)) fail("WORKTREE_REMOVE_VERIFY_FAILED", "Git Worktree registration remains after removal");
-        return { path: target, removed: true };
+        return withMutationGate(root, async () => {
+            const target = safeWorktreePath(worktreePath, baseRoot, "worktreePath", true, false);
+            const entry = await this.#registered(root, target);
+            if (entry.locked) fail("WORKTREE_LOCKED", "Unlock the Git Worktree before removal");
+            await this.#run(["worktree", "remove", target], root, "WORKTREE_REMOVE_FAILED", "Git Worktree remove failed");
+            if ((await this.#listRoot(root)).some(item => samePath(item.path, target))) {
+                fail("WORKTREE_REMOVE_VERIFY_FAILED", "Git Worktree registration remains after removal");
+            }
+            return { path: target, removed: true };
+        });
+    }
+    async #bestEffortRelock(root, target, expected) {
+        try {
+            let entry = (await this.#listRoot(root)).find(item => samePath(item.path, target)) || null;
+            if (matchesExpectedIdentity(entry, expected, true)) return true;
+            if (!matchesExpectedIdentity(entry, expected, false)) return false;
+            await this.#run(
+                ["worktree", "lock", "--reason", expected.lockReason, target],
+                root, "WORKTREE_LOCK_FAILED", "Git Worktree lock failed"
+            );
+            entry = (await this.#listRoot(root)).find(item => samePath(item.path, target)) || null;
+            return matchesExpectedIdentity(entry, expected, true);
+        } catch {
+            return false;
+        }
+    }
+    async discardExpected(options = {}) {
+        if (!options || typeof options !== "object" || Array.isArray(options)) {
+            fail("WORKTREE_OPTION_INVALID", "discardExpected options are invalid");
+        }
+        const baseRoot = this.assertPinnedWorkspaceBaseRoot(options.workspaceBaseRoot);
+        const expected = normalizeExpectedDiscard(options.expected);
+        const root = await this.#repo(options.repoRoot);
+        return withMutationGate(root, async () => {
+            const target = safeWorktreePath(
+                expected.path, baseRoot, "expected.path", pathPresent(expected.path), false
+            );
+            const beforeUnlock = (await this.#listRoot(root)).find(item => samePath(item.path, target)) || null;
+            if (!matchesExpectedIdentity(beforeUnlock, expected, true)) {
+                fail("WORKTREE_EXPECTED_IDENTITY_MISMATCH", "The registered Git Worktree identity changed");
+            }
+            await this.#run(
+                ["worktree", "unlock", target], root, "WORKTREE_UNLOCK_FAILED", "Git Worktree unlock failed"
+            );
+            const afterUnlock = (await this.#listRoot(root)).find(item => samePath(item.path, target)) || null;
+            if (!matchesExpectedIdentity(afterUnlock, expected, false)) {
+                fail("WORKTREE_EXPECTED_IDENTITY_MISMATCH", "The registered Git Worktree identity changed");
+            }
+            try {
+                await this.#run(
+                    ["worktree", "remove", target], root, "WORKTREE_REMOVE_FAILED", "Git Worktree remove failed"
+                );
+            } catch (error) {
+                if (error?.code !== "WORKTREE_REMOVE_FAILED") throw error;
+                const relocked = await this.#bestEffortRelock(root, target, expected);
+                throw new GitWorktreeError(
+                    "WORKTREE_DISCARD_BLOCKED",
+                    "Git Worktree discard was blocked",
+                    { cause: "WORKTREE_REMOVE_FAILED", relocked }
+                );
+            }
+            if ((await this.#listRoot(root)).some(item => samePath(item.path, target))) {
+                fail("WORKTREE_REMOVE_VERIFY_FAILED", "Git Worktree registration remains after removal");
+            }
+            return { path: target, removed: true };
+        });
     }
     async repair(repoRoot, paths = [], workspaceBaseRoot) {
+        const baseRoot = workspaceBaseRoot === undefined
+            ? this.#requirePinnedWorkspaceBaseRoot()
+            : this.assertPinnedWorkspaceBaseRoot(workspaceBaseRoot);
         const root = await this.#repo(repoRoot);
         if (!Array.isArray(paths) || paths.some(value => typeof value !== "string")) {
             fail("WORKTREE_PATH_INVALID", "repair paths must be an array of absolute paths");
         }
-        let normalized = [];
-        if (paths.length) {
-            const baseRoot = this.#workspaceBaseRoot(workspaceBaseRoot);
-            normalized = paths.map(value => safeWorktreePath(value, baseRoot, "repairPath", true, false));
-        }
-        const result = await this.#run(
-            ["worktree", "repair", ...normalized], root, "WORKTREE_REPAIR_FAILED", "Git Worktree repair failed"
-        );
-        const entries = await this.#listRoot(root);
-        if (normalized.length) {
-            const missing = normalized.find(target => !entries.some(entry => samePath(entry.path, target)));
-            if (missing) {
-                fail("WORKTREE_REPAIR_VERIFY_FAILED", "Git Worktree repair did not produce the expected registration", {
-                    path: missing
-                });
+        return withMutationGate(root, async () => {
+            const normalized = paths.map(value => safeWorktreePath(value, baseRoot, "repairPath", true, false));
+            const result = await this.#run(
+                ["worktree", "repair", ...normalized], root, "WORKTREE_REPAIR_FAILED", "Git Worktree repair failed"
+            );
+            const entries = await this.#listRoot(root);
+            if (normalized.length) {
+                const missing = normalized.find(target => !entries.some(entry => samePath(entry.path, target)));
+                if (missing) {
+                    fail("WORKTREE_REPAIR_VERIFY_FAILED", "Git Worktree repair did not produce the expected registration", {
+                        path: missing
+                    });
+                }
+            } else if (!entries.some(entry => samePath(entry.path, root) && !entry.bare)) {
+                fail("WORKTREE_REPAIR_VERIFY_FAILED", "Git Worktree repair did not preserve the primary registration");
             }
-        } else if (!entries.some(entry => samePath(entry.path, root) && !entry.bare)) {
-            fail("WORKTREE_REPAIR_VERIFY_FAILED", "Git Worktree repair did not preserve the primary registration");
-        }
-        return { paths: normalized, stdout: outputText(result.stdout), stderr: outputText(result.stderr) };
+            return { paths: normalized, stdout: outputText(result.stdout), stderr: outputText(result.stderr) };
+        });
     }
     async prune(repoRoot, options = {}) {
         const root = await this.#repo(repoRoot);
