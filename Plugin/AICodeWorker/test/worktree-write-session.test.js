@@ -62,6 +62,7 @@ function createFixture() {
     fs.mkdirSync(repoRoot, { recursive: true });
     fs.mkdirSync(workspaceBaseRoot, { recursive: true });
     git(repoRoot, ["init", "--quiet"]);
+    git(repoRoot, ["config", "core.autocrlf", "false"]);
     fs.writeFileSync(path.join(repoRoot, "tracked.txt"), "alpha\nbeta\n", "utf8");
     git(repoRoot, ["add", "--", "."]);
     git(repoRoot, [
@@ -413,6 +414,51 @@ test("base drift rejects verify and retain but still permits explicit discard", 
     assert.equal(gitText(fixture.repoRoot, ["rev-parse", expectedBranch(jobId)]), handle.base.baseRevision);
 });
 
+test("process filter added after open rejects verify and retain before primary status", async () => {
+    const fixture = createFixture();
+    fs.writeFileSync(path.join(fixture.repoRoot, ".gitattributes"), "tracked.txt filter=block\n", "utf8");
+    git(fixture.repoRoot, ["add", "--", ".gitattributes"]);
+    git(fixture.repoRoot, [
+        "-c", "user.name=AICW Test", "-c", "user.email=aicw@example.invalid",
+        "commit", "--quiet", "-m", "session process filter baseline"
+    ]);
+    const jobId = `process-filter-${fixture.number}`;
+    const session = makeSession(fixture, jobId);
+    const handle = await session.open();
+    const registrationBefore = officialEntry(fixture, handle.worktreePath);
+    const primaryHead = gitText(fixture.repoRoot, ["rev-parse", "HEAD"]);
+    const primaryStatus = git(fixture.repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout;
+    const marker = path.join(fixture.workspaceBaseRoot, "session-process-filter-marker.txt");
+    const executable = path.join(fixture.repoRoot, ".git", "session-process-filter-driver.sh");
+    const shellMarker = `#!/bin/sh\nprintf invoked > '${marker.replace(/'/g, "'\\''")}'\nexit 97\n`;
+    fs.writeFileSync(executable, shellMarker, "utf8");
+    if (process.platform !== "win32") fs.chmodSync(executable, 0o755);
+    const command = `'${executable.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`;
+    git(fixture.repoRoot, ["config", "filter.block.process", command]);
+    git(fixture.repoRoot, ["config", "filter.block.required", "true"]);
+    const tracked = path.join(fixture.repoRoot, "tracked.txt");
+    const content = fs.readFileSync(tracked);
+    fs.writeFileSync(tracked, content);
+    fs.utimesSync(tracked, new Date(), new Date(Date.now() + 10_000));
+
+    try {
+        await rejectsCode(() => session.verify(), "WORKTREE_CANDIDATE_FILTER_UNSAFE");
+        await rejectsCode(() => session.retain(), "WORKTREE_CANDIDATE_FILTER_UNSAFE");
+        assert.equal(fs.existsSync(marker), false, "process filter must be rejected before primary status");
+    } finally {
+        git(fixture.repoRoot, ["config", "--unset-all", "filter.block.required"], true);
+        git(fixture.repoRoot, ["config", "--unset-all", "filter.block.process"], true);
+    }
+
+    assert.equal(fs.existsSync(marker), false);
+    assert.deepEqual(officialEntry(fixture, handle.worktreePath), registrationBefore);
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", "HEAD"]), primaryHead);
+    assert.equal(git(fixture.repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout.equals(primaryStatus), true);
+    assert.strictEqual(await session.verify(), handle);
+    await session.discard();
+    assert.equal(officialEntries(fixture).length, 1);
+});
+
 test("Worktree HEAD advance or reset rejects verify, retain, and discard while the primary stays unchanged", async () => {
     const cases = [
         {
@@ -533,6 +579,141 @@ test("retain is idempotent and leaves Worktree files and official registration u
     assert.strictEqual(await session.retain(), handle);
     assert.equal(fs.readFileSync(path.join(handle.worktreePath, "tracked.txt"), "utf8"), beforeText);
     assert.deepEqual(officialEntry(fixture, handle.worktreePath), beforeEntry);
+});
+
+test("concurrent and repeated candidate commits share one Promise and one commit", async () => {
+    const fixture = createFixture();
+    const session = makeSession(fixture, `candidate-once-${fixture.number}`);
+    const handle = await session.open();
+    fs.appendFileSync(path.join(handle.worktreePath, "tracked.txt"), "candidate once\n", "utf8");
+    await rejectsCode(() => session.commitCandidate({ message: "caller controlled" }),
+        "WORKTREE_SESSION_COMMIT_NOT_ALLOWED");
+
+    const entered = deferred();
+    const release = deferred();
+    const originalCreate = fixture.adapter.createCandidateCommitExpected.bind(fixture.adapter);
+    let createCalls = 0;
+    fixture.adapter.createCandidateCommitExpected = async (...args) => {
+        createCalls += 1;
+        entered.resolve();
+        await release.promise;
+        return originalCreate(...args);
+    };
+
+    const first = session.commitCandidate();
+    const concurrent = [first, ...Array.from({ length: 7 }, () => session.commitCandidate())];
+    for (const call of concurrent) assert.strictEqual(call, first);
+    await entered.promise;
+    release.resolve();
+    const results = await Promise.all(concurrent);
+
+    assert.equal(createCalls, 1);
+    for (const result of results) assert.strictEqual(result, results[0]);
+    assert.strictEqual(session.commitCandidate(), first);
+    assert.strictEqual(await session.commitCandidate(), results[0]);
+    assert.equal(results[0].baseRevision, handle.base.baseRevision);
+    assert.notEqual(results[0].resultCommit, handle.base.baseRevision);
+    assert.equal(handle.base.baseRevision, gitText(fixture.repoRoot, ["rev-parse", "HEAD"]));
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", handle.branch]), results[0].resultCommit);
+});
+
+test("commit then discard keeps the candidate ref, while discard first rejects commit", async () => {
+    const commitFixture = createFixture();
+    const commitSession = makeSession(commitFixture, `commit-discard-${commitFixture.number}`);
+    const commitHandle = await commitSession.open();
+    fs.appendFileSync(path.join(commitHandle.worktreePath, "tracked.txt"), "commit before discard\n", "utf8");
+    const enteredCommit = deferred();
+    const releaseCommit = deferred();
+    const originalCreate = commitFixture.adapter.createCandidateCommitExpected.bind(commitFixture.adapter);
+    commitFixture.adapter.createCandidateCommitExpected = async (...args) => {
+        enteredCommit.resolve();
+        await releaseCommit.promise;
+        return originalCreate(...args);
+    };
+
+    const commitPromise = commitSession.commitCandidate();
+    await enteredCommit.promise;
+    const discardAfterCommit = commitSession.discard();
+    releaseCommit.resolve();
+    const candidate = await commitPromise;
+    await discardAfterCommit;
+    assert.equal(officialEntry(commitFixture, commitHandle.worktreePath), null);
+    assert.equal(fs.existsSync(commitHandle.worktreePath), false);
+    assert.equal(gitText(commitFixture.repoRoot, ["rev-parse", commitHandle.branch]), candidate.resultCommit);
+
+    const discardFixture = createFixture();
+    const discardSession = makeSession(discardFixture, `discard-commit-${discardFixture.number}`);
+    const discardHandle = await discardSession.open();
+    const enteredDiscard = deferred();
+    const releaseDiscard = deferred();
+    const originalDiscard = discardFixture.adapter.discardExpected.bind(discardFixture.adapter);
+    discardFixture.adapter.discardExpected = async (...args) => {
+        enteredDiscard.resolve();
+        await releaseDiscard.promise;
+        return originalDiscard(...args);
+    };
+
+    const discardFirst = discardSession.discard();
+    await enteredDiscard.promise;
+    await rejectsCode(() => discardSession.commitCandidate(), "WORKTREE_SESSION_COMMIT_NOT_ALLOWED");
+    releaseDiscard.resolve();
+    await discardFirst;
+    assert.equal(officialEntry(discardFixture, discardHandle.worktreePath), null);
+    assert.equal(gitText(discardFixture.repoRoot, ["rev-parse", discardHandle.branch]),
+        discardHandle.base.baseRevision);
+});
+
+test("candidate resultCommit becomes the expected HEAD for verify, retain, and discard", async () => {
+    const fixture = createFixture();
+    const session = makeSession(fixture, `candidate-head-${fixture.number}`);
+    const handle = await session.open();
+    fs.appendFileSync(path.join(handle.worktreePath, "tracked.txt"), "candidate expected head\n", "utf8");
+    const candidate = await session.commitCandidate();
+
+    assert.strictEqual(await session.verify(), handle);
+    assert.strictEqual(await session.retain(), handle);
+    assert.equal(handle.base.baseRevision, candidate.baseRevision);
+    assert.equal(officialEntry(fixture, handle.worktreePath).head, candidate.resultCommit);
+    const originalDiscard = fixture.adapter.discardExpected.bind(fixture.adapter);
+    let discardedExpected;
+    fixture.adapter.discardExpected = async options => {
+        discardedExpected = options.expected;
+        return originalDiscard(options);
+    };
+
+    await session.discard();
+
+    assert.equal(discardedExpected.head, candidate.resultCommit);
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", handle.branch]), candidate.resultCommit);
+    assert.equal(await session.inspect(), null);
+});
+
+test("unknown candidate outcome latches uncertainty and leaves only inspect available", async () => {
+    const fixture = createFixture();
+    const session = makeSession(fixture, `candidate-unknown-${fixture.number}`);
+    const handle = await session.open();
+    fs.appendFileSync(path.join(handle.worktreePath, "tracked.txt"), "uncertain candidate\n", "utf8");
+    let createCalls = 0;
+    fixture.adapter.createCandidateCommitExpected = async () => {
+        createCalls += 1;
+        throw new GitWorktreeError(
+            "WORKTREE_CANDIDATE_OUTCOME_UNKNOWN",
+            "simulated unknown update-ref response"
+        );
+    };
+
+    const first = session.commitCandidate();
+    await rejectsCode(() => first, "WORKTREE_CANDIDATE_OUTCOME_UNKNOWN");
+    assert.strictEqual(session.commitCandidate(), first);
+    await rejectsCode(() => session.commitCandidate(), "WORKTREE_CANDIDATE_OUTCOME_UNKNOWN");
+    assert.equal(createCalls, 1);
+    await rejectsCode(() => session.verify(), "WORKTREE_SESSION_OUTCOME_UNCERTAIN");
+    await rejectsCode(() => session.retain(), "WORKTREE_SESSION_OUTCOME_UNCERTAIN");
+    await rejectsCode(() => session.discard(), "WORKTREE_SESSION_OUTCOME_UNCERTAIN");
+    const snapshot = await session.inspect();
+    assert.deepEqual(snapshot, officialEntry(fixture, handle.worktreePath));
+    assert.equal(snapshot.locked, true);
+    assert.equal(snapshot.head, handle.base.baseRevision);
 });
 
 test("retain requested before discard completes first and the final state is discarded", async () => {
@@ -767,7 +948,7 @@ test("production session source has no direct process, deletion, integration, or
     const source = fs.readFileSync(path.resolve(__dirname, "../appserver/worktreeWriteSession.js"), "utf8").toLowerCase();
     for (const forbidden of [
         "child_process", "spawn(", "fs.rm", "rmsync", "unlink", "rmdir", "process.on", "beforeexit",
-        "manifest", "wal", "registry", "perforce", "path lease", "commit", "merge", "push", "cherry-pick",
+        "manifest", "wal", "registry", "perforce", "path lease", "merge", "push", "cherry-pick",
         "sidecar", "rpc", "aicodeworker/", "config", "jobs", "codex"
     ]) {
         assert.equal(source.includes(forbidden), false, `session source contains ${forbidden}`);
@@ -778,6 +959,10 @@ test("production session source has no direct process, deletion, integration, or
     assert.equal(source.includes("adapter.assertbasestable"), true);
     assert.equal(source.includes("adapter.assertpinnedworkspacebaseroot"), true);
     assert.equal(source.includes("adapter.discardexpected"), true);
+    assert.equal(source.includes("adapter.createcandidatecommitexpected"), true);
+    assert.equal(source.includes("commitcandidate()"), true);
+    assert.equal(source.includes("commit-tree"), false);
+    assert.equal(source.includes("update-ref"), false);
     assert.equal(source.includes("recovermatchingregistration"), false);
     assert.equal(source.includes("adapter.unlock"), false);
     assert.equal(source.includes("adapter.remove"), false);

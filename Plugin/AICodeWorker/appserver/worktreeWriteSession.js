@@ -66,10 +66,14 @@ class WorktreeWriteSession {
     #lockReason;
     #state = "new";
     #handle = null;
+    #expectedHead = null;
     #openPromise = null;
+    #candidatePromise = null;
+    #candidateResult = null;
     #discardPromise = null;
     #operationTail = Promise.resolve();
     #discardRequested = false;
+    #uncertain = false;
 
     constructor(options = {}) {
         if (!options || typeof options !== "object" || Array.isArray(options)) {
@@ -104,7 +108,8 @@ class WorktreeWriteSession {
         return Boolean(entry) && samePath(entry.path, handle.worktreePath) &&
             entry.branch === handle.branch && entry.locked === true &&
             entry.lockReason === handle.lockReason && typeof entry.head === "string" &&
-            entry.head.toLowerCase() === handle.base.baseRevision.toLowerCase();
+            typeof this.#expectedHead === "string" &&
+            entry.head.toLowerCase() === this.#expectedHead.toLowerCase();
     }
 
     #identityMismatch() {
@@ -176,6 +181,7 @@ class WorktreeWriteSession {
             this.#assertOpeningEntry(officialEntry, base, targetPath);
             const handle = this.#handleFrom(base, officialEntry);
             this.#handle = handle;
+            this.#expectedHead = handle.base.baseRevision;
             this.#state = "open";
             return handle;
         } catch (error) {
@@ -215,6 +221,9 @@ class WorktreeWriteSession {
     }
 
     async #verifyOnce() {
+        if (this.#uncertain) {
+            fail("WORKTREE_SESSION_OUTCOME_UNCERTAIN", "Candidate outcome is uncertain");
+        }
         if (!this.#handle || (this.#state !== "open" && this.#state !== "retained")) {
             fail("WORKTREE_SESSION_NOT_OPEN", "Worktree write session is not open");
         }
@@ -225,6 +234,12 @@ class WorktreeWriteSession {
     }
 
     verify() {
+        if (this.#uncertain) {
+            return Promise.reject(new WorktreeWriteSessionError(
+                "WORKTREE_SESSION_OUTCOME_UNCERTAIN",
+                "Candidate outcome is uncertain"
+            ));
+        }
         if (this.#discardRequested) {
             return Promise.reject(new WorktreeWriteSessionError(
                 "WORKTREE_SESSION_NOT_OPEN",
@@ -241,6 +256,12 @@ class WorktreeWriteSession {
     }
 
     retain() {
+        if (this.#uncertain) {
+            return Promise.reject(new WorktreeWriteSessionError(
+                "WORKTREE_SESSION_OUTCOME_UNCERTAIN",
+                "Candidate outcome is uncertain"
+            ));
+        }
         if (this.#discardRequested) {
             return Promise.reject(new WorktreeWriteSessionError(
                 "WORKTREE_SESSION_NOT_OPEN",
@@ -260,7 +281,67 @@ class WorktreeWriteSession {
         });
     }
 
+    async #commitCandidateOnce() {
+        try {
+            const result = await this.#adapter.createCandidateCommitExpected({
+                repoRoot: this.#repoRoot,
+                workspaceBaseRoot: this.#workspaceBaseRoot,
+                base: this.#handle.base,
+                expected: {
+                    path: this.#handle.worktreePath,
+                    branch: this.#handle.branch,
+                    head: this.#expectedHead,
+                    locked: true,
+                    lockReason: this.#handle.lockReason
+                }
+            });
+            if (!result || typeof result !== "object" || result.schemaVersion !== 1 ||
+                result.jobId !== this.#jobId || !samePath(result.worktreePath, this.#handle.worktreePath) ||
+                result.branch !== this.#branch || result.baseRevision !== this.#handle.base.baseRevision ||
+                typeof result.resultCommit !== "string" || result.worktreeClean !== true ||
+                result.locked !== true || !Object.isFrozen(result)) {
+                this.#uncertain = true;
+                this.#state = "uncertain";
+                fail("WORKTREE_SESSION_OUTCOME_UNCERTAIN", "Candidate result was not proven");
+            }
+            this.#expectedHead = result.resultCommit;
+            this.#candidateResult = result;
+            return this.#candidateResult;
+        } catch (error) {
+            if (error?.code === "WORKTREE_CANDIDATE_OUTCOME_UNKNOWN" ||
+                error?.code === "WORKTREE_CANDIDATE_INDEX_ROLLBACK_UNCONFIRMED" ||
+                error?.code === "WORKTREE_SESSION_OUTCOME_UNCERTAIN") {
+                this.#uncertain = true;
+                this.#state = "uncertain";
+            }
+            throw error;
+        }
+    }
+
+    commitCandidate() {
+        if (arguments.length !== 0) {
+            return Promise.reject(new WorktreeWriteSessionError(
+                "WORKTREE_SESSION_COMMIT_NOT_ALLOWED",
+                "Candidate commit does not accept caller options"
+            ));
+        }
+        if (this.#candidatePromise) return this.#candidatePromise;
+        if (this.#uncertain || this.#discardRequested || !this.#handle ||
+            (this.#state !== "open" && this.#state !== "retained")) {
+            return Promise.reject(new WorktreeWriteSessionError(
+                "WORKTREE_SESSION_COMMIT_NOT_ALLOWED",
+                "Candidate commit is not allowed for this session"
+            ));
+        }
+        const operation = this.#enqueue(() => this.#commitCandidateOnce());
+        this.#candidatePromise = operation.then(result => result);
+        return this.#candidatePromise;
+    }
+
     async #discardOnce() {
+        if (this.#uncertain) {
+            fail("WORKTREE_SESSION_OUTCOME_UNCERTAIN", "Candidate outcome is uncertain");
+        }
         const handle = this.#handle;
         try {
             await this.#adapter.discardExpected({
@@ -269,7 +350,7 @@ class WorktreeWriteSession {
                 expected: {
                     path: handle.worktreePath,
                     branch: handle.branch,
-                    head: handle.base.baseRevision,
+                    head: this.#expectedHead,
                     locked: true,
                     lockReason: handle.lockReason
                 }
@@ -300,6 +381,12 @@ class WorktreeWriteSession {
 
     discard() {
         if (this.#discardPromise) return this.#discardPromise;
+        if (this.#uncertain) {
+            return Promise.reject(new WorktreeWriteSessionError(
+                "WORKTREE_SESSION_OUTCOME_UNCERTAIN",
+                "Candidate outcome is uncertain"
+            ));
+        }
         if (this.#state === "discarded") return Promise.resolve();
         if (!this.#handle || (this.#state !== "open" && this.#state !== "retained" && this.#state !== "failed")) {
             return Promise.reject(new WorktreeWriteSessionError(
@@ -316,9 +403,13 @@ class WorktreeWriteSession {
                 return result;
             },
             error => {
-                this.#state = "failed";
-                this.#discardRequested = false;
-                this.#discardPromise = null;
+                if (this.#uncertain) {
+                    this.#state = "uncertain";
+                } else {
+                    this.#state = "failed";
+                    this.#discardRequested = false;
+                    this.#discardPromise = null;
+                }
                 throw error;
             }
         );

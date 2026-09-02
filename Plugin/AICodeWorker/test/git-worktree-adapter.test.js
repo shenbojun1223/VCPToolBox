@@ -275,6 +275,122 @@ test("add creates a locked branch Worktree under a base containing spaces", asyn
     assert.deepEqual(await fixture.adapter.inspect(fixture.repoRoot, target), result);
 });
 
+test("captureBase rejects a preconfigured process filter before status can execute it", async () => {
+    const fixture = createFixture();
+    fs.writeFileSync(path.join(fixture.repoRoot, ".gitattributes"), "filtered.txt filter=block\n", "utf8");
+    fs.writeFileSync(path.join(fixture.repoRoot, "filtered.txt"), "filtered baseline\n", "utf8");
+    git(fixture.repoRoot, ["add", "--", ".gitattributes", "filtered.txt"]);
+    git(fixture.repoRoot, [
+        "-c", "user.name=AICW Test", "-c", "user.email=aicw@example.invalid",
+        "commit", "--quiet", "-m", "process filter baseline"
+    ]);
+    const marker = path.join(fixture.workspaceBaseRoot, "capture-process-filter-marker.txt");
+    const executable = path.join(fixture.repoRoot, ".git", "capture-process-filter-driver.sh");
+    const shellMarker = `#!/bin/sh\nprintf invoked > '${marker.replace(/'/g, "'\\''")}'\nexit 97\n`;
+    fs.writeFileSync(executable, shellMarker, "utf8");
+    if (process.platform !== "win32") fs.chmodSync(executable, 0o755);
+    const command = `'${executable.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`;
+    git(fixture.repoRoot, ["config", "filter.block.process", command]);
+
+    try {
+        await rejectsCode(
+            () => fixture.adapter.captureBase(fixture.repoRoot),
+            "WORKTREE_CANDIDATE_FILTER_UNSAFE"
+        );
+        assert.equal(fs.existsSync(marker), false, "process filter must be rejected before git status");
+    } finally {
+        git(fixture.repoRoot, ["config", "--unset-all", "filter.block.process"], true);
+    }
+
+    const base = await fixture.adapter.captureBase(fixture.repoRoot);
+    assert.equal(base.baseRevision, gitText(fixture.repoRoot, ["rev-parse", "HEAD"]));
+});
+
+test("assertBaseStable rejects a process filter added after capture before status can execute it", async () => {
+    const fixture = createFixture();
+    fs.writeFileSync(path.join(fixture.repoRoot, ".gitattributes"), "tracked.txt filter=block\n", "utf8");
+    git(fixture.repoRoot, ["add", "--", ".gitattributes"]);
+    git(fixture.repoRoot, [
+        "-c", "user.name=AICW Test", "-c", "user.email=aicw@example.invalid",
+        "commit", "--quiet", "-m", "assert base process filter baseline"
+    ]);
+    const base = await fixture.adapter.captureBase(fixture.repoRoot);
+    const marker = path.join(fixture.workspaceBaseRoot, "assert-base-process-filter-marker.txt");
+    const executable = path.join(fixture.repoRoot, ".git", "assert-base-process-filter-driver.sh");
+    const shellMarker = `#!/bin/sh\nprintf invoked > '${marker.replace(/'/g, "'\\''")}'\nexit 97\n`;
+    fs.writeFileSync(executable, shellMarker, "utf8");
+    if (process.platform !== "win32") fs.chmodSync(executable, 0o755);
+    const command = `'${executable.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`;
+    git(fixture.repoRoot, ["config", "filter.block.process", command]);
+    git(fixture.repoRoot, ["config", "filter.block.required", "true"]);
+    const tracked = path.join(fixture.repoRoot, "tracked.txt");
+    const content = fs.readFileSync(tracked);
+    fs.writeFileSync(tracked, content);
+    fs.utimesSync(tracked, new Date(), new Date(Date.now() + 10_000));
+
+    try {
+        await rejectsCode(
+            () => fixture.adapter.assertBaseStable(base),
+            "WORKTREE_CANDIDATE_FILTER_UNSAFE"
+        );
+        assert.equal(fs.existsSync(marker), false, "process filter must be rejected before git status");
+    } finally {
+        git(fixture.repoRoot, ["config", "--unset-all", "filter.block.required"], true);
+        git(fixture.repoRoot, ["config", "--unset-all", "filter.block.process"], true);
+    }
+
+    assert.equal(fs.existsSync(marker), false);
+    const stable = await fixture.adapter.assertBaseStable(base);
+    assert.equal(stable.head, base.baseRevision);
+});
+
+test("add rejects local smudge or process filters before checkout, ref creation, or driver execution", async () => {
+    for (const driver of ["smudge", "process"]) {
+        const fixture = createFixture();
+        fs.writeFileSync(path.join(fixture.repoRoot, ".gitattributes"), "filtered.txt filter=block\n", "utf8");
+        fs.writeFileSync(path.join(fixture.repoRoot, "filtered.txt"), "filtered baseline\n", "utf8");
+        git(fixture.repoRoot, ["add", "--", ".gitattributes", "filtered.txt"]);
+        git(fixture.repoRoot, [
+            "-c", "user.name=AICW Test", "-c", "user.email=aicw@example.invalid",
+            "commit", "--quiet", "-m", `${driver} filter baseline`
+        ]);
+        const base = await fixture.adapter.captureBase(fixture.repoRoot);
+        const marker = path.join(fixture.workspaceBaseRoot, `${driver}-filter-marker.txt`);
+        const executable = path.join(fixture.repoRoot, ".git", `${driver}-filter-driver.sh`);
+        const shellMarker = `#!/bin/sh\nprintf invoked > '${marker.replace(/'/g, "'\\''")}'\nexit 97\n`;
+        fs.writeFileSync(executable, shellMarker, "utf8");
+        if (process.platform !== "win32") fs.chmodSync(executable, 0o755);
+        const command = `'${executable.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`;
+        if (driver === "smudge") {
+            const includedConfig = path.join(fixture.repoRoot, ".git", "candidate-filter.inc");
+            fs.writeFileSync(includedConfig, `[filter "block"]\n\tsmudge = ${command}\n`, "utf8");
+            git(fixture.repoRoot, ["config", "include.path", includedConfig]);
+        } else {
+            git(fixture.repoRoot, ["config", "filter.block.process", command]);
+        }
+        const id = `checkout-filter-${driver}-${nextFixture}`;
+        const target = path.join(fixture.workspaceBaseRoot, id);
+        const branchRef = `refs/heads/vcp/aicw/${id}`;
+
+        await rejectsCode(() => fixture.adapter.add({
+            base,
+            workspaceBaseRoot: fixture.workspaceBaseRoot,
+            workspaceId: id,
+            lockReason: `${driver} filter must be rejected`
+        }), "WORKTREE_CANDIDATE_FILTER_UNSAFE");
+
+        assert.equal(fs.existsSync(marker), false, `${driver} filter driver must not execute`);
+        assert.equal(fs.existsSync(target), false);
+        assert.equal(officialWorktreeEntry(fixture, target), null);
+        assert.equal(git(fixture.repoRoot, ["show-ref", "--verify", "--quiet", branchRef], true).status, 1);
+        assert.equal(gitText(fixture.repoRoot, ["rev-parse", "HEAD"]), base.baseRevision);
+        if (driver === "smudge") git(fixture.repoRoot, ["config", "--unset-all", "include.path"]);
+        else git(fixture.repoRoot, ["config", "--unset-all", "filter.block.process"]);
+        const stable = await fixture.adapter.assertBaseStable(base);
+        assert.equal(stable.head, base.baseRevision);
+    }
+});
+
 test("unlock then lock updates the official registration and reason", async () => {
     const fixture = createFixture();
     const created = await addWorktree(fixture, "lock-cycle", "initial reason");
@@ -612,7 +728,7 @@ test("production adapter source keeps Git execution fixed and passes static safe
     const source = fs.readFileSync(path.resolve(__dirname, "../appserver/gitWorktreeAdapter.js"), "utf8").toLowerCase();
     for (const forbidden of [
         "--force", "shell: true", "fs.rm", "rmsync", "unlinksync", "rmdirsync", "renamesync",
-        "copyfile", "copysync", "cpsync", "manifest", "wal", "perforce", "path lease", "commit", "merge", "push", "cherry-pick",
+        "copyfile", "copysync", "cpsync", "manifest", "wal", "perforce", "path lease",
         "fallback", "this.#gitbin", "this.#spawnrunner", "options.gitbin", "options._spawnrunner", "options.args",
         "node_env", "module.exports.symbol", "symbol.for", "global."
     ]) {
@@ -631,6 +747,56 @@ test("production adapter source keeps Git execution fixed and passes static safe
     assert.equal(source.includes("asser pinnedworkspacebaseroot"), false);
     assert.equal(source.includes("assertpinnedworkspacebaseroot"), true);
     assert.equal(source.includes("discardexpected"), true);
+    assert.equal(source.includes("createcandidatecommitexpected"), true);
+    assert.equal(source.includes('"commit-tree"'), true);
+    assert.equal(source.includes('"update-ref"'), true);
+    assert.equal(source.includes('"read-tree", "--reset"'), true);
+    assert.equal(source.includes('git_config_nosystem = "1"'), true);
+    assert.equal(source.includes("git_config_global"), true);
+    assert.equal(source.includes("git_namespace"), true);
+    assert.equal(source.includes('"core.fsmonitor=false"'), true);
+    assert.equal(source.includes('core.hookspath=${process.platform === "win32" ? "nul" : "/dev/null"}'), true);
+    assert.equal(source.includes("^filter\\\\..*\\\\.(clean|smudge|process)$"), true);
+    assert.equal(source.includes('"--no-ext-diff"'), true);
+    assert.equal(source.includes("vcp aicodeworker candidate"), true);
+    const captureStart = source.indexOf("async capturebase(");
+    const captureEnd = source.indexOf("async assertbasestable(", captureStart);
+    assert.notEqual(captureStart, -1);
+    assert.notEqual(captureEnd, -1);
+    const captureSource = source.slice(captureStart, captureEnd);
+    assert.equal(captureSource.includes("this.#repo(reporoot, true)"), true);
+    assert.equal(captureSource.includes("this.#fingerprint(root, true)"), true);
+    const assertBaseStart = source.indexOf("async assertbasestable(", captureEnd);
+    const assertBaseEnd = source.indexOf("async list(", assertBaseStart);
+    assert.notEqual(assertBaseStart, -1);
+    assert.notEqual(assertBaseEnd, -1);
+    const assertBaseSource = source.slice(assertBaseStart, assertBaseEnd);
+    const assertBaseFilter = assertBaseSource.indexOf("this.#assertcandidatefiltersclosed(root)");
+    const assertBaseFingerprint = assertBaseSource.indexOf("this.#fingerprint(root, true)");
+    assert.equal(assertBaseSource.includes("this.#repo(base.reporoot, true)"), true);
+    assert.notEqual(assertBaseFilter, -1);
+    assert.equal(assertBaseFingerprint > assertBaseFilter, true);
+    const candidateBaseStart = source.indexOf("async #assertcandidatebasestable(");
+    const candidateBaseEnd = source.indexOf("async #rollbackcandidateindex(", candidateBaseStart);
+    assert.notEqual(candidateBaseStart, -1);
+    assert.notEqual(candidateBaseEnd, -1);
+    const candidateBaseSource = source.slice(candidateBaseStart, candidateBaseEnd);
+    const candidateBaseFilter = candidateBaseSource.indexOf("this.#assertcandidatefiltersclosed(root)");
+    const candidateBaseFingerprint = candidateBaseSource.indexOf("this.#fingerprint(root, true)");
+    assert.notEqual(candidateBaseFilter, -1);
+    assert.equal(candidateBaseFingerprint > candidateBaseFilter, true);
+    const addStart = source.indexOf("async add(");
+    const addEnd = source.indexOf("async lock(", addStart);
+    assert.notEqual(addStart, -1);
+    assert.notEqual(addEnd, -1);
+    const addSource = source.slice(addStart, addEnd);
+    assert.equal(addSource.includes("this.#runcandidate("), true);
+    assert.equal(addSource.includes("this.#run("), false);
+    assert.equal((addSource.match(/withmutationgate\(/g) || []).length, 1);
+    for (const command of ["commit", "merge", "push", "cherry-pick"]) {
+        const directCommand = new RegExp(`#run(?:candidate)?\\(\\s*\\[\\s*"${command}"(?:\\s*,|\\s*\\])`);
+        assert.equal(directCommand.test(source), false, `adapter invokes ordinary git ${command}`);
+    }
     assert.equal(source.includes("--dry-run"), true);
     assert.equal(source.includes("dryrun !== true"), true);
     assert.equal(source.includes('["worktree", "prune", "--dry-run"'), true);
