@@ -38,6 +38,7 @@ const { captureGitBaseline, startGitBaselineMonitor, sha256 } = require("../apps
 const { CodexAppServerProcess } = require("../appserver/codexAppServerProcess");
 const { JsonLineRpcConnection } = require("../appserver/jsonLineRpcConnection");
 const { SidecarServer } = require("../appserver/sidecarServer");
+const { parseWorktreeListPorcelainZ } = require("../appserver/gitWorktreeAdapter");
 
 const fixturePath = path.join(__dirname, "fixtures", "fake-codex-app-server.js");
 const entryPath = path.join(__dirname, "..", "appserver", "sidecar-entry.js");
@@ -612,6 +613,87 @@ test("Sidecar status returns the exact patch protocol proof", async () => {
         assert.equal(status.codexPid, null);
         assert.ok(Array.isArray(status.activeJobs));
     } finally { await environment.close(); }
+});
+
+test("Sidecar write session primitive stays dormant when unconfigured", async () => {
+    const environment = await createEnvironment({ gitProject: true });
+    const server = new SidecarServer({ pluginDir: environment.pluginDir, jobRoot: environment.jobRoot });
+    const beforeWorktrees = gitFixture(environment.projectRoot, ["worktree", "list", "--porcelain", "-z"]);
+    try {
+        await assert.rejects(
+            server._openWriteSession({ jobId: "write_unconfigured", projectPath: environment.projectRoot }),
+            error => error instanceof SidecarError && error.code === "AICW_WRITE_NOT_CONFIGURED"
+        );
+        await assert.rejects(
+            server._dispatch("submitWriteJob", { jobId: "write_unconfigured", projectPath: environment.projectRoot }),
+            error => error instanceof SidecarError && error.code === "UNKNOWN_METHOD"
+        );
+        assert.equal(
+            gitFixture(environment.projectRoot, ["worktree", "list", "--porcelain", "-z"]),
+            beforeWorktrees
+        );
+    } finally { await environment.close(); }
+    assert.equal(fs.existsSync(environment.tempRoot), false);
+});
+
+test("Sidecar opens and holds a configured Worktree write session", async () => {
+    const environment = await createEnvironment({ gitProject: true });
+    const workspaceBaseRoot = path.join(environment.tempRoot, "write-workspaces");
+    fs.mkdirSync(workspaceBaseRoot, { recursive: true });
+    const canonicalWorkspaceBaseRoot = fs.realpathSync.native(workspaceBaseRoot);
+    const server = new SidecarServer({
+        pluginDir: environment.pluginDir,
+        jobRoot: environment.jobRoot,
+        writeWorkspaceBaseRoot: canonicalWorkspaceBaseRoot
+    });
+    const jobId = "write_configured";
+    const primaryHead = gitFixture(environment.projectRoot, ["rev-parse", "HEAD"]);
+    const primaryTree = gitFixture(environment.projectRoot, ["rev-parse", "HEAD^{tree}"]);
+    const primaryStatus = gitFixture(environment.projectRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const primaryContent = fs.readFileSync(path.join(environment.projectRoot, "tracked.txt"), "utf8");
+    let session = null;
+    let handle = null;
+    try {
+        ({ session, handle } = await server._openWriteSession({ jobId, projectPath: environment.projectRoot }));
+        assert.equal(handle.repoRoot, environment.projectRoot);
+        assert.equal(handle.worktreePath, path.join(canonicalWorkspaceBaseRoot, jobId));
+        assert.equal(handle.branch, `vcp/aicw/${jobId}`);
+        assert.equal(handle.lockReason, `AICodeWorker write session ${jobId}`);
+        assert.deepEqual(handle.base, {
+            repoRoot: environment.projectRoot,
+            baseRevision: primaryHead,
+            baseTree: primaryTree,
+            statusSha256: crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex")
+        });
+
+        const officialEntry = parseWorktreeListPorcelainZ(
+            gitFixture(environment.projectRoot, ["worktree", "list", "--porcelain", "-z"])
+        ).find(entry => path.resolve(entry.path) === path.resolve(handle.worktreePath));
+        assert.ok(officialEntry);
+        assert.equal(officialEntry.head, primaryHead);
+        assert.equal(officialEntry.branch, handle.branch);
+        assert.equal(officialEntry.locked, true);
+        assert.equal(officialEntry.lockReason, handle.lockReason);
+        assert.equal(gitFixture(environment.projectRoot, ["rev-parse", "HEAD"]), primaryHead);
+        assert.equal(
+            gitFixture(environment.projectRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+            primaryStatus
+        );
+        assert.equal(fs.readFileSync(path.join(environment.projectRoot, "tracked.txt"), "utf8"), primaryContent);
+    } finally {
+        try {
+            if (session) {
+                await session.discard();
+                const remaining = parseWorktreeListPorcelainZ(
+                    gitFixture(environment.projectRoot, ["worktree", "list", "--porcelain", "-z"])
+                );
+                assert.equal(remaining.some(entry => path.resolve(entry.path) === path.resolve(handle.worktreePath)), false);
+            }
+        } finally {
+            await environment.close();
+        }
+    }
+    assert.equal(fs.existsSync(environment.tempRoot), false);
 });
 
 test("SidecarClient inspection and status preserve the exact patch protocol proof", async () => {

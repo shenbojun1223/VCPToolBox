@@ -6,6 +6,8 @@ const net = require("net");
 const path = require("path");
 const { EventEmitter } = require("events");
 const { CodexAppServerProcess } = require("./codexAppServerProcess");
+const { GitWorktreeAdapter } = require("./gitWorktreeAdapter");
+const { WorktreeWriteSession } = require("./worktreeWriteSession");
 const {
     SidecarError,
     runtimePaths,
@@ -94,6 +96,10 @@ class SidecarServer extends EventEmitter {
         this.patchMonitorIntervalMs = Math.max(50, Number(options.patchMonitorIntervalMs || 500));
         this.patchArtifactHooks = options.patchArtifactHooks || {};
         this.patchMetaOptions = options.patchMetaOptions || {};
+        this._writeWorkspaceBaseRoot = options.writeWorkspaceBaseRoot ?? null;
+        this._writeAdapter = this._writeWorkspaceBaseRoot === null
+            ? null
+            : new GitWorktreeAdapter({ workspaceBaseRoot: this._writeWorkspaceBaseRoot });
         this.activeJobs = new Map();
         this.seenJobs = new Set();
         this.sockets = new Set();
@@ -303,6 +309,22 @@ class SidecarServer extends EventEmitter {
             maxConcurrency: this.maxConcurrency,
             ...getPatchProtocolProof()
         };
+    }
+
+    async _openWriteSession(params) {
+        if (!this._writeAdapter) {
+            throw new SidecarError("AICW_WRITE_NOT_CONFIGURED", "Sidecar write sessions are not configured");
+        }
+        const jobId = assertJobId(params.jobId);
+        const projectPath = assertAbsolutePath(params.projectPath, "projectPath");
+        const session = new WorktreeWriteSession({
+            adapter: this._writeAdapter,
+            jobId,
+            repoRoot: projectPath,
+            workspaceBaseRoot: this._writeWorkspaceBaseRoot
+        });
+        const handle = await session.open();
+        return { session, handle };
     }
 
     async _submitAnalyzeJob(params) {
