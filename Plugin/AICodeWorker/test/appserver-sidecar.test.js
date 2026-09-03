@@ -35,6 +35,7 @@ const {
     getPatchProtocolProof
 } = require("../appserver/protocol");
 const { captureGitBaseline, startGitBaselineMonitor, sha256 } = require("../appserver/patchValidator");
+const { CodexAppServerProcess } = require("../appserver/codexAppServerProcess");
 const { JsonLineRpcConnection } = require("../appserver/jsonLineRpcConnection");
 const { SidecarServer } = require("../appserver/sidecarServer");
 
@@ -774,6 +775,119 @@ test("submitPatchJob publishes only a validated patch with exact read-only field
             assert.equal(Object.prototype.hasOwnProperty.call(analyzeTurn.params, field), false);
         }
     } finally { await environment.close(); }
+});
+
+test("Codex transport workspace-write sends fixed thread and turn sandbox fields", async () => {
+    const environment = await createEnvironment();
+    const codex = new CodexAppServerProcess({
+        codexBin: nodeExecutable,
+        codexGlobalArgs: environment.codexGlobalArgs,
+        cwd: environment.projectRoot,
+        requestTimeoutMs: 5000
+    });
+    try {
+        await codex.start();
+        const writeThread = await codex.startThread({
+            projectPath: environment.projectRoot,
+            model: "gpt-5-codex-write",
+            writeMode: true
+        });
+        await codex.startTurn({
+            threadId: writeThread.id,
+            text: "workspace-write",
+            effort: "medium",
+            projectPath: environment.projectRoot,
+            model: "gpt-5-codex-write",
+            writeMode: true
+        });
+
+        const records = environment.readFakeRecords();
+        assert.deepEqual(records.find(record => record.method === "thread/start")?.params, {
+            cwd: environment.projectRoot,
+            ephemeral: true,
+            sandbox: "workspace-write",
+            approvalPolicy: "never",
+            model: "gpt-5-codex-write"
+        });
+        assert.deepEqual(records.find(record => record.method === "turn/start")?.params, {
+            threadId: writeThread.id,
+            cwd: environment.projectRoot,
+            sandboxPolicy: {
+                type: "workspaceWrite",
+                writableRoots: [environment.projectRoot],
+                networkAccess: false
+            },
+            approvalPolicy: "never",
+            model: "gpt-5-codex-write",
+            effort: "medium",
+            inputTypes: ["text"]
+        });
+
+        const analyzeThread = await codex.startThread({
+            projectPath: environment.projectRoot,
+            model: "gpt-5-codex-analyze"
+        });
+        await codex.startTurn({
+            threadId: analyzeThread.id,
+            text: "default-analyze",
+            projectPath: environment.projectRoot,
+            model: "gpt-5-codex-analyze"
+        });
+        const analyzeRecords = environment.readFakeRecords();
+        assert.deepEqual(analyzeRecords.filter(record => record.method === "thread/start").at(-1)?.params, {
+            cwd: environment.projectRoot,
+            ephemeral: true,
+            sandbox: "read-only",
+            approvalPolicy: "never",
+            model: "gpt-5-codex-analyze"
+        });
+        assert.deepEqual(analyzeRecords.filter(record => record.method === "turn/start").at(-1)?.params, {
+            threadId: analyzeThread.id,
+            inputTypes: ["text"]
+        });
+    } finally {
+        await codex.stop();
+        await environment.close();
+    }
+});
+
+test("Codex transport workspace-write rejects conflicts and invalid project paths before RPC", async () => {
+    const environment = await createEnvironment();
+    const codex = new CodexAppServerProcess({
+        codexBin: nodeExecutable,
+        codexGlobalArgs: environment.codexGlobalArgs,
+        cwd: environment.projectRoot,
+        requestTimeoutMs: 5000
+    });
+    try {
+        await codex.start();
+        const rpcCount = () => environment.readFakeRecords().length;
+        const before = rpcCount();
+
+        await assert.rejects(codex.startTurn({
+            threadId: "thread-not-sent",
+            text: "not-sent",
+            patchMode: true,
+            writeMode: true,
+            projectPath: environment.projectRoot
+        }), error => error instanceof SidecarError && error.code === "CODEX_MODE_CONFLICT");
+        await assert.rejects(codex.startThread({ writeMode: true }),
+            error => error instanceof SidecarError && error.code === "CODEX_WRITE_PROJECT_PATH_INVALID");
+        await assert.rejects(codex.startThread({ projectPath: "relative-project", writeMode: true }),
+            error => error instanceof SidecarError && error.code === "CODEX_WRITE_PROJECT_PATH_INVALID");
+        await assert.rejects(codex.startTurn({ threadId: "thread-not-sent", writeMode: true }),
+            error => error instanceof SidecarError && error.code === "CODEX_WRITE_PROJECT_PATH_INVALID");
+        await assert.rejects(codex.startTurn({
+            threadId: "thread-not-sent",
+            projectPath: "relative-project",
+            writeMode: true
+        }), error => error instanceof SidecarError && error.code === "CODEX_WRITE_PROJECT_PATH_INVALID");
+
+        assert.equal(rpcCount(), before);
+    } finally {
+        await codex.stop();
+        await environment.close();
+    }
 });
 
 test("two patch Jobs overlap and share the maxConcurrency=2 budget", async () => {

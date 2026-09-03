@@ -2,6 +2,7 @@
 
 const { EventEmitter } = require("events");
 const { spawn } = require("child_process");
+const path = require("path");
 const { JsonLineRpcConnection } = require("./jsonLineRpcConnection");
 const { SidecarError, getProcessIdentity, terminateOwnedChild } = require("./protocol");
 
@@ -132,12 +133,15 @@ class CodexAppServerProcess extends EventEmitter {
         }
     }
 
-    async startThread({ projectPath, model } = {}) {
+    async startThread({ projectPath, model, writeMode = false } = {}) {
+        if (writeMode && (!projectPath || !path.isAbsolute(projectPath))) {
+            throw new SidecarError("CODEX_WRITE_PROJECT_PATH_INVALID", "writeMode requires an absolute projectPath");
+        }
         if (!this.connection || this.closed) throw new SidecarError("CODEX_NOT_READY", "Codex app-server is not ready");
         const params = {
             cwd: projectPath,
             ephemeral: true,
-            sandbox: "read-only",
+            sandbox: writeMode ? "workspace-write" : "read-only",
             approvalPolicy: "never"
         };
         if (model) params.model = model;
@@ -151,7 +155,13 @@ class CodexAppServerProcess extends EventEmitter {
         return this.version === PATCH_CODEX_VERSION;
     }
 
-    async startTurn({ threadId, text, effort, patchMode = false, projectPath, model } = {}) {
+    async startTurn({ threadId, text, effort, patchMode = false, writeMode = false, projectPath, model } = {}) {
+        if (patchMode && writeMode) {
+            throw new SidecarError("CODEX_MODE_CONFLICT", "patchMode and writeMode cannot be enabled together");
+        }
+        if (writeMode && (!projectPath || !path.isAbsolute(projectPath))) {
+            throw new SidecarError("CODEX_WRITE_PROJECT_PATH_INVALID", "writeMode requires an absolute projectPath");
+        }
         if (!this.connection || this.closed) throw new SidecarError("CODEX_NOT_READY", "Codex app-server is not ready");
         const params = {
             threadId,
@@ -160,6 +170,12 @@ class CodexAppServerProcess extends EventEmitter {
         if (patchMode) {
             params.cwd = projectPath;
             params.sandboxPolicy = { type: "readOnly", networkAccess: false };
+            params.approvalPolicy = "never";
+            params.model = model;
+        }
+        if (writeMode) {
+            params.cwd = projectPath;
+            params.sandboxPolicy = { type: "workspaceWrite", writableRoots: [projectPath], networkAccess: false };
             params.approvalPolicy = "never";
             params.model = model;
         }
