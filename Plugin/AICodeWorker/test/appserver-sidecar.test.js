@@ -2445,6 +2445,101 @@ function ownedTerminationFixture() {
     };
 }
 
+test("terminateOwnedChild strict process tree", {
+    skip: process.platform !== "win32" && "requires Windows strict process-tree semantics"
+}, async t => {
+    await t.test("confirms tree termination only after the owned PID disappears", async () => {
+        const fixture = ownedTerminationFixture();
+        const treeKillCalls = [];
+        let alive = true;
+        const result = await terminateOwnedChild(fixture.child, {
+            ...fixture.options,
+            requireProcessTree: true,
+            isPidAlive: () => alive,
+            treeKill: (...args) => {
+                treeKillCalls.push(args);
+                alive = false;
+                return true;
+            }
+        });
+
+        assert.deepEqual(treeKillCalls, [[fixture.child.pid]]);
+        assert.deepEqual(fixture.child.killCalls, []);
+        assert.equal(alive, false);
+        assert.equal(result.confirmed, true);
+        assert.equal(result.processTreeRequired, true);
+        assert.equal(result.treeTermination, "confirmed");
+    });
+
+    await t.test("does not report confirmation while the PID remains alive", async () => {
+        const fixture = ownedTerminationFixture();
+        let treeKillCalls = 0;
+        const result = await terminateOwnedChild(fixture.child, {
+            ...fixture.options,
+            requireProcessTree: true,
+            isPidAlive: () => true,
+            treeKill: () => {
+                treeKillCalls++;
+                return true;
+            }
+        });
+
+        assert.equal(treeKillCalls, 1);
+        assert.deepEqual(fixture.child.killCalls, []);
+        assert.equal(result.confirmed, false);
+        assert.equal(result.processTreeRequired, true);
+        assert.equal(result.treeTermination, "unconfirmed");
+    });
+
+    await t.test("does not tree-kill without an identity", async () => {
+        const fixture = ownedTerminationFixture();
+        let treeKillCalls = 0;
+        const result = await terminateOwnedChild(fixture.child, {
+            ...fixture.options,
+            identity: null,
+            requireProcessTree: true,
+            isPidAlive: () => true,
+            treeKill: () => {
+                treeKillCalls++;
+                return true;
+            }
+        });
+
+        assert.equal(treeKillCalls, 0);
+        assert.deepEqual(fixture.child.killCalls, []);
+        assert.equal(result.confirmed, false);
+        assert.equal(result.identityMissing, true);
+        assert.equal(result.processTreeRequired, true);
+    });
+
+    await t.test("does not tree-kill after an identity mismatch", async () => {
+        const fixture = ownedTerminationFixture();
+        const mismatchedIdentity = {
+            pid: fixture.child.pid,
+            ...(fixture.identity.startTimeTicks
+                ? { startTimeTicks: "mismatch" }
+                : { startTime: "mismatch" })
+        };
+        let treeKillCalls = 0;
+        const result = await terminateOwnedChild(fixture.child, {
+            ...fixture.options,
+            identity: mismatchedIdentity,
+            requireProcessTree: true,
+            isPidAlive: () => true,
+            treeKill: () => {
+                treeKillCalls++;
+                return true;
+            }
+        });
+
+        assert.equal(treeKillCalls, 0);
+        assert.deepEqual(fixture.child.killCalls, []);
+        assert.equal(result.confirmed, false);
+        assert.equal(result.identityMismatch, true);
+        assert.equal(result.processTreeRequired, true);
+    });
+});
+
 test("force signal sent while child and PID remain alive is not confirmed", async () => {
     const fixture = ownedTerminationFixture();
     const result = await terminateOwnedChild(fixture.child, {

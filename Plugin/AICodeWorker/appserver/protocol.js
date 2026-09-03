@@ -748,14 +748,18 @@ function isPidAlive(pid) {
     }
 }
 
-function getProcessIdentity(pid) {
+function getProcessIdentity(pid, options = {}) {
     const number = Number(pid);
     if (!Number.isInteger(number) || number <= 0) return null;
     try {
         if (process.platform === "win32") {
+            const requestedTimeoutMs = Number(options.timeoutMs ?? 1500);
+            const timeoutMs = Number.isFinite(requestedTimeoutMs)
+                ? Math.min(1500, Math.max(50, requestedTimeoutMs))
+                : 1500;
             const script = "$ErrorActionPreference='Stop'; $p=Get-Process -Id " + number + "; [pscustomobject]@{Pid=$p.Id; StartTime=$p.StartTime.ToUniversalTime().ToString('o')} | ConvertTo-Json -Compress";
             const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-                encoding: "utf8", timeout: 1500, windowsHide: true, stdio: ["ignore", "pipe", "ignore"]
+                encoding: "utf8", timeout: timeoutMs, windowsHide: true, stdio: ["ignore", "pipe", "ignore"]
             });
             if (result.status !== 0 || !result.stdout) return null;
             const parsed = JSON.parse(result.stdout.trim());
@@ -827,7 +831,13 @@ function sameProcessIdentity(left, right) {
 }
 
 async function terminateOwnedChild(child, options = {}) {
-    if (!child || typeof child.kill !== "function") return { terminated: false, confirmed: false };
+    const requireProcessTree = options.requireProcessTree === true;
+    const treeStatus = (result, status) => requireProcessTree
+        ? { ...result, processTreeRequired: true, treeTermination: status }
+        : result;
+    if (!child || typeof child.kill !== "function") {
+        return treeStatus({ terminated: false, confirmed: false }, "unconfirmed");
+    }
     const gracefulTimeoutMs = Math.max(0, Number(options.gracefulTimeoutMs ?? 750));
     const forceConfirmationTimeoutMs = Math.min(2000, Math.max(0,
         Number(options.forceConfirmationTimeoutMs ?? 1000)));
@@ -872,21 +882,127 @@ async function terminateOwnedChild(child, options = {}) {
         child.once?.("close", onClose);
         poll();
     });
-    if (hasExited()) return { terminated: false, confirmed: true, alreadyExited: true };
+
+    if (requireProcessTree && process.platform === "win32") {
+        const strictResult = details => treeStatus({
+            terminated: false,
+            confirmed: false,
+            treeKillAttempted: false,
+            treeKillSucceeded: false,
+            ...details
+        }, "unconfirmed");
+        const pid = Number(child.pid);
+        if (!Number.isInteger(pid) || pid <= 0) return strictResult({ identityMissing: true });
+        if (hasExited()) return strictResult({ rootAlreadyExited: true });
+        if (!identity || typeof identity !== "object") return strictResult({ identityMissing: true });
+
+        let currentIdentity = null;
+        try { currentIdentity = getIdentity(pid); } catch {}
+        if (!currentIdentity) return strictResult({ identityMissing: true });
+        if (!sameProcessIdentity(identity, currentIdentity)) {
+            return strictResult({ identityMismatch: true });
+        }
+        let alive = false;
+        try { alive = isAlive(pid) === true; } catch {}
+        if (!alive || hasExited()) return strictResult({ rootAlreadyExited: true });
+
+        let treeKillSucceeded = false;
+        try {
+            if (typeof options.treeKill === "function") {
+                treeKillSucceeded = await options.treeKill(pid) !== false;
+            } else {
+                const result = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+                    stdio: "ignore",
+                    windowsHide: true,
+                    timeout: Math.max(250, forceConfirmationTimeoutMs)
+                });
+                treeKillSucceeded = result.status === 0;
+            }
+        } catch {
+            treeKillSucceeded = false;
+        }
+        if (!treeKillSucceeded) {
+            return treeStatus({
+                terminated: false,
+                confirmed: false,
+                forced: true,
+                forceSent: false,
+                treeKillAttempted: true,
+                treeKillSucceeded: false
+            }, "unconfirmed");
+        }
+
+        let identityDrifted = false;
+        let identityUnavailable = false;
+        const confirmed = await new Promise(resolve => {
+            let settled = false;
+            let timer;
+            const finish = value => {
+                if (settled) return;
+                settled = true;
+                if (timer) clearTimeout(timer);
+                try { child.removeListener?.("exit", onExit); } catch {}
+                try { child.removeListener?.("close", onClose); } catch {}
+                resolve(value);
+            };
+            const onExit = () => finish(true);
+            const onClose = () => finish(true);
+            const deadline = Date.now() + forceConfirmationTimeoutMs;
+            const poll = () => {
+                if (hasExited()) return finish(true);
+                let pidAlive = true;
+                try { pidAlive = isAlive(pid) === true; } catch {}
+                if (!pidAlive) return finish(true);
+                let observedIdentity = null;
+                try { observedIdentity = getIdentity(pid); } catch {}
+                if (observedIdentity && !sameProcessIdentity(identity, observedIdentity)) {
+                    identityDrifted = true;
+                    return finish(false);
+                }
+                if (!observedIdentity) identityUnavailable = true;
+                if (Date.now() >= deadline) return finish(false);
+                timer = setTimeout(poll, Math.min(confirmationPollMs, Math.max(0, deadline - Date.now())));
+            };
+            try { child.once?.("exit", onExit); } catch {}
+            try { child.once?.("close", onClose); } catch {}
+            poll();
+        });
+        return treeStatus({
+            terminated: confirmed,
+            confirmed,
+            forced: true,
+            forceSent: true,
+            treeKillAttempted: true,
+            treeKillSucceeded: true,
+            ...(confirmed ? {} : {
+                stillAlive: true,
+                ...(identityDrifted ? { identityMismatch: true } : {}),
+                ...(!identityDrifted && identityUnavailable ? { identityMissing: true } : {})
+            })
+        }, confirmed ? "confirmed" : "unconfirmed");
+    }
+
+    if (hasExited()) {
+        return treeStatus({ terminated: false, confirmed: true, alreadyExited: true }, "not_supported");
+    }
     if (identity) {
         const initialIdentity = getIdentity(child.pid);
         if (initialIdentity && !sameProcessIdentity(identity, initialIdentity)) {
-            return { terminated: false, confirmed: false, identityMismatch: true };
+            return treeStatus({ terminated: false, confirmed: false, identityMismatch: true }, "not_supported");
         }
     }
     try { child.kill(options.signal || "SIGTERM"); } catch {}
     const exited = await waitForTermination(gracefulTimeoutMs, Boolean(identity));
-    if (exited || hasExited()) return { terminated: true, confirmed: true, forced: false };
+    if (exited || hasExited()) {
+        return treeStatus({ terminated: true, confirmed: true, forced: false }, "not_supported");
+    }
     const currentIdentity = getIdentity(child.pid);
     if (!identity || !currentIdentity || !sameProcessIdentity(identity, currentIdentity)) {
-        return { terminated: false, confirmed: false, identityMismatch: true };
+        return treeStatus({ terminated: false, confirmed: false, identityMismatch: true }, "not_supported");
     }
-    if (hasExited()) return { terminated: false, confirmed: true, alreadyExited: true };
+    if (hasExited()) {
+        return treeStatus({ terminated: false, confirmed: true, alreadyExited: true }, "not_supported");
+    }
     let forceSent = false;
     try {
         if (typeof options.forceKill === "function") {
@@ -903,13 +1019,13 @@ async function terminateOwnedChild(child, options = {}) {
         forceSent = false;
     }
     const confirmed = await waitForTermination(forceConfirmationTimeoutMs);
-    return {
+    return treeStatus({
         terminated: forceSent || confirmed,
         confirmed,
         forced: true,
         forceSent,
         ...(confirmed ? {} : { stillAlive: true })
-    };
+    }, "not_supported");
 }
 
 async function reconcileDeadSidecarJobs(jobRoot, state, options = {}) {
