@@ -39,6 +39,7 @@ const { CodexAppServerProcess } = require("../appserver/codexAppServerProcess");
 const { JsonLineRpcConnection } = require("../appserver/jsonLineRpcConnection");
 const { SidecarServer } = require("../appserver/sidecarServer");
 const { parseWorktreeListPorcelainZ } = require("../appserver/gitWorktreeAdapter");
+const { TrustedValidationRunner } = require("../appserver/trustedValidationRunner");
 
 const fixturePath = path.join(__dirname, "fixtures", "fake-codex-app-server.js");
 const entryPath = path.join(__dirname, "..", "appserver", "sidecar-entry.js");
@@ -398,6 +399,90 @@ async function createEnvironment(options = {}) {
     return environment;
 }
 
+async function createDormantWriteEnvironment(expectedContent = "write-approved\n") {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vcp-aicodeworker-dormant-write-"));
+    const pluginDir = path.join(tempRoot, "plugin");
+    const jobRoot = path.join(tempRoot, "jobs");
+    const projectRoot = path.join(tempRoot, "repo");
+    const workspaceBaseRoot = path.join(tempRoot, "workspaces");
+    const fakeRecordPath = path.join(tempRoot, "fake-codex-record.jsonl");
+    for (const directory of [pluginDir, jobRoot, projectRoot, workspaceBaseRoot]) {
+        fs.mkdirSync(directory, { recursive: true });
+    }
+    initializeGitProject(projectRoot, { "tracked.txt": "base-value\n" });
+    const canonicalProjectRoot = fs.realpathSync.native(projectRoot);
+    const canonicalWorkspaceBaseRoot = fs.realpathSync.native(workspaceBaseRoot);
+    const validationScript = `const fs=require("node:fs");process.exit(fs.readFileSync("tracked.txt","utf8")===${JSON.stringify(expectedContent)}?0:1)`;
+    assert.equal(/[\r\n]/.test(validationScript), false);
+    const validationRunner = new TrustedValidationRunner({
+        profiles: {
+            "write-check": {
+                steps: [{
+                    name: "tracked-content",
+                    display: "Check tracked content",
+                    executable: fs.realpathSync.native(process.execPath),
+                    args: ["-e", validationScript],
+                    timeoutMs: 5000
+                }]
+            }
+        },
+        totalTimeoutMs: 10000
+    });
+    const server = new SidecarServer({
+        pluginDir,
+        jobRoot,
+        codexBin: fs.realpathSync.native(process.execPath),
+        codexGlobalArgs: [
+            fixturePath,
+            `--fake-record-base64=${Buffer.from(fakeRecordPath, "utf8").toString("base64")}`
+        ],
+        maxConcurrency: 2,
+        requestTimeoutMs: 5000,
+        writeWorkspaceBaseRoot: canonicalWorkspaceBaseRoot,
+        writeValidationRunner: validationRunner,
+        writeValidationProfile: "write-check"
+    });
+    await server.start();
+    return {
+        tempRoot,
+        pluginDir,
+        jobRoot,
+        projectRoot: canonicalProjectRoot,
+        workspaceBaseRoot: canonicalWorkspaceBaseRoot,
+        fakeRecordPath,
+        server,
+        createWriteMeta(jobId) {
+            return createMeta(jobRoot, jobId);
+        },
+        submitWrite(jobId, text, paths) {
+            return server._submitWriteJob({
+                jobId,
+                projectPath: canonicalProjectRoot,
+                text,
+                model: "gpt-5-codex",
+                effort: "high",
+                metaPath: paths.metaPath,
+                outputPath: paths.outputPath,
+                codexOutputPath: paths.codexOutputPath
+            });
+        },
+        readFakeRecords() {
+            if (!fs.existsSync(fakeRecordPath)) return [];
+            return fs.readFileSync(fakeRecordPath, "utf8").split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+        },
+        worktrees() {
+            return parseWorktreeListPorcelainZ(
+                gitFixture(canonicalProjectRoot, ["worktree", "list", "--porcelain", "-z"])
+            );
+        },
+        async close() {
+            await server.shutdown();
+            await removeTestRoot(tempRoot, "dormant write fixture");
+            assert.equal(fs.existsSync(tempRoot), false);
+        }
+    };
+}
+
 function clientFor(environment, options = {}) {
     return new SidecarClient({
         pluginDir: environment.pluginDir,
@@ -694,6 +779,298 @@ test("Sidecar opens and holds a configured Worktree write session", async () => 
         }
     }
     assert.equal(fs.existsSync(environment.tempRoot), false);
+});
+
+test("dormant write submission stays internal and fail-closed", async () => {
+    const environment = await createDormantWriteEnvironment();
+    const jobId = "write_internal_only";
+    const paths = environment.createWriteMeta(jobId);
+    const metaBefore = fs.readFileSync(paths.metaPath, "utf8");
+    const worktreesBefore = environment.worktrees();
+    const recordsBefore = environment.readFakeRecords();
+    const unconfigured = new SidecarServer({
+        pluginDir: environment.pluginDir,
+        jobRoot: environment.jobRoot
+    });
+    try {
+        await assert.rejects(
+            environment.server._dispatch("submitWriteJob", { jobId }),
+            error => error instanceof SidecarError && error.code === "UNKNOWN_METHOD"
+        );
+        await assert.rejects(
+            unconfigured._submitWriteJob({ jobId, projectPath: environment.projectRoot }),
+            error => error instanceof SidecarError && error.code === "AICW_WRITE_NOT_CONFIGURED"
+        );
+        await assert.rejects(
+            environment.server._submitWriteJob(null),
+            error => error instanceof SidecarError && error.code === "AICW_WRITE_REQUEST_INVALID"
+        );
+        assert.equal(fs.readFileSync(paths.metaPath, "utf8"), metaBefore);
+        assert.deepEqual(environment.worktrees(), worktreesBefore);
+        assert.deepEqual(environment.readFakeRecords(), recordsBefore);
+
+        const bindPluginDir = path.join(environment.tempRoot, "bind-failure-plugin");
+        const bindJobRoot = path.join(bindPluginDir, "jobs");
+        const bindJobId = "write_bind_meta_failure";
+        const bindPaths = createMeta(bindJobRoot, bindJobId, {
+            state: "running",
+            executionBackend: "codex-app-server",
+            sidecarInstanceId: "foreign-instance"
+        });
+        const bindServer = new SidecarServer({ pluginDir: bindPluginDir, jobRoot: bindJobRoot });
+        bindServer.state = { status: "ready", instanceId: "bind-instance", pid: process.pid };
+        let resolveTerminal;
+        const terminalPromise = new Promise(resolve => { resolveTerminal = resolve; });
+        const bindJob = {
+            jobId: bindJobId,
+            kind: "write",
+            paths: bindPaths,
+            threadId: "thread-bind-meta-failure",
+            turnId: null,
+            accepted: false,
+            terminal: false,
+            finalizing: false,
+            finalizationFailed: false,
+            finalizationError: null,
+            state: "running",
+            eventChain: Promise.resolve(),
+            terminalPromise,
+            resolveTerminal,
+            resolveTurnBound() {},
+            cancelRequested: false,
+            timeoutRequested: false
+        };
+        bindServer.activeJobs.set(bindJobId, bindJob);
+        bindServer._bindTurn(bindJob, "turn-bind-meta-failure");
+        await assert.rejects(
+            bindJob.eventChain,
+            error => error instanceof SidecarError && error.code === "AICW_WRITE_FINALIZATION_UNCERTAIN"
+        );
+        assert.deepEqual(await terminalPromise, {
+            state: "finalizationFailed",
+            errorCode: "AICW_WRITE_FINALIZATION_UNCERTAIN"
+        });
+        assert.equal(bindJob.finalizationFailed, true);
+        assert.equal(bindJob.state, "finalizationFailed");
+        assert.equal(bindJob.terminal, true);
+        assert.equal(bindServer.state.status, "degraded");
+        assert.equal(bindServer.activeJobs.get(bindJobId), bindJob);
+
+        let finalizeCalls = 0;
+        bindServer._finalizeWrite = async () => { finalizeCalls++; };
+        bindServer._handleNotification({
+            method: "turn/started",
+            params: {
+                threadId: bindJob.threadId,
+                turn: { id: bindJob.turnId, status: "inProgress" }
+            }
+        });
+        await bindJob.eventChain;
+        bindServer._handleNotification({
+            method: "turn/completed",
+            params: {
+                threadId: bindJob.threadId,
+                turn: { id: bindJob.turnId, status: "completed" }
+            }
+        });
+        await bindJob.eventChain;
+        assert.equal(bindJob.state, "finalizationFailed");
+        assert.equal(bindJob.terminalClaim, undefined);
+        assert.equal(finalizeCalls, 0);
+        assert.equal(bindServer.activeJobs.get(bindJobId), bindJob);
+        bindServer.activeJobs.clear();
+    } finally {
+        await environment.close();
+    }
+});
+
+test("write completion trace failure cannot start validation or candidate commit", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vcp-aicodeworker-write-trace-failure-"));
+    const pluginDir = path.join(tempRoot, "plugin");
+    const jobRoot = path.join(pluginDir, "jobs");
+    const jobId = "write_completion_trace_failure";
+    const paths = createMeta(jobRoot, jobId, {
+        state: "running",
+        executionBackend: "codex-app-server",
+        sidecarInstanceId: "trace-failure-instance"
+    });
+    fs.mkdirSync(paths.outputPath, { recursive: true });
+    const server = new SidecarServer({ pluginDir, jobRoot });
+    server.state = {
+        status: "ready",
+        instanceId: "trace-failure-instance",
+        pid: process.pid
+    };
+    let resolveTerminal;
+    const terminalPromise = new Promise(resolve => { resolveTerminal = resolve; });
+    const job = {
+        jobId,
+        kind: "write",
+        paths,
+        threadId: "thread-trace-failure",
+        turnId: "turn-trace-failure",
+        accepted: true,
+        terminal: false,
+        finalizing: false,
+        finalizationFailed: false,
+        finalizationError: null,
+        terminalClaim: null,
+        state: "running",
+        eventChain: Promise.resolve(),
+        terminalPromise,
+        resolveTerminal,
+        timeoutTimer: null,
+        timeoutFinalizeTimer: null,
+        cancelTimeoutTimer: null
+    };
+    server.activeJobs.set(jobId, job);
+    let finalizeCalls = 0;
+    server._finalizeWrite = async () => { finalizeCalls++; };
+
+    try {
+        server._handleNotification({
+            method: "turn/completed",
+            params: {
+                threadId: job.threadId,
+                turn: { id: job.turnId, status: "completed" }
+            }
+        });
+        await job.eventChain;
+        const terminal = await terminalPromise;
+        assert.equal(terminal.state, "failed");
+        assert.equal(job.terminal, true);
+        assert.equal(job.state, "failed");
+        assert.equal(finalizeCalls, 0);
+        assert.equal(server.activeJobs.has(jobId), false);
+        const meta = readJsonOrNull(paths.metaPath);
+        assert.equal(meta.state, "failed");
+        assert.equal(meta.candidateAvailable, false);
+        assert.equal(Object.prototype.hasOwnProperty.call(meta, "resultCommit"), false);
+    } finally {
+        server.activeJobs.clear();
+        await removeTestRoot(tempRoot, "write completion trace failure fixture");
+        assert.equal(fs.existsSync(tempRoot), false);
+    }
+});
+
+test("dormant write completes validation and candidate commit in a locked Worktree", async () => {
+    const expectedContent = "write-approved\n";
+    const environment = await createDormantWriteEnvironment(expectedContent);
+    const jobId = "write_candidate_success";
+    const paths = environment.createWriteMeta(jobId);
+    const baseHead = gitFixture(environment.projectRoot, ["rev-parse", "HEAD"]);
+    const primaryStatus = gitFixture(environment.projectRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const primaryContent = fs.readFileSync(path.join(environment.projectRoot, "tracked.txt"), "utf8");
+    try {
+        const submission = environment.submitWrite(jobId, "[[DELAY_MS=1200]]", paths);
+        await waitFor(() => Boolean(readJsonOrNull(paths.metaPath)?.worktreePath));
+        const worktreePath = readJsonOrNull(paths.metaPath).worktreePath;
+        fs.writeFileSync(path.join(worktreePath, "tracked.txt"), expectedContent, "utf8");
+        await submission;
+        await waitFor(() => readJsonOrNull(paths.metaPath)?.state === "completed", 10000);
+        const meta = readJsonOrNull(paths.metaPath);
+        assert.equal(meta.state, "completed");
+        assert.equal(meta.jobPhase, "completed");
+        assert.equal(meta.validationPassed, true);
+        assert.equal(meta.candidateAvailable, true);
+        assert.match(meta.resultCommit, /^[0-9a-f]{40,64}$/);
+        assert.match(meta.resultTree, /^[0-9a-f]{40,64}$/);
+        assert.deepEqual(meta.changedFiles, [{ status: "M", score: null, path: "tracked.txt", oldPath: null }]);
+        assert.deepEqual(meta.validationSteps, [{ name: "tracked-content", status: "passed", exitCode: 0, timedOut: false }]);
+        const serialized = JSON.stringify(meta);
+        for (const forbidden of ["stdoutSummary", "stderrSummary", "stdoutBytes", "stderrBytes"]) {
+            assert.equal(serialized.includes(forbidden), false);
+        }
+        const records = environment.readFakeRecords();
+        const thread = records.find(record => record.method === "thread/start");
+        const turn = records.find(record => record.method === "turn/start");
+        assert.equal(thread.params.cwd, worktreePath);
+        assert.equal(thread.params.sandbox, "workspace-write");
+        assert.equal(turn.params.cwd, worktreePath);
+        assert.deepEqual(turn.params.sandboxPolicy, {
+            type: "workspaceWrite",
+            writableRoots: [worktreePath],
+            networkAccess: false
+        });
+        assert.equal(gitFixture(environment.projectRoot, ["rev-parse", `${meta.resultCommit}^`]), baseHead);
+        assert.equal(gitFixture(environment.projectRoot, ["show", `${meta.resultCommit}:tracked.txt`]), expectedContent.trimEnd());
+        const official = environment.worktrees().find(entry => path.resolve(entry.path) === path.resolve(worktreePath));
+        assert.ok(official);
+        assert.equal(official.head, meta.resultCommit);
+        assert.equal(official.locked, true);
+        assert.equal(official.lockReason, `AICodeWorker write session ${jobId}`);
+        assert.equal(gitFixture(environment.projectRoot, ["rev-parse", "HEAD"]), baseHead);
+        assert.equal(gitFixture(environment.projectRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]), primaryStatus);
+        assert.equal(fs.readFileSync(path.join(environment.projectRoot, "tracked.txt"), "utf8"), primaryContent);
+    } finally {
+        await environment.close();
+    }
+});
+
+test("dormant write validation failure retains locked Worktree without candidate", async () => {
+    const environment = await createDormantWriteEnvironment("required-value\n");
+    const jobId = "write_validation_failure";
+    const paths = environment.createWriteMeta(jobId);
+    const baseHead = gitFixture(environment.projectRoot, ["rev-parse", "HEAD"]);
+    const primaryStatus = gitFixture(environment.projectRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const primaryContent = fs.readFileSync(path.join(environment.projectRoot, "tracked.txt"), "utf8");
+    try {
+        const submission = environment.submitWrite(jobId, "[[DELAY_MS=1200]]", paths);
+        await waitFor(() => Boolean(readJsonOrNull(paths.metaPath)?.worktreePath));
+        const worktreePath = readJsonOrNull(paths.metaPath).worktreePath;
+        fs.writeFileSync(path.join(worktreePath, "tracked.txt"), "wrong-value\n", "utf8");
+        await submission;
+        await waitFor(() => readJsonOrNull(paths.metaPath)?.state === "failed", 10000);
+        const meta = readJsonOrNull(paths.metaPath);
+        assert.equal(meta.state, "failed");
+        assert.equal(meta.jobPhase, "failed");
+        assert.equal(meta.validationPassed, false);
+        assert.equal(meta.candidateAvailable, false);
+        assert.equal(meta.errorCode, "AICW_VALIDATION_STEP_FAILED");
+        assert.equal(Object.prototype.hasOwnProperty.call(meta, "resultCommit"), false);
+        assert.equal(Object.prototype.hasOwnProperty.call(meta, "resultTree"), false);
+        const official = environment.worktrees().find(entry => path.resolve(entry.path) === path.resolve(worktreePath));
+        assert.ok(official);
+        assert.equal(official.head, baseHead);
+        assert.equal(official.locked, true);
+        assert.equal(official.lockReason, `AICodeWorker write session ${jobId}`);
+        assert.equal(gitFixture(worktreePath, ["rev-parse", "HEAD"]), baseHead);
+        assert.equal(gitFixture(environment.projectRoot, ["rev-parse", "HEAD"]), baseHead);
+        assert.equal(gitFixture(environment.projectRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]), primaryStatus);
+        assert.equal(fs.readFileSync(path.join(environment.projectRoot, "tracked.txt"), "utf8"), primaryContent);
+    } finally {
+        await environment.close();
+    }
+});
+
+test("second dormant write is rejected before meta Worktree or RPC side effects", async () => {
+    const expectedContent = "write-approved\n";
+    const environment = await createDormantWriteEnvironment(expectedContent);
+    const firstId = "write_active_first";
+    const firstPaths = environment.createWriteMeta(firstId);
+    try {
+        const firstSubmission = environment.submitWrite(firstId, "[[DELAY_MS=1200]]", firstPaths);
+        await waitFor(() => Boolean(readJsonOrNull(firstPaths.metaPath)?.worktreePath));
+        const firstWorktreePath = readJsonOrNull(firstPaths.metaPath).worktreePath;
+        const secondId = "write_rejected_second";
+        const secondPaths = environment.createWriteMeta(secondId);
+        const secondMetaBefore = fs.readFileSync(secondPaths.metaPath, "utf8");
+        const worktreesBefore = environment.worktrees();
+        const rpcCountBefore = environment.readFakeRecords().length;
+        await assert.rejects(
+            environment.submitWrite(secondId, "second", secondPaths),
+            error => error instanceof SidecarError && error.code === "AICW_WRITE_CONCURRENCY_LIMIT"
+        );
+        assert.equal(fs.readFileSync(secondPaths.metaPath, "utf8"), secondMetaBefore);
+        assert.deepEqual(environment.worktrees(), worktreesBefore);
+        assert.equal(environment.readFakeRecords().length, rpcCountBefore);
+        fs.writeFileSync(path.join(firstWorktreePath, "tracked.txt"), expectedContent, "utf8");
+        await firstSubmission;
+        await waitFor(() => readJsonOrNull(firstPaths.metaPath)?.state === "completed", 10000);
+        assert.equal(readJsonOrNull(firstPaths.metaPath).candidateAvailable, true);
+    } finally {
+        await environment.close();
+    }
 });
 
 test("SidecarClient inspection and status preserve the exact patch protocol proof", async () => {

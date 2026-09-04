@@ -8,6 +8,7 @@ const { EventEmitter } = require("events");
 const { CodexAppServerProcess } = require("./codexAppServerProcess");
 const { GitWorktreeAdapter } = require("./gitWorktreeAdapter");
 const { WorktreeWriteSession } = require("./worktreeWriteSession");
+const { TrustedValidationRunner } = require("./trustedValidationRunner");
 const {
     SidecarError,
     runtimePaths,
@@ -47,6 +48,28 @@ const {
 } = require("./patchValidator");
 
 const TERMINAL_STATES = new Set(["completed", "cancelled", "failed", "timeout"]);
+const SAFE_WRITE_VALIDATION_PROFILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const UNCERTAIN_WRITE_CANDIDATE_CODES = new Set([
+    "WORKTREE_CANDIDATE_OUTCOME_UNKNOWN",
+    "WORKTREE_CANDIDATE_INDEX_ROLLBACK_UNCONFIRMED",
+    "WORKTREE_SESSION_OUTCOME_UNCERTAIN"
+]);
+
+function safeWriteErrorCode(error) {
+    return typeof error?.code === "string" && /^[A-Z0-9_]+$/.test(error.code)
+        ? error.code
+        : "AICW_WRITE_FINALIZE_FAILED";
+}
+
+function safeValidationSteps(steps) {
+    if (!Array.isArray(steps)) return [];
+    return steps.map(step => ({
+        name: typeof step?.name === "string" ? step.name.slice(0, 64) : "unknown",
+        status: typeof step?.status === "string" ? step.status.slice(0, 32) : "unknown",
+        exitCode: Number.isInteger(step?.exitCode) ? step.exitCode : null,
+        timedOut: step?.timedOut === true
+    }));
+}
 
 function withSafeIdentityCwd(callback) {
     if (process.platform !== "win32") return callback();
@@ -100,6 +123,13 @@ class SidecarServer extends EventEmitter {
         this._writeAdapter = this._writeWorkspaceBaseRoot === null
             ? null
             : new GitWorktreeAdapter({ workspaceBaseRoot: this._writeWorkspaceBaseRoot });
+        this._writeValidationRunner = options.writeValidationRunner instanceof TrustedValidationRunner
+            ? options.writeValidationRunner
+            : null;
+        this._writeValidationProfile = typeof options.writeValidationProfile === "string" &&
+            SAFE_WRITE_VALIDATION_PROFILE.test(options.writeValidationProfile)
+            ? options.writeValidationProfile
+            : null;
         this.activeJobs = new Map();
         this.seenJobs = new Set();
         this.sockets = new Set();
@@ -327,6 +357,173 @@ class SidecarServer extends EventEmitter {
         return { session, handle };
     }
 
+    async _submitWriteJob(params) {
+        if (!this._writeAdapter || !this._writeValidationRunner || !this._writeValidationProfile) {
+            throw new SidecarError("AICW_WRITE_NOT_CONFIGURED", "Sidecar write Jobs are not configured");
+        }
+        let plainParams = false;
+        try {
+            plainParams = Boolean(params) && typeof params === "object" && !Array.isArray(params) &&
+                Object.getPrototypeOf(params) === Object.prototype;
+        } catch {}
+        if (!plainParams) {
+            throw new SidecarError("AICW_WRITE_REQUEST_INVALID", "Write Job request must be a plain object");
+        }
+        if (this.draining || this.state?.status !== "ready") throw new SidecarError("SIDECAR_NOT_READY", "Sidecar is not ready");
+        if ([...this.activeJobs.values()].some(job => job.kind === "write" && !job.terminal)) {
+            throw new SidecarError("AICW_WRITE_CONCURRENCY_LIMIT", "Only one write Job may be active");
+        }
+        if (this.activeJobs.size >= this.maxConcurrency) throw new SidecarError("CONCURRENCY_LIMIT", "Sidecar concurrency limit reached");
+        const jobId = assertJobId(params.jobId);
+        const projectPath = assertAbsolutePath(params.projectPath, "projectPath");
+        const timeoutSec = params.timeoutSec === undefined ? 600 : Number(params.timeoutSec);
+        if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutSec > 86400) {
+            throw new SidecarError("INVALID_TIMEOUT_SEC", "timeoutSec must be a finite number greater than 0 and at most 86400");
+        }
+        const paths = validateJobPaths(this.jobRoot, jobId, params);
+        if (!fs.existsSync(paths.metaPath)) throw new SidecarError("META_NOT_FOUND", "Job meta file does not exist");
+        let meta;
+        try { meta = readJson(paths.metaPath); } catch { throw new SidecarError("META_INVALID", "Job meta file is invalid"); }
+        if (String(meta.jobId || "") !== jobId) throw new SidecarError("META_JOB_MISMATCH", "Job meta does not match jobId");
+        if (this.seenJobs.has(jobId) || this.activeJobs.has(jobId) || meta.sidecarInstanceId || meta.executionBackend || TERMINAL_STATES.has(meta.state)) {
+            throw new SidecarError("DUPLICATE_JOB_ID", "jobId has already been submitted");
+        }
+        const job = {
+            jobId,
+            kind: "write",
+            projectPath,
+            model: params.model,
+            effort: params.effort,
+            paths,
+            outputBytes: 0,
+            timeoutSec,
+            timeoutTimer: null,
+            timeoutFinalizeTimer: null,
+            cancelTimeoutTimer: null,
+            timeoutRequested: false,
+            threadId: null,
+            turnId: null,
+            state: "starting",
+            cancelRequested: false,
+            terminalClaim: null,
+            finalizing: false,
+            terminal: false,
+            terminalPromise: null,
+            resolveTerminal: null,
+            finalizationFailed: false,
+            finalizationError: null,
+            eventChain: Promise.resolve(),
+            turnBoundPromise: null,
+            resolveTurnBound: null,
+            interruptPromise: null,
+            interruptRequested: false,
+            accepted: false,
+            session: null,
+            handle: null,
+            candidateResult: null
+        };
+        job.terminalPromise = new Promise(resolve => { job.resolveTerminal = resolve; });
+        job.turnBoundPromise = new Promise(resolve => { job.resolveTurnBound = resolve; });
+        this.activeJobs.set(jobId, job);
+        job.timeoutTimer = setTimeout(() => this._handleTimeout(job), timeoutSec * 1000);
+        job.timeoutTimer.unref?.();
+        this.seenJobs.add(jobId);
+        try {
+            await this._updateMeta(job, metaValue => {
+                metaValue.sidecarInstanceId = this.state.instanceId;
+                metaValue.sidecarPid = this.state.pid;
+                metaValue.executionBackend = "codex-app-server";
+                metaValue.jobKind = "write";
+                metaValue.jobPhase = "worktree-creating";
+                metaValue.state = "running";
+                metaValue.submissionState = "submitting";
+                metaValue.sandboxMode = "workspace-write";
+                metaValue.approvalPolicy = "never";
+                metaValue.validationProfile = this._writeValidationProfile;
+                metaValue.validationPassed = false;
+                metaValue.candidateAvailable = false;
+            });
+
+            const opened = await this._openWriteSession({ jobId, projectPath });
+            job.session = opened.session;
+            job.handle = opened.handle;
+            job.projectPath = opened.handle.worktreePath;
+            await this._updateMeta(job, metaValue => {
+                metaValue.gitRepoRoot = opened.handle.repoRoot;
+                metaValue.worktreePath = opened.handle.worktreePath;
+                metaValue.worktreeBranch = opened.handle.branch;
+                metaValue.worktreeLockReason = opened.handle.lockReason;
+                metaValue.baseHead = opened.handle.base.baseRevision;
+                metaValue.baseTree = opened.handle.base.baseTree;
+                metaValue.baseStatusSha256 = opened.handle.base.statusSha256;
+                metaValue.worktreeLocked = true;
+                metaValue.jobPhase = "running";
+            });
+
+            const threadOutcome = await this._awaitStartOrTerminal(job, this.codex.startThread({
+                projectPath: opened.handle.worktreePath,
+                model: params.model,
+                writeMode: true
+            }));
+            if (threadOutcome.terminal) return this._terminalSubmissionResult(job, threadOutcome.terminal);
+            const thread = threadOutcome.value;
+            job.threadId = thread.id;
+            await this._updateMeta(job, metaValue => {
+                metaValue.threadId = job.threadId;
+                metaValue.jobPhase = "running";
+            });
+            const turnOutcome = await this._awaitStartOrTerminal(job, this.codex.startTurn({
+                threadId: job.threadId,
+                text: params.text,
+                effort: params.effort,
+                writeMode: true,
+                projectPath: opened.handle.worktreePath,
+                model: params.model
+            }));
+            if (turnOutcome.terminal) return this._terminalSubmissionResult(job, turnOutcome.terminal);
+            const turn = turnOutcome.value;
+            if (!turn?.id) throw new SidecarError("CODEX_INVALID_RESPONSE", "turn/start did not return turn.id");
+            await job.eventChain;
+            if (job.finalizationError) throw job.finalizationError;
+            if (job.turnId && job.turnId !== turn.id) {
+                this._recordProtocolEvent("protocol/turn-id-conflict", { jobId, threadId: job.threadId });
+                if (!job.terminal && !job.finalizing) await this._finishJob(job, "failed", 1, "Turn ID conflict", "TURN_ID_CONFLICT");
+                throw new SidecarError("TURN_ID_CONFLICT", "turn/start response conflicts with a trusted turn notification");
+            }
+            if (!job.turnId) this._bindTurn(job, turn.id);
+            await job.eventChain;
+            if (job.finalizationError) throw job.finalizationError;
+            if (job.terminal) {
+                return { accepted: true, jobId, threadId: job.threadId, turnId: job.turnId, terminalState: job.state };
+            }
+            return { accepted: true, jobId, threadId: job.threadId, turnId: job.turnId };
+        } catch (error) {
+            if (error?.code === "TURN_ID_CONFLICT") throw error;
+            if (job.finalizationError) throw job.finalizationError;
+            if (job.turnId || job.terminal || job.finalizing) {
+                await job.eventChain;
+                if (job.finalizationError) throw job.finalizationError;
+                return {
+                    accepted: true,
+                    jobId,
+                    threadId: job.threadId,
+                    turnId: job.turnId,
+                    submissionConfirmedBy: job.turnId ? "notification" : "terminal",
+                    ...(job.terminal ? { terminalState: job.state } : {})
+                };
+            }
+            const errorCode = safeWriteErrorCode(error);
+            if (job.terminalClaim === "timeout" || job.timeoutRequested) {
+                await this._finishJob(job, "timeout", null, "JOB_TIMEOUT", "JOB_TIMEOUT");
+            } else if (job.terminalClaim === "cancelled" || job.cancelRequested) {
+                await this._finishJob(job, "cancelled", null, null);
+            } else {
+                await this._finishJob(job, "failed", 1, errorCode, errorCode);
+            }
+            throw error instanceof SidecarError ? error : new SidecarError(errorCode, "Write Job could not start");
+        }
+    }
+
     async _submitAnalyzeJob(params) {
         if (this.draining || this.state?.status !== "ready") throw new SidecarError("SIDECAR_NOT_READY", "Sidecar is not ready");
         if (this.activeJobs.size >= this.maxConcurrency) throw new SidecarError("CONCURRENCY_LIMIT", "Sidecar concurrency limit reached");
@@ -378,7 +575,10 @@ class SidecarServer extends EventEmitter {
         try {
             const threadOutcome = await this._awaitStartOrTerminal(
                 job,
-                this.codex.startThread({ projectPath, model: params.model })
+                this.codex.startThread({
+                    projectPath,
+                    model: params.model,
+                })
             );
             if (threadOutcome.terminal) {
                 return this._terminalSubmissionResult(job, threadOutcome.terminal);
@@ -397,7 +597,11 @@ class SidecarServer extends EventEmitter {
             });
             const turnOutcome = await this._awaitStartOrTerminal(
                 job,
-                this.codex.startTurn({ threadId: job.threadId, text: params.text, effort: params.effort })
+                this.codex.startTurn({
+                    threadId: job.threadId,
+                    text: params.text,
+                    effort: params.effort,
+                })
             );
             if (turnOutcome.terminal) {
                 return this._terminalSubmissionResult(job, turnOutcome.terminal);
@@ -572,7 +776,10 @@ class SidecarServer extends EventEmitter {
 
             const threadOutcome = await this._awaitStartOrTerminal(
                 job,
-                this.codex.startThread({ projectPath: job.projectPath, model })
+                this.codex.startThread({
+                    projectPath: job.projectPath,
+                    model,
+                })
             );
             if (threadOutcome.terminal) return this._terminalSubmissionResult(job, threadOutcome.terminal);
             const thread = threadOutcome.value;
@@ -653,13 +860,13 @@ class SidecarServer extends EventEmitter {
             throw new SidecarError("JOB_NOT_ACTIVE", "Job is not active");
         }
         if (job.terminal) return { cancelled: false, alreadyTerminal: true, state: job.state };
-        if (job.kind === "patch" && (job.finalizing || job.terminalClaim === "validation")) {
+        if ((job.kind === "patch" || job.kind === "write") && (job.finalizing || job.terminalClaim === "validation")) {
             return { cancelled: false, alreadyFinalizing: true, state: "running" };
         }
-        if (job.kind === "patch" && job.terminalClaim && job.terminalClaim !== "cancelled") {
+        if ((job.kind === "patch" || job.kind === "write") && job.terminalClaim && job.terminalClaim !== "cancelled") {
             return { cancelled: false, alreadyFinalizing: true, state: job.terminalClaim };
         }
-        if (job.kind === "patch") job.terminalClaim = "cancelled";
+        if (job.kind === "patch" || job.kind === "write") job.terminalClaim = "cancelled";
         job.cancelRequested = true;
         let bindingTimer = null;
         const bindingTimeout = new Promise(resolve => {
@@ -675,7 +882,7 @@ class SidecarServer extends EventEmitter {
             if (job.cancelTimeoutTimer === bindingTimer) job.cancelTimeoutTimer = null;
         }
         if (job.terminal) return { cancelled: false, alreadyTerminal: true, state: job.state };
-        if (job.kind === "patch" && (job.finalizing || job.terminalClaim === "validation")) {
+        if ((job.kind === "patch" || job.kind === "write") && (job.finalizing || job.terminalClaim === "validation")) {
             return { cancelled: false, alreadyFinalizing: true, state: "running" };
         }
         if (!job.turnId || boundOrTerminal?.timeout) throw new SidecarError("CANCEL_TIMEOUT", "Timed out waiting for turn binding");
@@ -702,7 +909,7 @@ class SidecarServer extends EventEmitter {
         const params = request?.params || {};
         const threadId = params.threadId || params.thread?.id;
         const turnId = params.turnId || params.turn?.id;
-        let patchJobs = [...this.activeJobs.values()].filter(job => job.kind === "patch" && !job.terminal);
+        let patchJobs = [...this.activeJobs.values()].filter(job => (job.kind === "patch" || job.kind === "write") && !job.terminal);
         if (threadId || turnId) {
             patchJobs = patchJobs.filter(job => (!threadId || job.threadId === threadId) && (!turnId || !job.turnId || job.turnId === turnId));
         }
@@ -715,7 +922,8 @@ class SidecarServer extends EventEmitter {
             this._enqueueJobEvent(job, async () => {
                 if (job.terminal || job.finalizing) return;
                 if (!job.terminalClaim) job.terminalClaim = "failed";
-                await this._finishJob(job, "failed", 1, "AICW_PATCH_APPROVAL_REQUESTED", "AICW_PATCH_APPROVAL_REQUESTED");
+                const code = job.kind === "write" ? "AICW_WRITE_APPROVAL_REQUESTED" : "AICW_PATCH_APPROVAL_REQUESTED";
+                await this._finishJob(job, "failed", 1, code, code);
             });
         }
     }
@@ -765,6 +973,7 @@ class SidecarServer extends EventEmitter {
             }
             if (method === "turn/completed") {
                 this._recordJobEvent(job, method, params);
+                if (job.terminal) return;
                 const status = params.turn?.status;
                 if (job.kind === "patch") {
                     if (job.terminalClaim === "timeout" || job.timeoutRequested) {
@@ -782,6 +991,23 @@ class SidecarServer extends EventEmitter {
                         await this._finishJob(job, "failed", 1, "CODEX_TURN_INTERRUPTED");
                     } else {
                         await this._finishJob(job, "failed", 1, "CODEX_TURN_FAILED");
+                    }
+                } else if (job.kind === "write") {
+                    if (job.terminalClaim === "timeout" || job.timeoutRequested) {
+                        await this._finishJob(job, "timeout", null, "JOB_TIMEOUT", "JOB_TIMEOUT");
+                    } else if (job.terminalClaim === "cancelled" || job.cancelRequested) {
+                        await this._finishJob(job, "cancelled", null, null);
+                    } else if (status === "completed") {
+                        job.terminalClaim = "validation";
+                        job.finalizing = true;
+                        job.state = "running";
+                        if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
+                        job.timeoutTimer = null;
+                        await this._finalizeWrite(job);
+                    } else if (status === "interrupted") {
+                        await this._finishJob(job, "failed", 1, "CODEX_TURN_INTERRUPTED", "CODEX_TURN_INTERRUPTED");
+                    } else {
+                        await this._finishJob(job, "failed", 1, "CODEX_TURN_FAILED", "CODEX_TURN_FAILED");
                     }
                 } else if (job.timeoutRequested) await this._finishJob(job, "timeout", null, "JOB_TIMEOUT", "JOB_TIMEOUT");
                 else if (status === "completed") await this._finishJob(job, "completed", 0, null);
@@ -822,15 +1048,23 @@ class SidecarServer extends EventEmitter {
         job.resolveTurnBound(job.turnId);
         const updateMeta = job.kind === "patch"
             ? updater => this._updatePatchMeta(job, updater)
-            : updater => this._updateMeta(job, updater);
+            : job.kind === "write"
+                ? updater => this._updateWriteMeta(job, updater)
+                : updater => this._updateMeta(job, updater);
         job.eventChain = job.eventChain.then(() => updateMeta(meta => {
             meta.turnId = job.turnId;
             meta.submissionState = "accepted";
             if (!job.terminal) {
                 meta.state = "running";
-                if (job.kind === "patch") meta.jobPhase = "running";
+                if (job.kind === "patch" || job.kind === "write") meta.jobPhase = "running";
             }
         }));
+        if (job.kind === "write") {
+            job.eventChain = job.eventChain.catch(error => {
+                const mapped = this._markWriteFinalizationIncomplete(job, error);
+                throw mapped;
+            });
+        }
         if (job.cancelRequested || job.timeoutRequested) {
             this._requestInterruptOnce(job).catch(() => {});
         }
@@ -839,7 +1073,7 @@ class SidecarServer extends EventEmitter {
 
     _handleTimeout(job) {
         if (!job || job.terminal || job.timeoutRequested) return;
-        if (job.kind === "patch") {
+        if (job.kind === "patch" || job.kind === "write") {
             if (job.finalizing || job.terminalClaim) return;
             job.terminalClaim = "timeout";
         }
@@ -895,6 +1129,90 @@ class SidecarServer extends EventEmitter {
         job.interruptRequested = true;
         job.interruptPromise = this.codex.interruptTurn({ threadId: job.threadId, turnId: job.turnId });
         return job.interruptPromise;
+    }
+
+    async _finalizeWrite(job) {
+        try {
+            const validationStartedAt = new Date().toISOString();
+            await this._updateWriteMeta(job, meta => {
+                meta.jobPhase = "validating";
+                meta.validationStartedAt = validationStartedAt;
+                meta.validationPassed = false;
+                meta.candidateAvailable = false;
+            });
+            const validation = await this._writeValidationRunner.run({
+                profile: this._writeValidationProfile,
+                worktreeRoot: job.handle.worktreePath
+            });
+            const validationSteps = safeValidationSteps(validation?.steps);
+            const validationCompletedAt = new Date().toISOString();
+            if (validation?.passed !== true) {
+                const validationError = new SidecarError("AICW_WRITE_VALIDATION_FAILED", "Write validation failed");
+                validationError.validationCompletedAt = validationCompletedAt;
+                validationError.validationSteps = validationSteps;
+                throw validationError;
+            }
+            await this._updateWriteMeta(job, meta => {
+                meta.jobPhase = "committing";
+                meta.validationCompletedAt = validationCompletedAt;
+                meta.validationPassed = true;
+                meta.validationSteps = validationSteps;
+                meta.candidateAvailable = false;
+            });
+            job.candidateResult = await job.session.commitCandidate();
+            await this._updateWriteMeta(job, meta => {
+                meta.state = "completed";
+                meta.jobPhase = "completed";
+                meta.exitCode = 0;
+                meta.completedAt = new Date().toISOString();
+                meta.validationCompletedAt = validationCompletedAt;
+                meta.validationPassed = true;
+                meta.validationSteps = validationSteps;
+                meta.candidateAvailable = true;
+                meta.resultCommit = job.candidateResult.resultCommit;
+                meta.resultTree = job.candidateResult.resultTree;
+                meta.changedFiles = job.candidateResult.changedFiles;
+                delete meta.errorCode;
+                delete meta.exitReason;
+            });
+            job.terminal = true;
+            job.finalizing = false;
+            job.state = "completed";
+            this._clearJobTimers(job);
+            this.activeJobs.delete(job.jobId);
+            job.resolveTerminal({ state: "completed", exitCode: 0 });
+        } catch (error) {
+            if (error?.code === "AICW_WRITE_FINALIZATION_UNCERTAIN" ||
+                UNCERTAIN_WRITE_CANDIDATE_CODES.has(error?.code) || job.candidateResult) {
+                this._markWriteFinalizationIncomplete(job, error);
+                return job.terminalPromise;
+            }
+            const code = safeWriteErrorCode(error);
+            try {
+                await this._updateWriteMeta(job, meta => {
+                    meta.state = "failed";
+                    meta.jobPhase = "failed";
+                    meta.exitCode = 1;
+                    meta.completedAt = new Date().toISOString();
+                    if (error?.validationCompletedAt) meta.validationCompletedAt = error.validationCompletedAt;
+                    if (error?.validationSteps) meta.validationSteps = error.validationSteps;
+                    meta.validationPassed = false;
+                    meta.candidateAvailable = false;
+                    meta.errorCode = code;
+                    meta.exitReason = code;
+                });
+            } catch (metaError) {
+                this._markWriteFinalizationIncomplete(job, metaError);
+                return job.terminalPromise;
+            }
+            job.terminal = true;
+            job.finalizing = false;
+            job.state = "failed";
+            this._clearJobTimers(job);
+            this.activeJobs.delete(job.jobId);
+            job.resolveTerminal({ state: "failed", exitCode: 1, reason: code });
+        }
+        return job.terminalPromise;
     }
 
     async _finalizePatch(job) {
@@ -1178,7 +1496,7 @@ class SidecarServer extends EventEmitter {
         this.state && (this.state.status = "degraded");
         try { if (this.state) writeJsonAtomic(this.paths.statePath, this.state); } catch {}
         for (const job of this.activeJobs.values()) {
-            if (job.kind === "patch" && job.finalizing) continue;
+            if ((job.kind === "patch" || job.kind === "write") && job.finalizing) continue;
             this._finishJob(job, "failed", 1, "CODEX_PROTOCOL_ERROR").catch(() => {});
         }
     }
@@ -1190,7 +1508,7 @@ class SidecarServer extends EventEmitter {
             try { writeJsonAtomic(this.paths.statePath, this.state); } catch {}
         }
         for (const job of [...this.activeJobs.values()]) {
-            if (job.kind === "patch" && job.finalizing) continue;
+            if ((job.kind === "patch" || job.kind === "write") && job.finalizing) continue;
             this._finishJob(job, "failed", 1, "CODEX_APP_SERVER_EXITED").catch(() => {});
         }
         this.emit("protocolEvent", { method: "codex/closed", details: { unexpected: true } });
@@ -1213,6 +1531,51 @@ class SidecarServer extends EventEmitter {
             this._handleProtocolError(error instanceof SidecarError ? error : new SidecarError("META_WRITE_FAILED", "Could not update job meta", { cause: error.code }));
             throw error instanceof SidecarError ? error : new SidecarError("META_WRITE_FAILED", "Could not update job meta");
         }
+    }
+
+    async _updateWriteMeta(job, updater) {
+        try {
+            await updateJobMetaLocked(this.jobRoot, job.jobId, job.paths.metaPath, meta => {
+                if (String(meta.jobId || "") !== job.jobId) throw new SidecarError("META_JOB_MISMATCH", "Job meta changed identity");
+                if (meta.executionBackend && meta.executionBackend !== "codex-app-server") {
+                    throw new SidecarError("META_BACKEND_MISMATCH", "Job meta backend changed identity");
+                }
+                if (meta.sidecarInstanceId && meta.sidecarInstanceId !== this.state?.instanceId) {
+                    throw new SidecarError("META_INSTANCE_MISMATCH", "Job meta Sidecar instance changed identity");
+                }
+                updater(meta);
+                return meta;
+            });
+        } catch (error) {
+            const mapped = error instanceof SidecarError && error.code === "AICW_WRITE_FINALIZATION_UNCERTAIN"
+                ? error
+                : new SidecarError("AICW_WRITE_FINALIZATION_UNCERTAIN", "Could not finalize write Job meta", { cause: error?.code });
+            if (this.state) {
+                this.state.status = "degraded";
+                try { writeJsonAtomic(this.paths.statePath, this.state); } catch {}
+            }
+            this.emit("protocolError", mapped);
+            throw mapped;
+        }
+    }
+
+    _markWriteFinalizationIncomplete(job, error) {
+        if (job.finalizationFailed && job.finalizationError) return job.finalizationError;
+        const mapped = error instanceof SidecarError && error.code === "AICW_WRITE_FINALIZATION_UNCERTAIN"
+            ? error
+            : new SidecarError("AICW_WRITE_FINALIZATION_UNCERTAIN", "Write Job finalization outcome is uncertain", { cause: error?.code });
+        job.finalizationFailed = true;
+        job.finalizationError = mapped;
+        job.state = "finalizationFailed";
+        job.terminal = true;
+        this._clearJobTimers(job);
+        if (this.state) {
+            this.state.status = "degraded";
+            try { writeJsonAtomic(this.paths.statePath, this.state); } catch {}
+        }
+        this.emit("protocolError", mapped);
+        job.resolveTerminal({ state: job.state, errorCode: mapped.code });
+        return mapped;
     }
 
     async _updatePatchMeta(job, updater, failureCode = "META_WRITE_FAILED") {
@@ -1243,7 +1606,7 @@ class SidecarServer extends EventEmitter {
 
     async _finishJob(job, state, exitCode, reason, errorCode) {
         if (!job || job.terminal) return job?.terminalPromise;
-        if (job.kind === "patch" && job.finalizing) return job.terminalPromise;
+        if ((job.kind === "patch" || job.kind === "write") && job.finalizing) return job.terminalPromise;
         job.terminal = true;
         job.state = state;
         this._clearJobTimers(job);
@@ -1257,7 +1620,9 @@ class SidecarServer extends EventEmitter {
         try {
             const updateMeta = job.kind === "patch"
                 ? updater => this._updatePatchMeta(job, updater, "AICW_PATCH_META_FINALIZE_FAILED")
-                : updater => this._updateMeta(job, updater);
+                : job.kind === "write"
+                    ? updater => this._updateWriteMeta(job, updater)
+                    : updater => this._updateMeta(job, updater);
             await updateMeta(meta => {
                 meta.state = state;
                 if (job.kind === "patch") {
@@ -1265,6 +1630,9 @@ class SidecarServer extends EventEmitter {
                     meta.patchValidated = false;
                     meta.applyCheckPassed = false;
                     meta.baselineStable = false;
+                } else if (job.kind === "write") {
+                    meta.jobPhase = state;
+                    meta.candidateAvailable = false;
                 }
                 meta.exitCode = exitCode;
                 meta.completedAt = new Date().toISOString();
@@ -1279,6 +1647,10 @@ class SidecarServer extends EventEmitter {
                 }
             });
         } catch (error) {
+            if (job.kind === "write") {
+                const finalizeError = this._markWriteFinalizationIncomplete(job, error);
+                throw finalizeError;
+            }
             const expectedCode = job.kind === "patch" ? "AICW_PATCH_META_FINALIZE_FAILED" : "META_FINALIZE_FAILED";
             const finalizeError = error instanceof SidecarError && error.code === expectedCode
                 ? error
