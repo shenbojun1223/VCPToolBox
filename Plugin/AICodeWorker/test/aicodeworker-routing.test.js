@@ -1344,12 +1344,13 @@ test("buildResult and Monitor payload preserve old fields and expose safe backen
     }
 });
 
-function appServerPrepared(worker, environment, task = "fixture task") {
+function appServerPrepared(worker, environment, task = "fixture task", extra = {}) {
     const normalized = worker.normalizeRunRequest({
         worker: "codex",
         mode: "analyze",
         projectPath: environment.projectRoot,
-        task
+        task,
+        ...extra
     });
     assert.equal(normalized.status, "success");
     return normalized.prepared;
@@ -1367,13 +1368,22 @@ function appServerPatchPrepared(worker, environment, task = "fixture patch task"
     return normalized.prepared;
 }
 
-function fakeAppServerClient(submitState = {}) {
+function fakeAppServerClient(submitState = {}, behavior = {}) {
     return {
         inspectNoStart: async () => ({ status: "absent" }),
-        ensure: async () => ({ status: "ready" }),
+        ensure: async () => {
+            submitState.ensureCalls = (submitState.ensureCalls || 0) + 1;
+            if (behavior.ensureError) throw behavior.ensureError;
+            return {
+                status: "ready",
+                serviceTierOverrideProtocolVersion: 1,
+                ...(behavior.ensureState || {})
+            };
+        },
         submitAnalyzeJob: async params => {
             submitState.calls = (submitState.calls || 0) + 1;
             submitState.params = params;
+            if (behavior.submitError) throw behavior.submitError;
             return { accepted: true };
         }
     };
@@ -1384,7 +1394,12 @@ function fakePatchClient(submitState = {}, behavior = {}) {
         ensure: async () => {
             submitState.ensureCalls = (submitState.ensureCalls || 0) + 1;
             if (behavior.ensureError) throw behavior.ensureError;
-            return { status: "ready", ...patchProtocolProof() };
+            return {
+                status: "ready",
+                serviceTierOverrideProtocolVersion: 1,
+                ...patchProtocolProof(),
+                ...(behavior.ensureState || {})
+            };
         },
         submitPatchJob: async params => {
             submitState.calls = (submitState.calls || 0) + 1;
@@ -1982,9 +1997,12 @@ test("compact capabilities is a small routing-safe whitelist and full remains co
         );
         const codex = compact.workers.find(worker => worker.name === "codex");
         assert.deepEqual(Object.keys(codex).sort(), [
-            "available", "configuredReasoningEffort", "model", "modelSource", "name",
-            "reasoningEffortEffective", "reasoningEfforts", "supportsAppServerPatch", "version"
+            "available", "configuredReasoningEffort", "fastModeOmittedBehavior", "model", "modelSource", "name",
+            "reasoningEffortEffective", "reasoningEfforts", "supportsAppServerPatch",
+            "supportsPerTaskFastMode", "version"
         ].sort());
+        assert.equal(codex.supportsPerTaskFastMode, true);
+        assert.equal(codex.fastModeOmittedBehavior, "inherit_codex_config");
         for (const worker of compact.workers.filter(item => item.name !== "codex")) {
             assert.deepEqual(Object.keys(worker).sort(), ["available", "name"]);
         }
@@ -2859,4 +2877,364 @@ test("ambiguous app-server artifacts fail closed across full, compact, and trace
         assert.equal(compact.patchAvailable, false);
         assert.equal(fs.existsSync(paths.patchPath), true);
     } finally { await environment.cleanup(); }
+});
+
+test("cmdQuery projects running fastMode overrides consistently in full and compact modes", async () => {
+    const environment = await createEnvironment({ flag: "false" });
+    try {
+        const protocol = require(path.join(environment.pluginDir, "appserver", "protocol.js"));
+        const scenarios = [
+            { label: "fast", meta: { fastMode: true, serviceTierOverride: "fast" }, expected: [true, "fast"] },
+            { label: "default", meta: { fastMode: false, serviceTierOverride: "default" }, expected: [false, "default"] },
+            { label: "legacy", meta: {}, expected: [null, null] }
+        ];
+
+        for (const scenario of scenarios) {
+            const jobId = `job_running_fast_mode_${scenario.label}`;
+            protocol.writeJsonAtomic(metaPath(environment, jobId), {
+                jobId,
+                state: "running",
+                worker: "codex",
+                mode: "analyze",
+                projectPath: environment.projectRoot,
+                executionBackend: "legacy-exec",
+                pid: process.pid,
+                startedAt: "2000-01-01T00:00:00.000Z",
+                ...scenario.meta
+            });
+
+            const full = resultOf(await environment.invoke({
+                command: "query",
+                jobId,
+                wait: false,
+                responseMode: "full"
+            }));
+            const compact = resultOf(await environment.invoke({
+                command: "query",
+                jobId,
+                wait: false,
+                responseMode: "compact"
+            }));
+
+            assert.equal(full.state, "running");
+            assert.equal(compact.state, "running");
+            assert.deepEqual(
+                [full.fastMode, full.serviceTierOverride],
+                scenario.expected
+            );
+            assert.deepEqual(
+                [compact.fastMode, compact.serviceTierOverride],
+                scenario.expected
+            );
+            assert.deepEqual(
+                [full.fastMode, full.serviceTierOverride],
+                [compact.fastMode, compact.serviceTierOverride]
+            );
+        }
+    } finally {
+        await environment.cleanup();
+    }
+});
+
+test("fastMode validates as a Codex-only tri-state and reaches app-server submission", async () => {
+    const environment = await createEnvironment({ flag: "true" });
+    try {
+        const worker = require(environment.workerPath);
+
+        const rejectedWorker = worker.normalizeRunRequest({
+            worker: "opencode",
+            mode: "analyze",
+            projectPath: environment.projectRoot,
+            task: "reject non-Codex fastMode",
+            fastMode: true
+        });
+        assert.equal(rejectedWorker.status, "error");
+        assert.match(rejectedWorker.error, /worker=codex/);
+
+        const rejectedValue = worker.normalizeRunRequest({
+            worker: "codex",
+            mode: "analyze",
+            projectPath: environment.projectRoot,
+            task: "reject invalid fastMode",
+            fastMode: "fast"
+        });
+        assert.equal(rejectedValue.status, "error");
+        assert.match(rejectedValue.error, /true \/ false/);
+
+        const fast = worker.normalizeRunRequest({
+            worker: "codex",
+            mode: "analyze",
+            projectPath: environment.projectRoot,
+            task: "submit fast tier",
+            fastMode: true
+        });
+        assert.equal(fast.status, "success");
+        assert.equal(fast.prepared.normalizedFastMode, true);
+        assert.equal(fast.prepared.serviceTierOverride, "fast");
+
+        const standard = worker.normalizeRunRequest({
+            worker: "codex",
+            mode: "analyze",
+            projectPath: environment.projectRoot,
+            task: "submit standard tier",
+            fastMode: false
+        });
+        assert.equal(standard.status, "success");
+        assert.equal(standard.prepared.normalizedFastMode, false);
+        assert.equal(standard.prepared.serviceTierOverride, "default");
+
+        const inherited = worker.normalizeRunRequest({
+            worker: "codex",
+            mode: "analyze",
+            projectPath: environment.projectRoot,
+            task: "inherit tier"
+        });
+        assert.equal(inherited.status, "success");
+        assert.equal(inherited.prepared.normalizedFastMode, null);
+        assert.equal(inherited.prepared.serviceTierOverride, null);
+
+        const submitState = {};
+        const response = await worker.cmdRunAppServerAnalyze(
+            fast.prepared,
+            { client: fakeAppServerClient(submitState) }
+        );
+        assert.equal(response.status, "success");
+        assert.equal(submitState.params.serviceTier, "fast");
+        const meta = readJson(metaPath(environment, response.jobId));
+        assert.equal(meta.fastMode, true);
+        assert.equal(meta.serviceTierOverride, "fast");
+    } finally {
+        await environment.cleanup();
+    }
+});
+
+test("legacy Codex exec encodes fast, standard, and inherited tiers per Job", async () => {
+    const environment = await createEnvironment({ flag: "false" });
+    try {
+        const cases = [
+            {
+                label: "fast",
+                fastMode: true,
+                tierArg: 'service_tier="fast"',
+                featureArg: "features.fast_mode=true"
+            },
+            {
+                label: "standard",
+                fastMode: false,
+                tierArg: 'service_tier="default"',
+                featureArg: null
+            },
+            {
+                label: "inherit",
+                fastMode: undefined,
+                tierArg: null,
+                featureArg: null
+            }
+        ];
+
+        for (const fixture of cases) {
+            const request = {
+                command: "run",
+                worker: "codex",
+                mode: "analyze",
+                projectPath: environment.projectRoot,
+                task: `[[FINAL=${fixture.label}]]`
+            };
+            if (fixture.fastMode !== undefined) request.fastMode = fixture.fastMode;
+
+            const response = await environment.invoke(request);
+            assert.equal(response.status, "success", JSON.stringify(response));
+            const jobId = resultOf(response).jobId;
+            const meta = await waitForMeta(environment, jobId, true);
+            const args = readJson(path.join(environment.jobRoot, "meta", `${jobId}.args.json`));
+            assert.ok(args);
+            assert.equal(meta.fastMode, fixture.fastMode ?? null);
+            assert.equal(meta.serviceTierOverride, fixture.tierArg
+                ? (fixture.fastMode ? "fast" : "default")
+                : null);
+            assert.equal(
+                fixture.tierArg ? args.codexArgs.includes(fixture.tierArg) : false,
+                Boolean(fixture.tierArg)
+            );
+            assert.equal(
+                args.codexArgs.includes("features.fast_mode=true"),
+                Boolean(fixture.featureArg)
+            );
+            if (!fixture.tierArg) {
+                assert.equal(
+                    args.codexArgs.some(argument => String(argument).startsWith("service_tier=")),
+                    false
+                );
+            }
+        }
+    } finally {
+        await environment.cleanup();
+    }
+});
+
+test("app-server analyze and patch reject explicit fastMode on old Sidecars before Job creation", async () => {
+    const environment = await createEnvironment({ flag: "true", patchFlag: "true" });
+    try {
+        const worker = require(environment.workerPath);
+        for (const fastMode of [true, false]) {
+            const analyzeState = {};
+            const analyze = await worker.cmdRunAppServerAnalyze(
+                appServerPrepared(worker, environment, `old analyze ${fastMode}`, { fastMode }),
+                {
+                    client: fakeAppServerClient(analyzeState, {
+                        ensureState: { serviceTierOverrideProtocolVersion: null }
+                    })
+                }
+            );
+            assert.equal(analyze.status, "error");
+            assert.equal(analyze.errorCode, "AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED");
+            assert.equal(analyze.jobId, undefined);
+            assert.equal(analyzeState.calls || 0, 0);
+
+            const patchState = {};
+            const patch = await worker.cmdRunAppServerPatch(
+                appServerPatchPrepared(worker, environment, `old patch ${fastMode}`, { fastMode }),
+                {
+                    client: fakePatchClient(patchState, {
+                        ensureState: {
+                            serviceTierOverrideProtocolVersion: null,
+                            patchProtocolSupported: "unknown"
+                        }
+                    })
+                }
+            );
+            assert.equal(patch.status, "error");
+            assert.equal(patch.errorCode, "AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED");
+            assert.equal(patch.jobId, undefined);
+            assert.equal(patchState.calls || 0, 0);
+        }
+        assert.deepEqual(jobMetaFiles(environment), []);
+        assert.equal(fs.existsSync(path.join(environment.jobRoot, "meta")), false);
+    } finally {
+        await environment.cleanup();
+    }
+});
+
+test("app-server analyze and patch keep omitted fastMode compatible with old Sidecars", async () => {
+    const environment = await createEnvironment({ flag: "true", patchFlag: "true" });
+    try {
+        const worker = require(environment.workerPath);
+        const analyzeState = {};
+        const analyze = await worker.cmdRunAppServerAnalyze(
+            appServerPrepared(worker, environment, "old analyze inherit"),
+            {
+                client: fakeAppServerClient(analyzeState, {
+                    ensureState: { serviceTierOverrideProtocolVersion: null }
+                })
+            }
+        );
+        assert.equal(analyze.status, "success");
+        assert.equal(analyzeState.calls, 1);
+        assert.equal(Object.prototype.hasOwnProperty.call(analyzeState.params, "serviceTier"), false);
+
+        const patchState = {};
+        const patch = await worker.cmdRunAppServerPatch(
+            appServerPatchPrepared(worker, environment, "old patch inherit"),
+            {
+                client: fakePatchClient(patchState, {
+                    ensureState: { serviceTierOverrideProtocolVersion: null }
+                })
+            }
+        );
+        assert.equal(patch.status, "success");
+        assert.equal(patchState.calls, 1);
+        assert.equal(Object.prototype.hasOwnProperty.call(patchState.params, "serviceTier"), false);
+        assert.equal(jobMetaFiles(environment).length, 2);
+    } finally {
+        await environment.cleanup();
+    }
+});
+
+test("app-server service-tier race fails existing analyze and patch meta without submit RPC or replay", async () => {
+    for (const mode of ["analyze", "patch"]) {
+        const environment = await createEnvironment({ flag: "true", patchFlag: "true" });
+        try {
+            const worker = require(environment.workerPath);
+            const protocol = require(path.join(environment.pluginDir, "appserver", "protocol.js"));
+            const calls = { entryEnsure: 0, clientSubmit: 0, submitRpc: 0 };
+            const client = {
+                inspectNoStart: async () => ({ status: "ready" }),
+                ensure: async () => {
+                    calls.entryEnsure++;
+                    return {
+                        status: "ready",
+                        serviceTierOverrideProtocolVersion: 1,
+                        ...patchProtocolProof()
+                    };
+                },
+                async submitAnalyzeJob() {
+                    calls.clientSubmit++;
+                    throw new protocol.SidecarError(
+                        "AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED",
+                        "injected old Sidecar during submit ensure"
+                    );
+                },
+                async submitPatchJob() {
+                    calls.clientSubmit++;
+                    throw new protocol.SidecarError(
+                        "AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED",
+                        "injected old Sidecar during submit ensure"
+                    );
+                }
+            };
+            const prepared = mode === "analyze"
+                ? appServerPrepared(worker, environment, "race analyze", { fastMode: true })
+                : appServerPatchPrepared(worker, environment, "race patch", { fastMode: true });
+            const response = mode === "analyze"
+                ? await worker.cmdRunAppServerAnalyze(prepared, { client })
+                : await worker.cmdRunAppServerPatch(prepared, { client });
+
+            assert.equal(response.status, "error");
+            assert.equal(response.errorCode, "AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED");
+            assert.equal(response.state, "failed");
+            assert.equal(calls.entryEnsure, 1);
+            assert.equal(calls.clientSubmit, 1);
+            assert.equal(calls.submitRpc, 0);
+            const files = jobMetaFiles(environment);
+            assert.equal(files.length, 1);
+            const meta = readJson(path.join(environment.jobRoot, "meta", files[0]));
+            assert.equal(meta.state, "failed");
+            assert.equal(meta.submissionState, "rejected");
+            assert.equal(meta.errorCode, "AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED");
+            assert.equal(meta.fallbackFrom, undefined);
+        } finally {
+            await environment.cleanup();
+        }
+    }
+});
+
+test("app-server supported Sidecars forward fastMode true false and omission for analyze and patch", async () => {
+    const environment = await createEnvironment({ flag: "true", patchFlag: "true" });
+    try {
+        const worker = require(environment.workerPath);
+        for (const fixture of [
+            { fastMode: true, expectedTier: "fast" },
+            { fastMode: false, expectedTier: "default" },
+            { fastMode: undefined, expectedTier: undefined }
+        ]) {
+            const extra = fixture.fastMode === undefined ? {} : { fastMode: fixture.fastMode };
+            const analyzeState = {};
+            const analyze = await worker.cmdRunAppServerAnalyze(
+                appServerPrepared(worker, environment, `supported analyze ${String(fixture.fastMode)}`, extra),
+                { client: fakeAppServerClient(analyzeState) }
+            );
+            assert.equal(analyze.status, "success");
+            assert.equal(analyzeState.params.serviceTier, fixture.expectedTier);
+
+            const patchState = {};
+            const patch = await worker.cmdRunAppServerPatch(
+                appServerPatchPrepared(worker, environment, `supported patch ${String(fixture.fastMode)}`, extra),
+                { client: fakePatchClient(patchState) }
+            );
+            assert.equal(patch.status, "success");
+            assert.equal(patchState.params.serviceTier, fixture.expectedTier);
+        }
+    } finally {
+        await environment.cleanup();
+    }
 });

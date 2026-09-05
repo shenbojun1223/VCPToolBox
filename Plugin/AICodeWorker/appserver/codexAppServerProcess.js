@@ -7,6 +7,16 @@ const { JsonLineRpcConnection } = require("./jsonLineRpcConnection");
 const { SidecarError, getProcessIdentity, terminateOwnedChild } = require("./protocol");
 
 const PATCH_CODEX_VERSION = "codex-cli 0.144.5";
+const SERVICE_TIER_OVERRIDES = new Set(["default", "fast"]);
+
+function normalizeServiceTierOverride(value) {
+    if (value === undefined || value === null || String(value).trim() === "") return null;
+    const normalized = String(value).trim().toLowerCase();
+    if (!SERVICE_TIER_OVERRIDES.has(normalized)) {
+        throw new SidecarError("CODEX_SERVICE_TIER_INVALID", "serviceTier must be default or fast");
+    }
+    return normalized;
+}
 
 class CodexAppServerProcess extends EventEmitter {
     constructor(options = {}) {
@@ -133,7 +143,7 @@ class CodexAppServerProcess extends EventEmitter {
         }
     }
 
-    async startThread({ projectPath, model, writeMode = false } = {}) {
+    async startThread({ projectPath, model, serviceTier, writeMode = false } = {}) {
         if (writeMode && (!projectPath || !path.isAbsolute(projectPath))) {
             throw new SidecarError("CODEX_WRITE_PROJECT_PATH_INVALID", "writeMode requires an absolute projectPath");
         }
@@ -145,6 +155,8 @@ class CodexAppServerProcess extends EventEmitter {
             approvalPolicy: "never"
         };
         if (model) params.model = model;
+        const normalizedServiceTier = normalizeServiceTierOverride(serviceTier);
+        if (normalizedServiceTier) params.serviceTier = normalizedServiceTier;
         const result = await this.connection.request("thread/start", params);
         const threadId = result?.thread?.id;
         if (!threadId) throw new SidecarError("CODEX_INVALID_RESPONSE", "thread/start did not return thread.id");
@@ -155,7 +167,7 @@ class CodexAppServerProcess extends EventEmitter {
         return this.version === PATCH_CODEX_VERSION;
     }
 
-    async startTurn({ threadId, text, effort, patchMode = false, writeMode = false, projectPath, model } = {}) {
+    async startTurn({ threadId, text, effort, serviceTier, patchMode = false, writeMode = false, projectPath, model } = {}) {
         if (patchMode && writeMode) {
             throw new SidecarError("CODEX_MODE_CONFLICT", "patchMode and writeMode cannot be enabled together");
         }
@@ -180,6 +192,8 @@ class CodexAppServerProcess extends EventEmitter {
             params.model = model;
         }
         if (effort) params.effort = effort;
+        const normalizedServiceTier = normalizeServiceTierOverride(serviceTier);
+        if (normalizedServiceTier) params.serviceTier = normalizedServiceTier;
         const result = await this.connection.request("turn/start", params);
         const turnId = result?.turn?.id;
         if (!turnId) throw new SidecarError("CODEX_INVALID_RESPONSE", "turn/start did not return turn.id");
@@ -216,4 +230,8 @@ class CodexAppServerProcess extends EventEmitter {
     }
 }
 
-module.exports = { CodexAppServerProcess, PATCH_CODEX_VERSION };
+module.exports = {
+    CodexAppServerProcess,
+    PATCH_CODEX_VERSION,
+    normalizeServiceTierOverride
+};

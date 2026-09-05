@@ -71,6 +71,15 @@ function safeValidationSteps(steps) {
     }));
 }
 
+function validateServiceTierOverride(value) {
+    if (value === undefined || value === null || String(value).trim() === "") return null;
+    const normalized = String(value).trim().toLowerCase();
+    if (normalized !== "default" && normalized !== "fast") {
+        throw new SidecarError("CODEX_SERVICE_TIER_INVALID", "serviceTier must be default or fast");
+    }
+    return normalized;
+}
+
 function withSafeIdentityCwd(callback) {
     if (process.platform !== "win32") return callback();
     let originalCwd;
@@ -337,6 +346,7 @@ class SidecarServer extends EventEmitter {
                 errorCode: job.finalizationError?.code || null
             })),
             maxConcurrency: this.maxConcurrency,
+            serviceTierOverrideProtocolVersion: 1,
             ...getPatchProtocolProof()
         };
     }
@@ -376,6 +386,7 @@ class SidecarServer extends EventEmitter {
         if (this.activeJobs.size >= this.maxConcurrency) throw new SidecarError("CONCURRENCY_LIMIT", "Sidecar concurrency limit reached");
         const jobId = assertJobId(params.jobId);
         const projectPath = assertAbsolutePath(params.projectPath, "projectPath");
+        const serviceTier = validateServiceTierOverride(params.serviceTier);
         const timeoutSec = params.timeoutSec === undefined ? 600 : Number(params.timeoutSec);
         if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutSec > 86400) {
             throw new SidecarError("INVALID_TIMEOUT_SEC", "timeoutSec must be a finite number greater than 0 and at most 86400");
@@ -463,6 +474,7 @@ class SidecarServer extends EventEmitter {
             const threadOutcome = await this._awaitStartOrTerminal(job, this.codex.startThread({
                 projectPath: opened.handle.worktreePath,
                 model: params.model,
+                serviceTier,
                 writeMode: true
             }));
             if (threadOutcome.terminal) return this._terminalSubmissionResult(job, threadOutcome.terminal);
@@ -476,6 +488,7 @@ class SidecarServer extends EventEmitter {
                 threadId: job.threadId,
                 text: params.text,
                 effort: params.effort,
+                serviceTier,
                 writeMode: true,
                 projectPath: opened.handle.worktreePath,
                 model: params.model
@@ -529,6 +542,7 @@ class SidecarServer extends EventEmitter {
         if (this.activeJobs.size >= this.maxConcurrency) throw new SidecarError("CONCURRENCY_LIMIT", "Sidecar concurrency limit reached");
         const jobId = assertJobId(params.jobId);
         const projectPath = assertAbsolutePath(params.projectPath, "projectPath");
+        const serviceTier = validateServiceTierOverride(params.serviceTier);
         const timeoutSec = params.timeoutSec === undefined ? 600 : Number(params.timeoutSec);
         if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutSec > 86400) {
             throw new SidecarError("INVALID_TIMEOUT_SEC", "timeoutSec must be a finite number greater than 0 and at most 86400");
@@ -578,6 +592,7 @@ class SidecarServer extends EventEmitter {
                 this.codex.startThread({
                     projectPath,
                     model: params.model,
+                    serviceTier
                 })
             );
             if (threadOutcome.terminal) {
@@ -601,6 +616,7 @@ class SidecarServer extends EventEmitter {
                     threadId: job.threadId,
                     text: params.text,
                     effort: params.effort,
+                    serviceTier
                 })
             );
             if (turnOutcome.terminal) {
@@ -656,6 +672,7 @@ class SidecarServer extends EventEmitter {
         const projectPath = assertAbsolutePath(params.projectPath, "projectPath");
         const model = validatePatchModel(params.model);
         const effort = validatePatchEffort(params.effort);
+        const serviceTier = validateServiceTierOverride(params.serviceTier);
         const timeoutSec = params.timeoutSec === undefined ? 600 : Number(params.timeoutSec);
         if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutSec > 86400) {
             throw new SidecarError("INVALID_TIMEOUT_SEC", "timeoutSec must be a finite number greater than 0 and at most 86400");
@@ -779,6 +796,7 @@ class SidecarServer extends EventEmitter {
                 this.codex.startThread({
                     projectPath: job.projectPath,
                     model,
+                    serviceTier
                 })
             );
             if (threadOutcome.terminal) return this._terminalSubmissionResult(job, threadOutcome.terminal);
@@ -792,6 +810,7 @@ class SidecarServer extends EventEmitter {
                 threadId: job.threadId,
                 text: params.text,
                 effort,
+                serviceTier,
                 patchMode: true,
                 projectPath: job.projectPath,
                 model

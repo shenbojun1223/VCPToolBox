@@ -1,5 +1,5 @@
 "use strict";
-// AICodeWorker - VCP 插件主入口 v1.12.0
+// AICodeWorker - VCP 插件主入口 v1.13.0
 // 让 VCP Agent 可以安全调度本地 opencode、Codex 或 antigravity 执行代码任务。
 // 插件类型: synchronous / stdio。
 //
@@ -194,6 +194,8 @@ const APP_SERVER_PATCH_UNSUPPORTED_CODES = new Set([
     "SIDECAR_VERSION_MISMATCH",
     "AICW_PATCH_CODEX_VERSION_UNVERIFIED"
 ]);
+const SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION = 1;
+const SERVICE_TIER_SIDECAR_UNSUPPORTED = "AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED";
 const APP_SERVER_PATCH_META_CODES = new Set([
     "DUPLICATE_JOB_ID",
     "META_NOT_FOUND",
@@ -223,6 +225,14 @@ function mapAppServerPatchSubmissionError(error) {
             state: "failed",
             submissionState: "rejected",
             message: "Codex app-server analyze/patch 共享并发额度已满，任务未被接受。"
+        };
+    }
+    if (code === SERVICE_TIER_SIDECAR_UNSUPPORTED) {
+        return {
+            errorCode: SERVICE_TIER_SIDECAR_UNSUPPORTED,
+            state: "failed",
+            submissionState: "rejected",
+            message: "当前 Sidecar 不支持显式逐任务档位覆盖；任务未提交，请受控更新 Sidecar 实例。"
         };
     }
     if (APP_SERVER_PATCH_UNSUPPORTED_CODES.has(code)) {
@@ -1064,6 +1074,59 @@ function normalizeResponseMode(value, fallback = null) {
     return RESPONSE_MODES.has(normalized) ? normalized : null;
 }
 
+function normalizeFastMode(value) {
+    const omitted = value === undefined ||
+        value === null ||
+        (typeof value === "string" && value.trim() === "");
+    if (omitted) {
+        return {
+            status: "success",
+            provided: false,
+            value: null,
+            serviceTier: null
+        };
+    }
+
+    if (typeof value === "boolean") {
+        return {
+            status: "success",
+            provided: true,
+            value,
+            serviceTier: value ? "fast" : "default"
+        };
+    }
+
+    if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (normalized === "true" || normalized === "false") {
+            const enabled = normalized === "true";
+            return {
+                status: "success",
+                provided: true,
+                value: enabled,
+                serviceTier: enabled ? "fast" : "default"
+            };
+        }
+    }
+
+    return {
+        status: "error",
+        error: "fastMode 仅接受 true / false；不传或留空时继承 Codex 配置。"
+    };
+}
+
+function appendCodexFastModeArgs(args, normalizedFastMode, serviceTierOverride) {
+    if (!Array.isArray(args)) {
+        throw new TypeError("Codex args must be an array");
+    }
+    if (!serviceTierOverride) return args;
+    args.push("-c", `service_tier="${serviceTierOverride}"`);
+    if (normalizedFastMode === true) {
+        args.push("-c", "features.fast_mode=true");
+    }
+    return args;
+}
+
 function clipTraceText(value, maxChars = CFG.traceEventTextChars) {
     const text = redact(String(value ?? "")).replace(/\r\n/g, "\n").trim();
     if (!text) return "";
@@ -1588,6 +1651,10 @@ function buildResult(jobId, meta, traceModeOverride = null) {
             meta.modelDefaultReasoningEffort || null,
         configuredReasoningEffort:
             meta.configuredReasoningEffort || null,
+        fastMode:
+            typeof meta.fastMode === "boolean" ? meta.fastMode : null,
+        serviceTierOverride:
+            meta.serviceTierOverride || null,
         fileReadList, // v1.5 新增：opencode 读了哪些文件
         summary,      // 优先锚点提取，比 v1.4 更准确
         output,
@@ -1966,6 +2033,9 @@ function buildCompactQueryResult(jobId, meta, options = {}) {
         codexModel: meta?.codexModel || null,
         reasoningEffortEffective:
             meta?.reasoningEffortEffective || meta?.reasoningEffort || null,
+        fastMode:
+            typeof meta?.fastMode === "boolean" ? meta.fastMode : null,
+        serviceTierOverride: meta?.serviceTierOverride || null,
         warnings: artifactClass === "legacy" ? compactWarnings(meta?.warnings) : [],
         summary: String(summary || "").slice(0, 240),
         outputFile: p.output,
@@ -1996,6 +2066,8 @@ function compactCapabilitiesResult(full) {
                     : [],
                 configuredReasoningEffort: worker.configuredReasoningEffort || null,
                 reasoningEffortEffective: worker.reasoningEffortDefault || null,
+                supportsPerTaskFastMode: worker.supportsPerTaskFastMode === true,
+                fastModeOmittedBehavior: worker.fastModeOmittedBehavior || "inherit_codex_config",
                 supportsAppServerPatch: worker.supportsAppServerPatch === true
             }
             : { name: worker?.name || "unknown", available: Boolean(worker?.available) }),
@@ -2100,6 +2172,8 @@ async function cmdCapabilities(input = {}) {
                 supportsSession: false,
                 supportsAttachments: true,
                 supportsPerTaskModel: true,
+                supportsPerTaskFastMode: true,
+                fastModeOmittedBehavior: "inherit_codex_config",
                 supportsLegacyExec: true,
                 supportsAppServerAnalyze: CFG.enableCodexAppServerAnalyze,
                 supportsAppServerPatch: CFG.enableCodexAppServerPatch && patchProtocolSupport === true,
@@ -2201,7 +2275,8 @@ function normalizeRunRequest(input = {}) {
         summaryHint,
         model,
         traceMode,
-        reasoningEffort
+        reasoningEffort,
+        fastMode
     } = prepared;
     if (!task) {
         return { status: "error", error: "task 是必填参数。若要快速上手可使用 preset 参数，例如：preset=index, targetPath=/path/to/file.js" };
@@ -2233,6 +2308,16 @@ function normalizeRunRequest(input = {}) {
     if (!Array.isArray(normalizedAttachments)) {
         return { status: "error", error: "attachments 必须是数组。" };
     }
+
+    const fastModeResult = normalizeFastMode(fastMode);
+    if (fastModeResult.status === "error") return fastModeResult;
+    if (fastModeResult.provided && normWorker !== "codex") {
+        return {
+            status: "error",
+            error: "fastMode 仅支持 worker=codex；其他 Worker 请移除此参数。"
+        };
+    }
+
     const reasoningEffortProvided = reasoningEffort !== undefined &&
         reasoningEffort !== null && String(reasoningEffort).trim() !== "";
     const normalizedReasoningEffort = reasoningEffortProvided
@@ -2281,6 +2366,8 @@ function normalizeRunRequest(input = {}) {
             model,
             normalizedTraceMode,
             normalizedReasoningEffort,
+            normalizedFastMode: fastModeResult.value,
+            serviceTierOverride: fastModeResult.serviceTier,
             codexCapabilities,
             reasoningMetadata: buildReasoningMetadata(
                 normWorker,
@@ -2314,6 +2401,9 @@ function appServerSubmissionResult(jobId, meta) {
         reasoningEffortSupported: meta?.reasoningEffortSupported || [],
         modelDefaultReasoningEffort: meta?.modelDefaultReasoningEffort || null,
         configuredReasoningEffort: meta?.configuredReasoningEffort || null,
+        fastMode:
+            typeof meta?.fastMode === "boolean" ? meta.fastMode : null,
+        serviceTierOverride: meta?.serviceTierOverride || null,
         warnings: artifactClass === "legacy" ? (meta?.warnings || []) : [],
         outputFile: p.output,
         logFile: p.log,
@@ -2369,6 +2459,8 @@ function buildAppServerMeta(jobId, p, prepared, projectPath, timeoutS) {
         reasoningEffortSupported: prepared.reasoningMetadata.reasoningEffortSupported,
         modelDefaultReasoningEffort: prepared.reasoningMetadata.modelDefaultReasoningEffort,
         configuredReasoningEffort: prepared.reasoningMetadata.configuredReasoningEffort,
+        fastMode: prepared.normalizedFastMode,
+        serviceTierOverride: prepared.serviceTierOverride,
         output: p.output,
         log: p.log,
         patch: p.patch,
@@ -2410,6 +2502,8 @@ function buildAppServerPatchMeta(jobId, p, prepared, projectPath, timeoutS) {
         reasoningEffortSupported: prepared.reasoningMetadata.reasoningEffortSupported,
         modelDefaultReasoningEffort: prepared.reasoningMetadata.modelDefaultReasoningEffort,
         configuredReasoningEffort: prepared.reasoningMetadata.configuredReasoningEffort,
+        fastMode: prepared.normalizedFastMode,
+        serviceTierOverride: prepared.serviceTierOverride,
         output: p.output,
         log: p.log,
         patch: p.patch,
@@ -2537,6 +2631,14 @@ async function cmdRunAppServerAnalyze(prepared, dependencies = {}) {
         });
     }
 
+    if (prepared.serviceTierOverride &&
+        sidecarState?.serviceTierOverrideProtocolVersion !== SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION) {
+        return appServerErrorResult(null, {
+            error: "当前 Sidecar 不支持显式逐任务档位覆盖，未创建 Job；请受控更新 Sidecar 实例后重试。",
+            errorCode: SERVICE_TIER_SIDECAR_UNSUPPORTED
+        });
+    }
+
     ensureJobDirs();
     const timeoutS = Number(prepared.timeoutSec) || CFG.defaultTimeout;
     const projectPath = path.resolve(prepared.projectPath);
@@ -2608,7 +2710,10 @@ async function cmdRunAppServerAnalyze(prepared, dependencies = {}) {
             codexOutputPath: p.codexOutput,
             timeoutSec: timeoutS,
             model: prepared.codexCapabilities?.model || undefined,
-            effort: prepared.normalizedReasoningEffort || undefined
+            effort: prepared.normalizedReasoningEffort || undefined,
+            ...(prepared.serviceTierOverride
+                ? { serviceTier: prepared.serviceTierOverride }
+                : {})
         });
     } catch (error) {
         let current = readMeta(jobId) || meta;
@@ -2631,7 +2736,9 @@ async function cmdRunAppServerAnalyze(prepared, dependencies = {}) {
 
         const mappedCode = error?.code === "CONCURRENCY_LIMIT"
             ? "AICW_APP_SERVER_CONCURRENCY_LIMIT"
-            : "AICW_APP_SERVER_SUBMISSION_REJECTED";
+            : error?.code === SERVICE_TIER_SIDECAR_UNSUPPORTED
+                ? SERVICE_TIER_SIDECAR_UNSUPPORTED
+                : "AICW_APP_SERVER_SUBMISSION_REJECTED";
         current = await updateAppServerMeta(jobId, p.meta, current, value => {
             if (isAppServerSubmissionConfirmed(value)) return undefined;
             value.state = "failed";
@@ -2642,7 +2749,9 @@ async function cmdRunAppServerAnalyze(prepared, dependencies = {}) {
             return value;
         });
         return appServerErrorResult(error, {
-            error: "Codex app-server 提交被拒绝。",
+            error: mappedCode === SERVICE_TIER_SIDECAR_UNSUPPORTED
+                ? "提交前检测到 Sidecar 实例不支持显式逐任务档位覆盖；已有 Job 已确定失败，请受控更新 Sidecar 实例。"
+                : "Codex app-server 提交被拒绝。",
             errorCode: mappedCode,
             jobId,
             state: current.state || "failed"
@@ -2770,20 +2879,29 @@ async function cmdRunAppServerPatch(prepared, dependencies = {}) {
     }
 
     const client = dependencies.client || createSidecarClient();
+    let sidecarState;
     try {
-        const sidecarState = await client.ensure();
-        if (!isPatchProtocolProof(sidecarState)) {
-            return appServerErrorResult(null, {
-                error: "Codex app-server patch 协议未得到完整 Sidecar status proof，已安全拒绝。",
-                errorCode: "AICW_APP_SERVER_PATCH_UNSUPPORTED"
-            });
-        }
+        sidecarState = await client.ensure();
     } catch (error) {
         return appServerErrorResult(error, {
             error: "Codex app-server patch 当前不可用，未创建任务且未回退到 legacy。",
             errorCode: APP_SERVER_PATCH_UNSUPPORTED_CODES.has(String(error?.code || ""))
                 ? "AICW_APP_SERVER_PATCH_UNSUPPORTED"
                 : "AICW_APP_SERVER_PATCH_UNAVAILABLE"
+        });
+    }
+
+    if (prepared.serviceTierOverride &&
+        sidecarState?.serviceTierOverrideProtocolVersion !== SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION) {
+        return appServerErrorResult(null, {
+            error: "当前 Sidecar 不支持显式逐任务档位覆盖，未创建 Job；请受控更新 Sidecar 实例后重试。",
+            errorCode: SERVICE_TIER_SIDECAR_UNSUPPORTED
+        });
+    }
+    if (!isPatchProtocolProof(sidecarState)) {
+        return appServerErrorResult(null, {
+            error: "Codex app-server patch 协议未得到完整 Sidecar status proof，已安全拒绝。",
+            errorCode: "AICW_APP_SERVER_PATCH_UNSUPPORTED"
         });
     }
 
@@ -2890,6 +3008,9 @@ async function cmdRunAppServerPatch(prepared, dependencies = {}) {
             timeoutSec: timeoutS,
             model: patchModel,
             effort: patchEffort,
+            ...(prepared.serviceTierOverride
+                ? { serviceTier: prepared.serviceTierOverride }
+                : {}),
             patchContractVersion: PATCH_CONTRACT_VERSION
         });
     } catch (error) {
@@ -2940,7 +3061,7 @@ async function cmdRunLegacy(input, fallbackReason = null) {
 
     const { worker = "opencode", projectPath, task, mode = "analyze",
             sessionId, attachments = [], timeoutSec, summaryHint, model,
-            traceMode, reasoningEffort } = input;
+            traceMode, reasoningEffort, fastMode } = input;
 
     if (!task)
         return { status: "error", error: "task 是必填参数。若要快速上手可使用 preset 参数，例如：preset=index, targetPath=/path/to/file.js" };
@@ -2958,6 +3079,17 @@ async function cmdRunLegacy(input, fallbackReason = null) {
     const normWorker = requestedWorker === "agy" ? "antigravity" : requestedWorker;
     if (!["opencode", "codex", "antigravity"].includes(normWorker))
         return { status: "error", error: `worker "${worker}" 不支持。可用: opencode, codex, antigravity` };
+
+    const fastModeResult = normalizeFastMode(fastMode);
+    if (fastModeResult.status === "error") return fastModeResult;
+    if (fastModeResult.provided && normWorker !== "codex") {
+        return {
+            status: "error",
+            error: "fastMode 仅支持 worker=codex；其他 Worker 请移除此参数。"
+        };
+    }
+    const normalizedFastMode = fastModeResult.value;
+    const serviceTierOverride = fastModeResult.serviceTier;
 
     const reasoningEffortProvided =
         reasoningEffort !== undefined &&
@@ -3118,6 +3250,11 @@ async function cmdRunLegacy(input, fallbackReason = null) {
                 `model_reasoning_effort="${normalizedReasoningEffort}"`
             );
         }
+        appendCodexFastModeArgs(
+            codexArgs,
+            normalizedFastMode,
+            serviceTierOverride
+        );
         for (const f of attachments) {
             if (typeof f === "string" && f.trim()) codexArgs.push("--image", f.trim());
         }
@@ -3142,6 +3279,8 @@ async function cmdRunLegacy(input, fallbackReason = null) {
                 reasoningMetadata.modelDefaultReasoningEffort,
             configuredReasoningEffort:
                 reasoningMetadata.configuredReasoningEffort,
+            fastMode: normalizedFastMode,
+            serviceTierOverride,
             codexOutputFile: p.codexOutput,
             projectPath: path.resolve(projectPath),
             timeoutSec: timeoutS,
@@ -3198,6 +3337,8 @@ async function cmdRunLegacy(input, fallbackReason = null) {
             reasoningMetadata.modelDefaultReasoningEffort,
         configuredReasoningEffort:
             reasoningMetadata.configuredReasoningEffort,
+        fastMode: normalizedFastMode,
+        serviceTierOverride,
         startedAt:    new Date().toISOString(),
         state: "running",
         pid: null, exitCode: null, completedAt: null,
@@ -3247,6 +3388,13 @@ async function cmdRunLegacy(input, fallbackReason = null) {
               (reasoningMetadata.reasoningEffortSource ||
                "unknown") + ")"
             : "n/a"}`,
+        `Fast Mode: ${normWorker === "codex"
+            ? (normalizedFastMode === null
+                ? "inherit"
+                : normalizedFastMode
+                    ? "fast"
+                    : "standard")
+            : "n/a"}`,
         `Trace    : ${normalizedTraceMode}`,
         `Started  : ${meta.startedAt}`,
         "==================="
@@ -3278,6 +3426,8 @@ async function cmdRunLegacy(input, fallbackReason = null) {
             reasoningMetadata.modelDefaultReasoningEffort,
         configuredReasoningEffort:
             reasoningMetadata.configuredReasoningEffort,
+        fastMode: normalizedFastMode,
+        serviceTierOverride,
         warnings, outputFile: p.output, logFile: p.log, patchFile: p.patch,
         message: `任务已提交。使用 query 命令查询进度：command=query, jobId=${jobId}`
     };
@@ -3402,6 +3552,10 @@ async function cmdQuery(input) {
         }
         return {
             status: "success", jobId, state: "running",
+            fastMode:
+                typeof meta.fastMode === "boolean" ? meta.fastMode : null,
+            serviceTierOverride:
+                meta.serviceTierOverride || null,
             warnings: classifyAppServerArtifactMeta(meta) === "legacy" ? (meta.warnings || []) : [],
             startedAt: meta.startedAt, suggestedWaitSec: 0,
             hint: shouldWait
@@ -3486,6 +3640,10 @@ async function cmdTrace(input) {
             meta.modelDefaultReasoningEffort || null,
         configuredReasoningEffort:
             meta.configuredReasoningEffort || null,
+        fastMode:
+            typeof meta.fastMode === "boolean" ? meta.fastMode : null,
+        serviceTierOverride:
+            meta.serviceTierOverride || null,
         ...executionMetaPayload(meta),
         startedAt: meta.startedAt,
         completedAt: meta.completedAt,
@@ -3543,7 +3701,11 @@ async function cmdListJobs(input) {
                         ? "legacy_unknown"
                         : null),
                 reasoningEffortSupported:
-                    m.reasoningEffortSupported || []
+                    m.reasoningEffortSupported || [],
+                fastMode:
+                    typeof m.fastMode === "boolean" ? m.fastMode : null,
+                serviceTierOverride:
+                    m.serviceTierOverride || null
                 , ...executionMetaPayload(m)
             });
         } catch {}
@@ -3727,6 +3889,8 @@ module.exports = {
     generateJobId,
     normalizeRunRequest,
     normalizeResponseMode,
+    normalizeFastMode,
+    appendCodexFastModeArgs,
     isAppServerMeta,
     isAppServerPatchMeta,
     isCodexAppServerAnalyzeRoute,

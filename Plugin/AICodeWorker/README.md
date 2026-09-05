@@ -205,6 +205,35 @@ Monitor 不信任 meta 中自行写入的 `patchAvailable`；每次投影都会�
 > 替换或热升级 Sidecar；无法从实际 status 证明 patch 协议时，能力值只能是 unknown/false。
 
 
+## Codex 逐任务 Fast mode
+
+`fastMode` 是 Codex 专用的三态逐任务开关：
+
+| 调用值 | 行为 |
+|---|---|
+| `true` | 请求将本 Job 档位覆盖为 Fast（`serviceTier=fast`） |
+| `false` | 请求将本 Job 档位覆盖为默认档（`serviceTier=default`） |
+| 不传或留空 | 继承 Codex `config.toml` / Profile 配置 |
+
+Legacy `codex exec` 与 app-server analyze/patch 两条执行链均支持。Fast mode 与
+`reasoningEffort` 独立。显式覆盖是否可用、是否被后端采用取决于模型、计划、额度和
+服务容量；它可能增加额度消耗，但不保证加速。返回及 meta 中的 `fastMode` /
+`serviceTierOverride` 只记录请求的覆盖值，不表示后端实际采用的 tier。
+
+app-server 会以当前连接的 Sidecar `status` 实时握手。旧 Sidecar 不支持显式覆盖时，
+`true` / `false` 会在提交前被拒绝且不回退、不重放；省略参数仍按原行为兼容。
+`capabilities.supportsPerTaskFastMode` 表示插件总体支持该参数，不等同于当前长驻
+Sidecar 已通过逐任务档位覆盖协议握手。
+
+```text
+command: run_and_wait
+worker: codex
+mode: analyze
+fastMode: true
+projectPath: C:\VCP\VCPToolBox
+task: 请只读分析指定模块，不修改文件。
+```
+
 ## Codex 逐任务推理强度
 
 `reasoningEffort` 按本次实际 Codex 模型动态校验，不再由插件固定成三档。
@@ -303,7 +332,7 @@ state 含义：`running` 进行中 / `completed` 成功 / `failed` 失败 / `tim
 | 命令 | 说明 | 关键参数 |
 |------|------|---------|
 | `capabilities` | 查询 opencode / Codex / antigravity 可用状态 | 无 |
-| `run` | 提交任务，立即返回 jobId | `worker` `projectPath` `task` `mode` `timeoutSec` `traceMode` `reasoningEffort` |
+| `run` | 提交任务，立即返回 jobId | `worker` `projectPath` `task` `mode` `timeoutSec` `traceMode` `reasoningEffort` `fastMode` |
 | `query` | 查询任务结果；`wait=false` 可即时返回 | `jobId` `wait` `traceMode` |
 | `trace` | 即时读取已有执行轨迹 | `jobId` `traceMode` |
 | `listJobs` | 列出历史任务 | `limit`（默认10） |

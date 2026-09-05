@@ -26,6 +26,13 @@ const {
 } = require("./protocol");
 
 const OWNED_CHILD_TERMINATION_PROOFS = new WeakSet();
+const SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION = 1;
+
+function hasExplicitServiceTierOverride(params) {
+    if (!params || !Object.prototype.hasOwnProperty.call(params, "serviceTier")) return false;
+    const value = params.serviceTier;
+    return value !== undefined && value !== null && String(value).trim() !== "";
+}
 
 function getSafeIdentityCwd() {
     if (process.platform !== "win32") return null;
@@ -158,6 +165,7 @@ class SidecarClient {
 
     async submitAnalyzeJob(params) {
         const state = await this.ensure();
+        this._assertServiceTierOverrideCompatible(state, params);
         return this._callWithState(state, "submitAnalyzeJob", params);
     }
 
@@ -165,6 +173,7 @@ class SidecarClient {
         const jobId = assertJobId(params.jobId);
         const fixedPaths = jobPaths(this.jobRoot, jobId);
         const state = await this.ensure();
+        this._assertServiceTierOverrideCompatible(state, params);
         try {
             return await this._callWithState(state, "submitPatchJob", {
                 ...params,
@@ -583,6 +592,12 @@ class SidecarClient {
 
     async _assertCompatibleConcurrency(state) {
         const status = await this._callWithState(state, "status", {});
+        if (status?.instanceId !== state.instanceId) {
+            throw new SidecarError("SIDECAR_INSTANCE_MISMATCH", "Sidecar status instance does not match the connected state", {
+                expected: state.instanceId || null,
+                actual: status?.instanceId || null
+            });
+        }
         if (Number(status?.maxConcurrency) !== this.maxConcurrency) {
             throw new SidecarError("SIDECAR_CONCURRENCY_MISMATCH", "Existing Sidecar concurrency does not match the required limit", {
                 expected: this.maxConcurrency,
@@ -591,8 +606,21 @@ class SidecarClient {
         }
         return {
             ...state,
+            serviceTierOverrideProtocolVersion:
+                status?.serviceTierOverrideProtocolVersion === SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION
+                    ? SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION
+                    : null,
             ...projectPatchProtocolProof(status)
         };
+    }
+
+    _assertServiceTierOverrideCompatible(state, params) {
+        if (!hasExplicitServiceTierOverride(params)) return;
+        if (state?.serviceTierOverrideProtocolVersion === SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION) return;
+        throw new SidecarError(
+            "AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED",
+            "The active Sidecar does not support explicit per-Job service tier overrides"
+        );
     }
 
     async _waitForLock() {

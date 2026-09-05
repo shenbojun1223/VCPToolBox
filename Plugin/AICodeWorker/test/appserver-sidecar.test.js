@@ -348,7 +348,8 @@ async function createEnvironment(options = {}) {
                 metaPath: paths.metaPath,
                 outputPath: paths.outputPath,
                 codexOutputPath: paths.codexOutputPath,
-                ...(Object.prototype.hasOwnProperty.call(submitOptions, "timeoutSec") ? { timeoutSec: submitOptions.timeoutSec } : {})
+                ...(Object.prototype.hasOwnProperty.call(submitOptions, "timeoutSec") ? { timeoutSec: submitOptions.timeoutSec } : {}),
+                ...(Object.prototype.hasOwnProperty.call(submitOptions, "serviceTier") ? { serviceTier: submitOptions.serviceTier } : {})
             });
         },
         async waitJob(jobId) {
@@ -368,6 +369,7 @@ async function createEnvironment(options = {}) {
                 model: submitOptions.model || "gpt-5-codex",
                 effort: submitOptions.effort || "high",
                 ...(Object.prototype.hasOwnProperty.call(submitOptions, "timeoutSec") ? { timeoutSec: submitOptions.timeoutSec } : {}),
+                ...(Object.prototype.hasOwnProperty.call(submitOptions, "serviceTier") ? { serviceTier: submitOptions.serviceTier } : {}),
                 ...paths
             });
         },
@@ -1091,6 +1093,8 @@ test("SidecarClient inspection and status preserve the exact patch protocol proo
         assert.equal(inspection.status, "ready");
         assert.equal(status.status, "ready");
         assert.equal(status.maxConcurrency, 2);
+        assert.equal(state.serviceTierOverrideProtocolVersion, 1);
+        assert.equal(status.serviceTierOverrideProtocolVersion, 1);
         assert.equal(status.instanceId, state.instanceId);
         assert.equal(status.pid, state.pid);
         assert.ok(Array.isArray(status.activeJobs));
@@ -3204,4 +3208,125 @@ test("large delta volume does not duplicate delta payloads in the trace", async 
         assert.equal(trace.includes('"delta"'), false);
         assert.ok(trace.length < 600000);
     } finally { await environment.close(); }
+});
+test("Sidecar carries per-Job serviceTier through thread and turn RPC", async () => {
+    const environment = await createEnvironment();
+    try {
+        await environment.submit(
+            "job_fast_service_tier",
+            "[[FINAL=fast-tier]]",
+            environment.projectRoot,
+            { serviceTier: "fast" }
+        );
+        assert.equal((await environment.waitJob("job_fast_service_tier")).state, "completed");
+
+        await environment.submit(
+            "job_standard_service_tier",
+            "[[FINAL=standard-tier]]",
+            environment.projectRoot,
+            { serviceTier: "default" }
+        );
+        assert.equal((await environment.waitJob("job_standard_service_tier")).state, "completed");
+
+        await environment.submit(
+            "job_inherited_service_tier",
+            "[[FINAL=inherited-tier]]"
+        );
+        assert.equal((await environment.waitJob("job_inherited_service_tier")).state, "completed");
+
+        const records = environment.readFakeRecords();
+        const threads = records.filter(record => record.method === "thread/start");
+        const turns = records.filter(record => record.method === "turn/start");
+        assert.equal(threads.at(-3).params.serviceTier, "fast");
+        assert.equal(turns.at(-3).params.serviceTier, "fast");
+        assert.equal(threads.at(-2).params.serviceTier, "default");
+        assert.equal(turns.at(-2).params.serviceTier, "default");
+        assert.equal(Object.prototype.hasOwnProperty.call(threads.at(-1).params, "serviceTier"), false);
+        assert.equal(Object.prototype.hasOwnProperty.call(turns.at(-1).params, "serviceTier"), false);
+    } finally {
+        await environment.close();
+    }
+});
+
+test("SidecarClient projects only live service-tier protocol v1 proof", async () => {
+    const client = new SidecarClient({
+        pluginDir: __dirname,
+        jobRoot: path.join(__dirname, "jobs-proof-fixture"),
+        maxConcurrency: 2
+    });
+    const state = {
+        instanceId: "proof-instance",
+        controlToken: "proof-token",
+        endpoint: "proof-endpoint",
+        serviceTierOverrideProtocolVersion: 1
+    };
+    const cases = [
+        ["supported", 1, 1],
+        ["missing", undefined, null],
+        ["string", "1", null],
+        ["unknown", 2, null]
+    ];
+
+    for (const [label, liveVersion, expected] of cases) {
+        client._callWithState = async () => ({
+            instanceId: state.instanceId,
+            maxConcurrency: 2,
+            ...(liveVersion === undefined ? {} : { serviceTierOverrideProtocolVersion: liveVersion })
+        });
+        const projected = await client._assertCompatibleConcurrency({ ...state });
+        assert.equal(projected.serviceTierOverrideProtocolVersion, expected, label);
+    }
+});
+
+test("SidecarClient rejects a live status from a different instance", async () => {
+    const client = new SidecarClient({
+        pluginDir: __dirname,
+        jobRoot: path.join(__dirname, "jobs-instance-fixture"),
+        maxConcurrency: 2
+    });
+    const state = {
+        instanceId: "state-instance",
+        controlToken: "state-token",
+        endpoint: "state-endpoint"
+    };
+    client._callWithState = async () => ({
+        instanceId: "other-instance",
+        maxConcurrency: 2,
+        serviceTierOverrideProtocolVersion: 1
+    });
+
+    await assert.rejects(
+        client._assertCompatibleConcurrency(state),
+        error => error.code === "SIDECAR_INSTANCE_MISMATCH"
+    );
+});
+
+test("SidecarClient direct submits reject explicit service tiers before submit RPC on old instances", async () => {
+    const client = new SidecarClient({
+        pluginDir: __dirname,
+        jobRoot: path.join(__dirname, "jobs-submit-gate-fixture")
+    });
+    let submitRpcCalls = 0;
+    client.ensure = async () => ({
+        instanceId: "old-instance",
+        controlToken: "old-token",
+        endpoint: "old-endpoint",
+        serviceTierOverrideProtocolVersion: null
+    });
+    client._callWithState = async () => {
+        submitRpcCalls++;
+        return { accepted: true };
+    };
+
+    for (const serviceTier of ["fast", "default"]) {
+        await assert.rejects(
+            client.submitAnalyzeJob({ jobId: `job_direct_analyze_${serviceTier}`, serviceTier }),
+            error => error.code === "AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED"
+        );
+        await assert.rejects(
+            client.submitPatchJob({ jobId: `job_direct_patch_${serviceTier}`, serviceTier }),
+            error => error.code === "AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED"
+        );
+    }
+    assert.equal(submitRpcCalls, 0);
 });

@@ -129,6 +129,7 @@ function startTurn(request) {
             approvalPolicy: request.params?.approvalPolicy,
             model: request.params?.model,
             effort: request.params?.effort,
+            serviceTier: request.params?.serviceTier,
             inputTypes: Array.isArray(request.params?.input) ? request.params.input.map(item => item?.type) : []
         }
     });
@@ -219,7 +220,8 @@ function handle(request) {
                 ephemeral: request.params?.ephemeral,
                 sandbox: request.params?.sandbox,
                 approvalPolicy: request.params?.approvalPolicy,
-                model: request.params?.model
+                model: request.params?.model,
+                serviceTier: request.params?.serviceTier
             }
         });
         const id = `thread-${nextThread++}`;
