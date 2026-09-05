@@ -79,8 +79,9 @@ PROJECT_CONTEXT=
 FILE_SIZE_WARN_KB=200
 
 # ⚠️ legacy runner 并发上限（opencode、legacy Codex、antigravity共用），默认1。
-# app-server analyze/patch/write 共享固定总上限2；write 另有串行上限1。
-# 超限直接拒绝，不排队、不回退；write 从创建 Worktree 起占位，uncertain/finalizationFailed 继续占位。
+# app-server analyze/patch/write 共享固定总上限3；write 另有固定上限2；legacy 仍为1。
+# 超限直接拒绝，不排队、不回退；write 从创建 Worktree 前起占位，terminal 尚未删除、
+# submission unknown 与 finalizationFailed ownership 都继续占槽。
 MAX_CONCURRENT_JOBS=1
 
 # 三个 app-server flag 相互独立，只有严格的字符串 true 才启用；默认都关闭。
@@ -163,7 +164,7 @@ mode: analyze
 - flag 开启：只有 `worker=codex, mode=patch` 走 app-server；非 Codex Worker 不受影响。
 - app-server patch 第一版不接受 attachments 或 `sessionId`，不自动应用 patch，
   也不会隐式开放 app-server write。
-- analyze、patch 与 write 共用 Sidecar 的 `maxConcurrency=2` 和 activeJobs 池。
+- analyze、patch 与 write 共用 Sidecar 的固定 `maxConcurrency=3` 和 activeJobs 池。
 
 patch 路由还需要实际 Sidecar status 提供完整的正向 proof：
 `patchProtocolSupported=true`、`patchContractVersion=1`、`patchMaxBytes=524288`、
@@ -213,7 +214,8 @@ Monitor 不信任 meta 中自行写入的 `patchAvailable`；每次投影都会�
 ## Codex app-server Worktree Write Preview
 
 `ENABLE_CODEX_APP_SERVER_WRITE=false` 默认关闭。关闭时 `worker=codex, mode=write`
-保持既有 legacy 行为；开启后，只有实际 Sidecar status 同时证明 write protocol v1 且
+保持既有 legacy 行为；开启后，只有实际 Sidecar status 同时证明 write protocol v2、
+`writeMaxConcurrency=2` 且
 服务端配置可用，才走 app-server write。`capabilities` 仅观察当前状态，不启动、替换或
 重启 Sidecar，并分别报告：
 
@@ -222,6 +224,9 @@ Monitor 不信任 meta 中自行写入的 `patchAvailable`；每次投影都会�
   是否配置完整。
 - `codexAppServerWriteRuntimeAvailable`：当前 Sidecar 是否就绪且 write 配置可用。
 - `codexAppServerWriteProtocolSupport`：只表示实时 status 的协议 proof；旧 Sidecar 为 false。
+- `appServerMaxConcurrentJobs` / `codexAppServerWriteMaxConcurrency`：客户端预期的固定 3/2 额度。
+- `appServerRuntimeMaxConcurrentJobs` / `codexAppServerWriteRuntimeMaxConcurrency`：当前实例实际
+  status 报告的额度；没有可验证的运行实例时为 null。
 
 服务端不信任调用参数中的安全配置。它从插件配置独立读取并规范化允许的真实仓库根和专用
 Worktree 父目录；请求只能提交项目根、任务、模型、推理强度、Fast 三态与超时，不能指定
@@ -233,8 +238,10 @@ shell、测试命令、验证 profile 正文、env、cwd 或制品路径。Workt
 这只是窄用途静态检查，不是项目测试，不会运行 `npm test` 或候选仓库脚本。通过后内核创建
 candidate commit；结果只表示可人工审查的候选，不表示主分支、主工作树或远端已被修改。
 
-write 串行上限为1，同时仍占用 Sidecar 的共享总额度2。占位从 Worktree 创建前开始；
-submission unknown 或 `finalizationFailed` 会保留占用，避免绕过串行。已选想运行 app-server
+write 固定上限为2，同时仍占用 Sidecar 的共享总额度3。额度检查和 Map 占位在首个异步
+操作前同步完成；creating、running、validating、committing，以及 terminal 但尚未从 Map 删除的
+ownership 都计数。submission unknown 或 `finalizationFailed` 也会保留占用，避免绕过限额。
+第 3 个 Write 或第 4 个 app-server 总任务会立即拒绝，不排队。已选想运行 app-server
 write 后，旧 Sidecar、拒绝、失败、unknown 或最终化失败都不会回退 legacy，也不会重放
 validation/commit。继续用原 jobId 执行 `query`/`cancel`；full/compact、`listJobs` 和
 `run_and_wait` 沿用现有语义，并有限返回 baseRevision、resultCommit、changedFiles、validation
@@ -243,6 +250,10 @@ validation/commit。继续用原 jobId 执行 `query`/`cancel`；full/compact、
 候选 Worktree/ref 默认保留供人工审查；本功能不 merge、不 push、不 cherry-pick，也不自动
 删除唯一候选产物。Worktree 只隔离 Git 工作区，不是 OS 安全边界；Codex 仍依赖
 `workspace-write` 沙箱、approval policy `never`、禁用网络和服务端路径门禁。
+
+> 从总额2 / write protocol v1 升级到固定3/2与 write protocol v2 时，必须选择无活跃任务的
+> 维护窗口，对旧 Sidecar 做有界、受控重启并确认退出后再启动新实例。额度或 proof 不匹配会
+> fail-closed；客户端不会自动重启、替换、回退或重放，`capabilities` 也只观察不启动。
 
 
 ## Codex 逐任务 Fast mode

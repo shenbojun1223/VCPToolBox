@@ -1,7 +1,7 @@
 "use strict";
 
 const { SidecarServer } = require("./sidecarServer");
-const { loadWriteRuntimeConfig } = require("./writeRuntimeConfig");
+const { APP_SERVER_MAX_CONCURRENCY, loadWriteRuntimeConfig } = require("./writeRuntimeConfig");
 
 function parseArgs(argv) {
     const result = {
@@ -9,7 +9,7 @@ function parseArgs(argv) {
         jobRoot: "",
         codexBin: "codex",
         codexGlobalArgs: [],
-        maxConcurrency: 2,
+        maxConcurrency: APP_SERVER_MAX_CONCURRENCY,
         testStartupDelayMs: 0
     };
     const valueFlags = new Map([

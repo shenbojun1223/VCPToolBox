@@ -9,7 +9,11 @@ const { CodexAppServerProcess } = require("./codexAppServerProcess");
 const { GitWorktreeAdapter } = require("./gitWorktreeAdapter");
 const { WorktreeWriteSession } = require("./worktreeWriteSession");
 const { TrustedValidationRunner } = require("./trustedValidationRunner");
-const { getWriteProtocolStatus } = require("./writeRuntimeConfig");
+const {
+    APP_SERVER_MAX_CONCURRENCY,
+    WRITE_MAX_CONCURRENCY,
+    getWriteProtocolStatus
+} = require("./writeRuntimeConfig");
 const {
     SidecarError,
     runtimePaths,
@@ -158,7 +162,7 @@ class SidecarServer extends EventEmitter {
         this.codexGlobalArgs = Array.isArray(options.codexGlobalArgs) ? [...options.codexGlobalArgs] : [];
         this.identityProvider = options.identityProvider;
         this.identityDelay = options.identityDelay;
-        this.maxConcurrency = Math.max(1, Number(options.maxConcurrency || 2));
+        this.maxConcurrency = Math.max(1, Number(options.maxConcurrency || APP_SERVER_MAX_CONCURRENCY));
         this.requestTimeoutMs = Math.max(500, Number(options.requestTimeoutMs || 10000));
         this.cancelTimeoutMs = Math.max(250, Number(options.cancelTimeoutMs || 3000));
         this.timeoutGraceMs = Math.max(250, Number(options.timeoutGraceMs || Math.min(this.cancelTimeoutMs, 1000)));
@@ -452,8 +456,12 @@ class SidecarServer extends EventEmitter {
             throw new SidecarError("AICW_WRITE_REQUEST_INVALID", "Write Job request fields are invalid");
         }
         if (this.draining || this.state?.status !== "ready") throw new SidecarError("SIDECAR_NOT_READY", "Sidecar is not ready");
-        if ([...this.activeJobs.values()].some(job => job.kind === "write" && !job.terminal)) {
-            throw new SidecarError("AICW_WRITE_CONCURRENCY_LIMIT", "Only one write Job may be active");
+        let activeWriteJobs = 0;
+        for (const job of this.activeJobs.values()) {
+            if (job.kind === "write") activeWriteJobs++;
+        }
+        if (activeWriteJobs >= WRITE_MAX_CONCURRENCY) {
+            throw new SidecarError("AICW_WRITE_CONCURRENCY_LIMIT", "At most two write Jobs may hold ownership");
         }
         if (this.activeJobs.size >= this.maxConcurrency) throw new SidecarError("CONCURRENCY_LIMIT", "Sidecar concurrency limit reached");
         const jobId = assertJobId(params.jobId);

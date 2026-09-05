@@ -5,7 +5,9 @@ const path = require("node:path");
 const { TrustedValidationRunner } = require("./trustedValidationRunner");
 const { resolveTrustedGitExecutable } = require("./trustedGitRuntime");
 
-const WRITE_PROTOCOL_VERSION = 1;
+const APP_SERVER_MAX_CONCURRENCY = 3;
+const WRITE_MAX_CONCURRENCY = 2;
+const WRITE_PROTOCOL_VERSION = 2;
 const WRITE_VALIDATION_PROFILE = "builtin-static-v1";
 const WRITE_WORKSPACE_POLICY = "server-generated-locked-git-worktree";
 const WRITE_VALIDATION_POLICY = "builtin-diff-json-js-syntax";
@@ -124,7 +126,7 @@ function getWriteProtocolStatus(options = {}) {
         writeProtocolVersion: WRITE_PROTOCOL_VERSION,
         writeConfigured: options.configured === true,
         writeConfigurationErrorCode: typeof options.errorCode === "string" ? options.errorCode.slice(0, 64) : null,
-        writeMaxConcurrency: 1,
+        writeMaxConcurrency: WRITE_MAX_CONCURRENCY,
         writeWorkspacePolicy: WRITE_WORKSPACE_POLICY,
         writeValidationPolicy: WRITE_VALIDATION_POLICY,
         writeValidationProfile: options.configured === true ? WRITE_VALIDATION_PROFILE : null
@@ -135,7 +137,7 @@ function isWriteProtocolProof(value) {
     return Boolean(value && typeof value === "object" && !Array.isArray(value) &&
         value.writeProtocolSupported === true &&
         value.writeProtocolVersion === WRITE_PROTOCOL_VERSION &&
-        value.writeMaxConcurrency === 1 &&
+        value.writeMaxConcurrency === WRITE_MAX_CONCURRENCY &&
         value.writeWorkspacePolicy === WRITE_WORKSPACE_POLICY &&
         value.writeValidationPolicy === WRITE_VALIDATION_POLICY);
 }
@@ -162,6 +164,8 @@ function projectWriteProtocolStatus(value, missingState = "unknown") {
 }
 
 module.exports = {
+    APP_SERVER_MAX_CONCURRENCY,
+    WRITE_MAX_CONCURRENCY,
     WRITE_PROTOCOL_VERSION,
     WRITE_VALIDATION_PROFILE,
     loadWriteRuntimeConfig,

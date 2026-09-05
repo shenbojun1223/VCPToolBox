@@ -14,7 +14,11 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { SidecarClient, hasOwnedChildTerminationProof } = require("./appserver/sidecarClient");
-const { isWriteProtocolProof } = require("./appserver/writeRuntimeConfig");
+const {
+    APP_SERVER_MAX_CONCURRENCY,
+    WRITE_MAX_CONCURRENCY,
+    isWriteProtocolProof
+} = require("./appserver/writeRuntimeConfig");
 const {
     SidecarError,
     withJobMetaLock,
@@ -101,7 +105,7 @@ function loadConfig() {
         // 2026-06-27崩服务器事故后加的硬保险：opencode/antigravity 共用同一并发上限(不是各自1个)，
         // 默认1=任何时刻全服务器只允许1个 worker 实例在跑。之前只在文档写"严禁并发"靠自觉，没有代码强制。
         maxConcurrentJobs: parseInt(raw.MAX_CONCURRENT_JOBS || "1", 10),
-        appServerMaxConcurrentJobs: 2,
+        appServerMaxConcurrentJobs: APP_SERVER_MAX_CONCURRENCY,
     };
 }
 
@@ -2182,7 +2186,9 @@ function compactCapabilitiesResult(full) {
                 ? true
                 : full.codexAppServerWriteProtocolSupport || false,
         codexAppServerWriteConfigurationErrorCode: full.codexAppServerWriteConfigurationErrorCode || null,
-        codexAppServerWriteMaxConcurrency: 1,
+        codexAppServerWriteMaxConcurrency: WRITE_MAX_CONCURRENCY,
+        appServerRuntimeMaxConcurrentJobs: full.appServerRuntimeMaxConcurrentJobs ?? null,
+        codexAppServerWriteRuntimeMaxConcurrency: full.codexAppServerWriteRuntimeMaxConcurrency ?? null,
         codexAppServerWriteValidationPolicy: full.codexAppServerWriteValidationPolicy || null,
         patchContractVersion: PATCH_CONTRACT_VERSION,
         patchMaxBytes: PATCH_MAX_BYTES,
@@ -2364,7 +2370,12 @@ async function cmdCapabilities(input = {}) {
         codexAppServerPatchProtocolSupport: patchProtocolSupport,
         codexAppServerWriteProtocolSupport: writeProtocolSupport,
         codexAppServerWriteConfigurationErrorCode: appServerInspection.writeConfigurationErrorCode || null,
-        codexAppServerWriteMaxConcurrency: 1,
+        codexAppServerWriteMaxConcurrency: WRITE_MAX_CONCURRENCY,
+        appServerRuntimeMaxConcurrentJobs: appServerInspection.runtimeMaxConcurrency ?? null,
+        codexAppServerWriteRuntimeMaxConcurrency:
+            Number.isSafeInteger(appServerInspection.writeMaxConcurrency)
+                ? appServerInspection.writeMaxConcurrency
+                : null,
         codexAppServerWriteWorkspacePolicy: appServerInspection.writeWorkspacePolicy || null,
         codexAppServerWriteValidationPolicy: appServerInspection.writeValidationPolicy || null,
         codexAppServerStatus: appServerConfigured

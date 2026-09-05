@@ -24,7 +24,11 @@ const {
     jobPaths,
     projectPatchProtocolProof
 } = require("./protocol");
-const { isWriteProtocolProof, projectWriteProtocolStatus } = require("./writeRuntimeConfig");
+const {
+    APP_SERVER_MAX_CONCURRENCY,
+    isWriteProtocolProof,
+    projectWriteProtocolStatus
+} = require("./writeRuntimeConfig");
 
 const OWNED_CHILD_TERMINATION_PROOFS = new WeakSet();
 const SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION = 1;
@@ -81,7 +85,7 @@ class SidecarClient {
         this.processIdentity = Object.prototype.hasOwnProperty.call(options, "processIdentity")
             ? options.processIdentity
             : getLocalProcessIdentitySafely();
-        this.maxConcurrency = Math.max(1, Number(options.maxConcurrency || 2));
+        this.maxConcurrency = Math.max(1, Number(options.maxConcurrency || APP_SERVER_MAX_CONCURRENCY));
         this.connectTimeoutMs = Math.max(250, Number(options.connectTimeoutMs || 1500));
         this.requestTimeoutMs = Math.max(500, Number(options.requestTimeoutMs || 10000));
         this.startupTimeoutMs = Math.max(1000, Number(options.startupTimeoutMs || 15000));
@@ -414,6 +418,9 @@ class SidecarClient {
                     : 0,
             maxConcurrency: Number(statusResult?.maxConcurrency || this.maxConcurrency)
         };
+        result.runtimeMaxConcurrency = Number.isSafeInteger(statusResult?.maxConcurrency)
+            ? statusResult.maxConcurrency
+            : null;
         Object.assign(result, projectPatchProtocolProof(
             statusResult === null || statusResult === undefined ? state : statusResult
         ));

@@ -40,7 +40,12 @@ const { JsonLineRpcConnection } = require("../appserver/jsonLineRpcConnection");
 const { SidecarServer } = require("../appserver/sidecarServer");
 const { parseWorktreeListPorcelainZ } = require("../appserver/gitWorktreeAdapter");
 const { TrustedValidationRunner } = require("../appserver/trustedValidationRunner");
-const { getWriteProtocolStatus } = require("../appserver/writeRuntimeConfig");
+const {
+    APP_SERVER_MAX_CONCURRENCY,
+    WRITE_MAX_CONCURRENCY,
+    getWriteProtocolStatus,
+    isWriteProtocolProof
+} = require("../appserver/writeRuntimeConfig");
 
 const fixturePath = path.join(__dirname, "fixtures", "fake-codex-app-server.js");
 const entryPath = path.join(__dirname, "..", "appserver", "sidecar-entry.js");
@@ -441,7 +446,7 @@ async function createDormantWriteEnvironment(expectedContent = "write-approved\n
             fixturePath,
             `--fake-record-base64=${Buffer.from(fakeRecordPath, "utf8").toString("base64")}`
         ],
-        maxConcurrency: 2,
+        maxConcurrency: options.maxConcurrency || APP_SERVER_MAX_CONCURRENCY,
         requestTimeoutMs: 5000,
         writeEnabled: true,
         writeAllowedProjectRoots: [canonicalProjectRoot],
@@ -468,6 +473,17 @@ async function createDormantWriteEnvironment(expectedContent = "write-approved\n
                 text,
                 model: "gpt-5-codex",
                 effort: "high",
+                ...options,
+                metaPath: paths.metaPath,
+                outputPath: paths.outputPath,
+                codexOutputPath: paths.codexOutputPath
+            });
+        },
+        submitAnalyze(jobId, text, paths, options = {}) {
+            return server._submitAnalyzeJob({
+                jobId,
+                projectPath: canonicalProjectRoot,
+                text,
                 ...options,
                 metaPath: paths.metaPath,
                 outputPath: paths.outputPath,
@@ -682,7 +698,7 @@ test("Sidecar start writes non-null local identity", async () => {
     }
 });
 
-test("Sidecar status returns the exact patch protocol proof", async () => {
+test("Sidecar status returns exact patch and write v2 protocol proofs", async () => {
     const environment = await createEnvironment();
     const server = new SidecarServer({
         pluginDir: environment.pluginDir,
@@ -706,10 +722,27 @@ test("Sidecar status returns the exact patch protocol proof", async () => {
         assert.equal(status.codexPid, null);
         assert.ok(Array.isArray(status.activeJobs));
         assert.equal(status.writeProtocolSupported, true);
-        assert.equal(status.writeProtocolVersion, 1);
+        assert.equal(status.writeProtocolVersion, 2);
         assert.equal(status.writeConfigured, false);
-        assert.equal(status.writeMaxConcurrency, 1);
+        assert.equal(status.writeMaxConcurrency, WRITE_MAX_CONCURRENCY);
     } finally { await environment.close(); }
+});
+
+test("write protocol v2 proof rejects v1, unknown, string, missing, and wrong quota fields", () => {
+    const proof = getWriteProtocolStatus({ configured: true });
+    assert.equal(isWriteProtocolProof(proof), true);
+    const cases = [
+        { ...proof, writeProtocolVersion: 1 },
+        { ...proof, writeProtocolVersion: 99 },
+        { ...proof, writeProtocolVersion: "2" },
+        { ...proof, writeMaxConcurrency: 1 },
+        { ...proof, writeMaxConcurrency: "2" },
+        { ...proof, writeWorkspacePolicy: "unknown" },
+        { ...proof, writeValidationPolicy: "unknown" },
+        (() => { const value = { ...proof }; delete value.writeProtocolVersion; return value; })(),
+        null
+    ];
+    for (const value of cases) assert.equal(isWriteProtocolProof(value), false);
 });
 
 test("Sidecar write RPC stays fail-closed when server write is unconfigured", async () => {
@@ -1118,32 +1151,226 @@ test("write identity drift fails before the validation process starts", async ()
     }
 });
 
-test("second dormant write is rejected before meta Worktree or RPC side effects", async () => {
+test("two write Jobs overlap in isolated Worktrees and create sibling candidates", async () => {
     const expectedContent = "write-approved\n";
     const environment = await createDormantWriteEnvironment(expectedContent);
-    const firstId = "write_active_first";
-    const firstPaths = environment.createWriteMeta(firstId);
+    const ids = ["write_parallel_first", "write_parallel_second"];
+    const paths = ids.map(id => environment.createWriteMeta(id));
+    const baseHead = gitFixture(environment.projectRoot, ["rev-parse", "HEAD"]);
+    const baseTree = gitFixture(environment.projectRoot, ["rev-parse", "HEAD^{tree}"]);
+    const primaryStatus = gitFixture(environment.projectRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const primaryContent = fs.readFileSync(path.join(environment.projectRoot, "tracked.txt"), "utf8");
+    const writeControl = `[[WRITE_TRACKED_BASE64=${Buffer.from(expectedContent).toString("base64")}]]`;
     try {
-        const firstSubmission = environment.submitWrite(firstId, "[[DELAY_MS=1200]]", firstPaths);
-        await waitFor(() => Boolean(readJsonOrNull(firstPaths.metaPath)?.worktreePath));
-        const firstWorktreePath = readJsonOrNull(firstPaths.metaPath).worktreePath;
-        const secondId = "write_rejected_second";
-        const secondPaths = environment.createWriteMeta(secondId);
-        const secondMetaBefore = fs.readFileSync(secondPaths.metaPath, "utf8");
-        const worktreesBefore = environment.worktrees();
-        const rpcCountBefore = environment.readFakeRecords().length;
+        const submissions = ids.map((id, index) => environment.submitWrite(
+            id,
+            `${writeControl}[[DELAY_MS=900]][[FINAL=parallel-${index + 1}]]`,
+            paths[index]
+        ));
+        await waitFor(() => {
+            const active = environment.server.status().activeJobs.filter(job => job.kind === "write");
+            return active.length === 2 && active.every(job => job.threadId && job.turnId);
+        }, 10000);
+        const active = environment.server.status().activeJobs.filter(job => job.kind === "write");
+        assert.equal(new Set(active.map(job => job.threadId)).size, 2);
+        assert.equal(new Set(active.map(job => job.turnId)).size, 2);
+        assert.equal(new Set(paths.map(item => readJsonOrNull(item.metaPath).worktreePath)).size, 2);
+
+        await Promise.all(submissions);
+        const metas = await Promise.all(ids.map(id => environment.server.activeJobs.get(id)?.terminalPromise));
+        assert.ok(metas.every(meta => meta?.state === "completed"));
+        const persisted = paths.map(item => readJsonOrNull(item.metaPath));
+        for (const meta of persisted) {
+            assert.equal(meta.candidateAvailable, true);
+            assert.equal(gitFixture(environment.projectRoot, ["rev-parse", `${meta.resultCommit}^`]), baseHead);
+        }
+        assert.notEqual(persisted[0].resultCommit, persisted[1].resultCommit);
+        assert.notEqual(persisted[0].worktreeBranch, persisted[1].worktreeBranch);
+        assert.equal(gitFixture(environment.projectRoot, ["rev-parse", "HEAD"]), baseHead);
+        assert.equal(gitFixture(environment.projectRoot, ["rev-parse", "HEAD^{tree}"]), baseTree);
+        assert.equal(gitFixture(environment.projectRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]), primaryStatus);
+        assert.equal(fs.readFileSync(path.join(environment.projectRoot, "tracked.txt"), "utf8"), primaryContent);
+    } finally {
+        await environment.close();
+    }
+});
+
+test("two active writes reject a third write while one analyze fills the third total slot", async () => {
+    const expectedContent = "quota-approved\n";
+    const environment = await createDormantWriteEnvironment(expectedContent);
+    const writeControl = `[[WRITE_TRACKED_BASE64=${Buffer.from(expectedContent).toString("base64")}]]`;
+    const writeIds = ["write_quota_first", "write_quota_second"];
+    const writePaths = writeIds.map(id => environment.createWriteMeta(id));
+    const pending = [];
+    try {
+        for (let index = 0; index < writeIds.length; index++) {
+            pending.push(environment.submitWrite(
+                writeIds[index],
+                `${writeControl}[[DELAY_MS=2500]][[FINAL=quota-${index + 1}]]`,
+                writePaths[index]
+            ));
+        }
+        await waitFor(() => environment.server.status().activeJobs.filter(job => job.kind === "write").length === 2);
+
+        const thirdWriteId = "write_quota_rejected_third";
+        const thirdWritePaths = environment.createWriteMeta(thirdWriteId);
+        const thirdMetaBefore = fs.readFileSync(thirdWritePaths.metaPath, "utf8");
         await assert.rejects(
-            environment.submitWrite(secondId, "second", secondPaths),
+            environment.submitWrite(thirdWriteId, "third write", thirdWritePaths),
             error => error instanceof SidecarError && error.code === "AICW_WRITE_CONCURRENCY_LIMIT"
         );
-        assert.equal(fs.readFileSync(secondPaths.metaPath, "utf8"), secondMetaBefore);
-        assert.deepEqual(environment.worktrees(), worktreesBefore);
-        assert.equal(environment.readFakeRecords().length, rpcCountBefore);
-        fs.writeFileSync(path.join(firstWorktreePath, "tracked.txt"), expectedContent, "utf8");
-        await firstSubmission;
-        await waitFor(() => readJsonOrNull(firstPaths.metaPath)?.state === "completed", 10000);
-        assert.equal(readJsonOrNull(firstPaths.metaPath).candidateAvailable, true);
+        assert.equal(fs.readFileSync(thirdWritePaths.metaPath, "utf8"), thirdMetaBefore);
+        assert.equal(fs.existsSync(path.join(environment.workspaceBaseRoot, thirdWriteId)), false);
+
+        const analyzeId = "analyze_quota_third_slot";
+        const analyzePaths = createMeta(environment.jobRoot, analyzeId);
+        pending.push(environment.submitAnalyze(analyzeId, "[[DELAY_MS=2500]][[FINAL=analyze-third-slot]]", analyzePaths));
+        await waitFor(() => environment.server.status().activeJobs.length === APP_SERVER_MAX_CONCURRENCY);
+        const active = environment.server.status().activeJobs;
+        assert.equal(active.filter(job => job.kind === "write").length, WRITE_MAX_CONCURRENCY);
+        assert.deepEqual(new Set(active.map(job => job.jobId)), new Set([...writeIds, analyzeId]));
+
+        const fourthId = "analyze_quota_rejected_fourth";
+        const fourthPaths = createMeta(environment.jobRoot, fourthId);
+        const fourthMetaBefore = fs.readFileSync(fourthPaths.metaPath, "utf8");
+        await assert.rejects(
+            environment.submitAnalyze(fourthId, "fourth total", fourthPaths),
+            error => error instanceof SidecarError && error.code === "CONCURRENCY_LIMIT"
+        );
+        assert.equal(fs.readFileSync(fourthPaths.metaPath, "utf8"), fourthMetaBefore);
     } finally {
+        for (const job of [...environment.server.activeJobs.values()]) {
+            try { await environment.server._cancel({ jobId: job.jobId }); } catch {}
+        }
+        await Promise.allSettled(pending);
+        await environment.close();
+    }
+});
+
+test("cancelling one write releases only its ownership and leaves the peer turn to complete", async () => {
+    const expectedContent = "cancel-peer-approved\n";
+    const environment = await createDormantWriteEnvironment(expectedContent);
+    const control = `[[WRITE_TRACKED_BASE64=${Buffer.from(expectedContent).toString("base64")}]]`;
+    const firstId = "write_cancel_one";
+    const secondId = "write_cancel_peer";
+    const firstPaths = environment.createWriteMeta(firstId);
+    const secondPaths = environment.createWriteMeta(secondId);
+    try {
+        const firstSubmission = environment.submitWrite(firstId, `${control}[[DELAY_MS=5000]][[FINAL=cancel-me]]`, firstPaths);
+        const secondSubmission = environment.submitWrite(secondId, `${control}[[DELAY_MS=1000]][[FINAL=peer-completes]]`, secondPaths);
+        await waitFor(() => {
+            const active = environment.server.status().activeJobs.filter(job => job.kind === "write");
+            return active.length === 2 && active.every(job => job.turnId);
+        });
+        const peerThreadId = environment.server.activeJobs.get(secondId).threadId;
+        const peerTurnId = environment.server.activeJobs.get(secondId).turnId;
+        await environment.server._cancel({ jobId: firstId });
+        await waitFor(() => !environment.server.activeJobs.has(firstId));
+        assert.equal(environment.server.activeJobs.size, 1);
+        assert.equal(environment.server.activeJobs.get(secondId).threadId, peerThreadId);
+        assert.equal(environment.server.activeJobs.get(secondId).turnId, peerTurnId);
+
+        await Promise.allSettled([firstSubmission, secondSubmission]);
+        await waitFor(() => readJsonOrNull(secondPaths.metaPath)?.state === "completed", 10000);
+        assert.equal(readJsonOrNull(firstPaths.metaPath).state, "cancelled");
+        assert.equal(readJsonOrNull(secondPaths.metaPath).candidateAvailable, true);
+        assert.equal(fs.readFileSync(secondPaths.codexOutputPath, "utf8"), "peer-completes");
+    } finally {
+        await environment.close();
+    }
+});
+
+test("concurrent write validation failure is isolated from a successful candidate", async () => {
+    const expectedContent = "validation-approved\n";
+    const environment = await createDormantWriteEnvironment(expectedContent);
+    const successId = "write_validation_parallel_success";
+    const failureId = "write_validation_parallel_failure";
+    const successPaths = environment.createWriteMeta(successId);
+    const failurePaths = environment.createWriteMeta(failureId);
+    const successControl = `[[WRITE_TRACKED_BASE64=${Buffer.from(expectedContent).toString("base64")}]]`;
+    const failureControl = `[[WRITE_TRACKED_BASE64=${Buffer.from("validation-rejected\n").toString("base64")}]]`;
+    try {
+        const submissions = [
+            environment.submitWrite(successId, `${successControl}[[DELAY_MS=900]][[FINAL=success-output]]`, successPaths),
+            environment.submitWrite(failureId, `${failureControl}[[DELAY_MS=900]][[FINAL=failure-output]]`, failurePaths)
+        ];
+        await waitFor(() => environment.server.status().activeJobs.filter(job => job.kind === "write").length === 2);
+        await Promise.all(submissions);
+        await waitFor(() => [successPaths, failurePaths].every(item => {
+            const state = readJsonOrNull(item.metaPath)?.state;
+            return state === "completed" || state === "failed";
+        }), 10000);
+        const success = readJsonOrNull(successPaths.metaPath);
+        const failure = readJsonOrNull(failurePaths.metaPath);
+        assert.equal(success.state, "completed");
+        assert.equal(success.validationPassed, true);
+        assert.equal(success.candidateAvailable, true);
+        assert.match(success.resultCommit, /^[0-9a-f]{40,64}$/);
+        assert.equal(failure.state, "failed");
+        assert.equal(failure.validationPassed, false);
+        assert.equal(failure.candidateAvailable, false);
+        assert.equal(failure.errorCode, "AICW_VALIDATION_STEP_FAILED");
+        assert.equal(Object.prototype.hasOwnProperty.call(failure, "resultCommit"), false);
+        assert.equal(fs.readFileSync(successPaths.codexOutputPath, "utf8"), "success-output");
+        assert.equal(fs.readFileSync(failurePaths.codexOutputPath, "utf8"), "failure-output");
+    } finally {
+        await environment.close();
+    }
+});
+
+test("terminal and finalizationFailed write ownership remains counted until its Map entry is removed", async () => {
+    const environment = await createDormantWriteEnvironment("ownership-approved\n");
+    const firstId = "write_terminal_persisting";
+    const secondId = "write_ownership_peer";
+    const firstPaths = environment.createWriteMeta(firstId);
+    const secondPaths = environment.createWriteMeta(secondId);
+    let releaseTerminalMeta;
+    let terminalMetaEntered;
+    const terminalMetaGate = new Promise(resolve => { releaseTerminalMeta = resolve; });
+    const terminalMetaObserved = new Promise(resolve => { terminalMetaEntered = resolve; });
+    const originalUpdateWriteMeta = environment.server._updateWriteMeta.bind(environment.server);
+    environment.server._updateWriteMeta = async (job, updater) => {
+        if (job.jobId === firstId && job.terminal) {
+            terminalMetaEntered();
+            await terminalMetaGate;
+        }
+        return originalUpdateWriteMeta(job, updater);
+    };
+    try {
+        const pending = [
+            environment.submitWrite(firstId, "[[DELAY_MS=5000]][[FINAL=terminal-first]]", firstPaths),
+            environment.submitWrite(secondId, "[[DELAY_MS=5000]][[FINAL=terminal-second]]", secondPaths)
+        ];
+        await waitFor(() => environment.server.status().activeJobs.filter(job => job.kind === "write").length === 2);
+        const cancelPromise = environment.server._cancel({ jobId: firstId });
+        await terminalMetaObserved;
+        assert.equal(environment.server.activeJobs.get(firstId).terminal, true);
+
+        const rejectedId = "write_terminal_ownership_rejected";
+        const rejectedPaths = environment.createWriteMeta(rejectedId);
+        await assert.rejects(
+            environment.submitWrite(rejectedId, "must remain rejected", rejectedPaths),
+            error => error instanceof SidecarError && error.code === "AICW_WRITE_CONCURRENCY_LIMIT"
+        );
+        releaseTerminalMeta();
+        await cancelPromise;
+        await waitFor(() => !environment.server.activeJobs.has(firstId));
+
+        const peer = environment.server.activeJobs.get(secondId);
+        const finalizationError = new SidecarError("AICW_WRITE_FINALIZATION_UNCERTAIN", "injected finalization ownership");
+        environment.server._markWriteFinalizationIncomplete(peer, finalizationError);
+        assert.equal(peer.finalizationFailed, true);
+        assert.equal(peer.terminal, true);
+        assert.equal(environment.server.activeJobs.get(secondId), peer);
+        assert.equal(environment.server.status().status, "degraded");
+        await assert.rejects(
+            environment.submitWrite("write_after_degraded", "rejected", createMeta(environment.jobRoot, "write_after_degraded")),
+            error => error instanceof SidecarError && error.code === "SIDECAR_NOT_READY"
+        );
+        await Promise.allSettled(pending);
+    } finally {
+        releaseTerminalMeta?.();
+        environment.server.activeJobs.clear();
         await environment.close();
     }
 });
@@ -3500,4 +3727,51 @@ test("SidecarClient write preflight binds proof and submit to one instance with 
     assert.equal(submittedParams.metaPath, fixed.metaPath);
     assert.equal(submittedParams.outputPath, fixed.outputPath);
     assert.equal(submittedParams.codexOutputPath, fixed.codexOutputPath);
+});
+
+test("new SidecarClient rejects old total quota and non-v2 write proofs before submit", async () => {
+    const jobRoot = path.join(__dirname, "jobs-write-v2-gate-fixture");
+    const client = new SidecarClient({ pluginDir: __dirname, jobRoot });
+    const state = { instanceId: "old-instance", controlToken: "old-token", endpoint: "old-endpoint" };
+    let submitCalls = 0;
+    client._callWithState = async (_state, method) => {
+        if (method === "status") {
+            return {
+                instanceId: state.instanceId,
+                maxConcurrency: 2,
+                ...getWriteProtocolStatus({ configured: true })
+            };
+        }
+        submitCalls++;
+        return { accepted: true };
+    };
+    client.ensure = async () => client._assertCompatibleConcurrency(state);
+    await assert.rejects(
+        client.submitWriteJob({ jobId: "job_write_old_total", projectPath: __dirname, text: "old total" }),
+        error => error.code === "SIDECAR_CONCURRENCY_MISMATCH" &&
+            error.details?.expected === APP_SERVER_MAX_CONCURRENCY && error.details?.actual === 2
+    );
+    assert.equal(submitCalls, 0);
+
+    const valid = getWriteProtocolStatus({ configured: true });
+    const invalidProofs = [
+        { ...valid, writeProtocolVersion: 1, writeMaxConcurrency: 1 },
+        { ...valid, writeProtocolVersion: 99 },
+        { ...valid, writeProtocolVersion: "2" },
+        { ...valid, writeMaxConcurrency: "2" },
+        (() => { const value = { ...valid }; delete value.writeValidationPolicy; return value; })(),
+        {}
+    ];
+    for (let index = 0; index < invalidProofs.length; index++) {
+        client.ensure = async () => ({ ...state, ...invalidProofs[index] });
+        await assert.rejects(
+            client.submitWriteJob({
+                jobId: `job_write_invalid_proof_${index}`,
+                projectPath: __dirname,
+                text: "invalid proof"
+            }),
+            error => error.code === "AICW_APP_SERVER_WRITE_SIDECAR_UNSUPPORTED"
+        );
+    }
+    assert.equal(submitCalls, 0);
 });

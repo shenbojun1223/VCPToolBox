@@ -1021,7 +1021,10 @@ test("app-server write flag creates a validated retained candidate without chang
         assert.equal(after.codexAppServerWriteConfigured, true);
         assert.equal(after.codexAppServerWriteRuntimeAvailable, true);
         assert.equal(after.codexAppServerWriteProtocolSupport, true);
-        assert.equal(after.codexAppServerWriteMaxConcurrency, 1);
+        assert.equal(after.codexAppServerWriteMaxConcurrency, 2);
+        assert.equal(after.appServerMaxConcurrentJobs, 3);
+        assert.equal(after.appServerRuntimeMaxConcurrentJobs, 3);
+        assert.equal(after.codexAppServerWriteRuntimeMaxConcurrency, 2);
         assert.equal(after.appServerConcurrencyScope, "shared-analyze-patch-write");
     } finally {
         await environment.cleanup();
@@ -1096,13 +1099,14 @@ test("unknown or blank run mode is rejected before Job, lock, or Sidecar while o
     } finally { await environment.cleanup(); }
 });
 
-test("app-server concurrency is two and the third submission is rejected without fallback", async () => {
+test("production app-server concurrency is three and the fourth submission is rejected without fallback", async () => {
     const environment = await createEnvironment({ flag: "true" });
     try {
         const responses = await Promise.all([
             environment.invoke({ command: "run", worker: "codex", mode: "analyze", projectPath: environment.projectRoot, task: "[[DELAY_MS=1800]][[FINAL=A]]" }),
             environment.invoke({ command: "run", worker: "codex", mode: "analyze", projectPath: environment.projectRoot, task: "[[DELAY_MS=1800]][[FINAL=B]]" }),
-            environment.invoke({ command: "run", worker: "codex", mode: "analyze", projectPath: environment.projectRoot, task: "[[DELAY_MS=1800]][[FINAL=C]]" })
+            environment.invoke({ command: "run", worker: "codex", mode: "analyze", projectPath: environment.projectRoot, task: "[[DELAY_MS=1800]][[FINAL=C]]" }),
+            environment.invoke({ command: "run", worker: "codex", mode: "analyze", projectPath: environment.projectRoot, task: "[[DELAY_MS=1800]][[FINAL=D]]" })
         ]);
         const errors = responses.filter(response => response.status === "error");
         assert.equal(errors.length, 1);
@@ -1250,7 +1254,10 @@ test("capabilities observes without starting Sidecar and exposes both quotas", a
             assert.equal(result.codexAppServerAnalyzeEnabled, fixture.flag === "true");
             assert.equal(result.codexAppServerPatchEnabled, fixture.patchFlag === "true");
             assert.equal(result.legacyMaxConcurrentJobs, 1);
-            assert.equal(result.appServerMaxConcurrentJobs, 2);
+            assert.equal(result.appServerMaxConcurrentJobs, 3);
+            assert.equal(result.codexAppServerWriteMaxConcurrency, 2);
+            assert.equal(result.appServerRuntimeMaxConcurrentJobs, null);
+            assert.equal(result.codexAppServerWriteRuntimeMaxConcurrency, null);
             assert.equal(result.appServerConcurrencyScope, "shared-analyze-patch-write");
             assert.equal(result.patchContractVersion, 1);
             assert.equal(result.patchMaxBytes, 524288);
@@ -2322,7 +2329,14 @@ test("compact capabilities is a small routing-safe whitelist and full remains co
             assert.deepEqual(Object.keys(worker).sort(), ["available", "name"]);
         }
         assert.equal(compact.legacyMaxConcurrentJobs, 1);
-        assert.equal(compact.appServerMaxConcurrentJobs, 2);
+        assert.equal(compact.appServerMaxConcurrentJobs, 3);
+        assert.equal(compact.codexAppServerWriteMaxConcurrency, 2);
+        assert.equal(compact.appServerRuntimeMaxConcurrentJobs, null);
+        assert.equal(compact.codexAppServerWriteRuntimeMaxConcurrency, null);
+        assert.equal(full.appServerMaxConcurrentJobs, compact.appServerMaxConcurrentJobs);
+        assert.equal(full.codexAppServerWriteMaxConcurrency, compact.codexAppServerWriteMaxConcurrency);
+        assert.equal(full.appServerRuntimeMaxConcurrentJobs, compact.appServerRuntimeMaxConcurrentJobs);
+        assert.equal(full.codexAppServerWriteRuntimeMaxConcurrency, compact.codexAppServerWriteRuntimeMaxConcurrency);
         assert.equal(compact.codexAppServerAnalyzeEnabled, true);
         assert.equal(compact.codexAppServerPatchEnabled, true);
         assert.equal(compact.appServerConcurrencyScope, "shared-analyze-patch-write");
