@@ -24,6 +24,7 @@ const {
     jobPaths,
     projectPatchProtocolProof
 } = require("./protocol");
+const { isWriteProtocolProof, projectWriteProtocolStatus } = require("./writeRuntimeConfig");
 
 const OWNED_CHILD_TERMINATION_PROOFS = new WeakSet();
 const SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION = 1;
@@ -202,6 +203,39 @@ class SidecarClient {
         }
     }
 
+    async submitWriteJob(params = {}) {
+        const jobId = assertJobId(params.jobId);
+        const fixedPaths = jobPaths(this.jobRoot, jobId);
+        const state = await this.ensure();
+        this._assertWriteSubmissionCompatible(state);
+        this._assertServiceTierOverrideCompatible(state, params);
+        try {
+            return await this._callWithState(state, "submitWriteJob", {
+                ...params,
+                jobId,
+                metaPath: fixedPaths.metaPath,
+                outputPath: fixedPaths.outputPath,
+                codexOutputPath: fixedPaths.codexOutputPath
+            });
+        } catch (error) {
+            const unknownTransportCodes = new Set([
+                "SIDECAR_IPC_TIMEOUT",
+                "SIDECAR_IPC_ERROR",
+                "SIDECAR_IPC_CLOSED",
+                "SIDECAR_IPC_WRITE_FAILED",
+                "SIDECAR_IPC_BUFFER_OVERFLOW",
+                "SIDECAR_RESPONSE_MISMATCH",
+                "INVALID_SIDECAR_RESPONSE"
+            ]);
+            if (!unknownTransportCodes.has(error?.code)) throw error;
+            throw new SidecarError(
+                "AICW_APP_SERVER_WRITE_SUBMISSION_UNKNOWN",
+                "Write submission outcome is unknown and must not be replayed",
+                { transportCode: error.code }
+            );
+        }
+    }
+
     /**
      * Observe Sidecar state without starting, cleaning, or taking over anything.
      * This is intentionally separate from _probeExisting(): the latter is part
@@ -226,7 +260,8 @@ class SidecarClient {
                 status: "absent",
                 activeJobs: 0,
                 maxConcurrency: this.maxConcurrency,
-                ...projectPatchProtocolProof(null)
+                ...projectPatchProtocolProof(null),
+                ...projectWriteProtocolStatus(null)
             };
             const lockStatus = this._inspectStartupLock(lock);
             return {
@@ -235,6 +270,7 @@ class SidecarClient {
                 activeJobs: 0,
                 maxConcurrency: this.maxConcurrency,
                 ...projectPatchProtocolProof(null),
+                ...projectWriteProtocolStatus(null),
                 ...(lockStatus.errorCode ? { errorCode: lockStatus.errorCode } : {})
             };
         }
@@ -298,7 +334,8 @@ class SidecarClient {
             status: "absent",
             activeJobs: 0,
             maxConcurrency: this.maxConcurrency,
-            ...projectPatchProtocolProof(null)
+            ...projectPatchProtocolProof(null),
+            ...projectWriteProtocolStatus(null)
         };
 
         try {
@@ -316,7 +353,8 @@ class SidecarClient {
                     activeJobs: 0,
                     maxConcurrency: this.maxConcurrency,
                     reconciled: true,
-                    ...projectPatchProtocolProof(null)
+                    ...projectPatchProtocolProof(null),
+                    ...projectWriteProtocolStatus(null)
                 };
         } catch (error) {
             const replacement = this._readState();
@@ -342,7 +380,8 @@ class SidecarClient {
         const status = await this._callWithState(state, "status", {});
         return {
             ...status,
-            ...projectPatchProtocolProof(status)
+            ...projectPatchProtocolProof(status),
+            ...projectWriteProtocolStatus(status)
         };
     }
 
@@ -376,6 +415,9 @@ class SidecarClient {
             maxConcurrency: Number(statusResult?.maxConcurrency || this.maxConcurrency)
         };
         Object.assign(result, projectPatchProtocolProof(
+            statusResult === null || statusResult === undefined ? state : statusResult
+        ));
+        Object.assign(result, projectWriteProtocolStatus(
             statusResult === null || statusResult === undefined ? state : statusResult
         ));
         if (statusResult?.errorCode) result.errorCode = statusResult.errorCode;
@@ -610,8 +652,27 @@ class SidecarClient {
                 status?.serviceTierOverrideProtocolVersion === SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION
                     ? SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION
                     : null,
-            ...projectPatchProtocolProof(status)
+            ...projectPatchProtocolProof(status),
+            ...projectWriteProtocolStatus(status)
         };
+    }
+
+    _assertWriteSubmissionCompatible(state) {
+        if (!isWriteProtocolProof(state)) {
+            throw new SidecarError(
+                "AICW_APP_SERVER_WRITE_SIDECAR_UNSUPPORTED",
+                "The active Sidecar does not provide the required write protocol proof"
+            );
+        }
+        if (state.writeConfigured !== true) {
+            throw new SidecarError(
+                "AICW_APP_SERVER_WRITE_NOT_CONFIGURED",
+                "The active Sidecar has no usable server-side write configuration",
+                state.writeConfigurationErrorCode
+                    ? { cause: state.writeConfigurationErrorCode }
+                    : undefined
+            );
+        }
     }
 
     _assertServiceTierOverrideCompatible(state, params) {

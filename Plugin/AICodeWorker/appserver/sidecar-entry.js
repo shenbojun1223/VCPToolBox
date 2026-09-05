@@ -1,6 +1,7 @@
 "use strict";
 
 const { SidecarServer } = require("./sidecarServer");
+const { loadWriteRuntimeConfig } = require("./writeRuntimeConfig");
 
 function parseArgs(argv) {
     const result = {
@@ -41,7 +42,16 @@ function parseArgs(argv) {
 
 async function main() {
     const options = parseArgs(process.argv.slice(2));
-    const server = new SidecarServer(options);
+    const writeRuntime = loadWriteRuntimeConfig(options.pluginDir);
+    const server = new SidecarServer({
+        ...options,
+        writeEnabled: writeRuntime.enabled,
+        writeConfigurationErrorCode: writeRuntime.errorCode,
+        writeAllowedProjectRoots: writeRuntime.allowedProjectRoots,
+        writeWorkspaceBaseRoot: writeRuntime.workspaceBaseRoot,
+        writeValidationRunner: writeRuntime.validationRunner,
+        writeValidationProfile: writeRuntime.validationProfile
+    });
     let signalPromise = null;
     const onSignal = () => {
         if (!signalPromise) signalPromise = server.shutdown().catch(() => {});

@@ -109,9 +109,11 @@ async function createEnvironment(options = {}) {
     const appserverDir = path.join(pluginDir, "appserver");
     const jobRoot = path.join(pluginDir, "jobs");
     const projectRoot = path.join(tempRoot, "project");
+    const workspaceBaseRoot = path.join(tempRoot, "write-workspaces");
     const codexHome = path.join(tempRoot, "codex-home");
     fs.mkdirSync(pluginDir, { recursive: true });
     fs.mkdirSync(projectRoot, { recursive: true });
+    fs.mkdirSync(workspaceBaseRoot, { recursive: true });
     fs.mkdirSync(codexHome, { recursive: true });
     fs.cpSync(sourceAppServerDir, appserverDir, { recursive: true });
     if (options.legacyPatchProtocol) {
@@ -178,6 +180,9 @@ async function createEnvironment(options = {}) {
     const patchFlagLine = Object.prototype.hasOwnProperty.call(options, "patchFlag")
         ? `ENABLE_CODEX_APP_SERVER_PATCH=${options.patchFlag}\n`
         : "";
+    const writeFlagLine = Object.prototype.hasOwnProperty.call(options, "writeFlag")
+        ? `ENABLE_CODEX_APP_SERVER_WRITE=${options.writeFlag}\n`
+        : "";
     fs.writeFileSync(path.join(pluginDir, "config.env"), [
         "ENABLE_OPENCODE=true",
         "ENABLE_MIMOCODE=false",
@@ -188,9 +193,12 @@ async function createEnvironment(options = {}) {
         "ENABLE_CODEX=true",
         flagLine.trimEnd(),
         patchFlagLine.trimEnd(),
+        writeFlagLine.trimEnd(),
         `CODEX_BIN=${process.execPath}`,
         `CODEX_HOME=${codexHome}`,
         `ALLOWED_PROJECT_ROOTS=${projectRoot}`,
+        `CODEX_APP_SERVER_WRITE_ALLOWED_PROJECT_ROOTS=${projectRoot}`,
+        `CODEX_APP_SERVER_WRITE_WORKSPACE_ROOT=${workspaceBaseRoot}`,
         `JOB_ROOT=${jobRoot}`,
         "DEFAULT_TIMEOUT_SEC=5",
         "MAX_TASK_CHARS=20000",
@@ -283,7 +291,7 @@ async function createEnvironment(options = {}) {
         await delay(100);
         await removeTestRoot(tempRoot, "routing fixture");
     }
-    return { tempRoot, pluginDir, jobRoot, projectRoot, workerPath, invoke, cleanup };
+    return { tempRoot, pluginDir, jobRoot, projectRoot, workspaceBaseRoot, workerPath, invoke, cleanup };
 }
 
 function metaPath(environment, jobId) {
@@ -831,6 +839,24 @@ test("strict patch flag enables only trimmed case-insensitive true", async () =>
     }
 });
 
+test("strict write flag enables only Codex write for trimmed case-insensitive true", async () => {
+    for (const writeFlag of [undefined, "", "false", "0", "1", "yes", " TRUE "]) {
+        const environment = await createEnvironment({
+            ...(writeFlag === undefined ? {} : { writeFlag })
+        });
+        try {
+            const worker = require(environment.workerPath);
+            assert.equal(
+                worker.isCodexAppServerWriteRoute("codex", "write"),
+                writeFlag === " TRUE ",
+                `writeFlag=${String(writeFlag)}`
+            );
+            assert.equal(worker.isCodexAppServerWriteRoute("codex", "analyze"), false);
+            assert.equal(worker.isCodexAppServerWriteRoute("opencode", "write"), false);
+        } finally { await environment.cleanup(); }
+    }
+});
+
 test("analyze and patch app-server flags are independent", async () => {
     for (const flags of [
         { flag: "true", patchFlag: "false", analyze: true, patch: false },
@@ -909,6 +935,94 @@ test("patch flag false preserves legacy while write and non-Codex patch remain l
             assert.equal(meta.executionBackend, "legacy-exec");
             assert.equal(meta.requestedExecutionBackend, undefined);
         }
+    } finally {
+        await environment.cleanup();
+    }
+});
+
+test("app-server write flag creates a validated retained candidate without changing the primary worktree", async () => {
+    const environment = await createEnvironment({ flag: "false", patchFlag: "false", writeFlag: "true", gitProject: true });
+    const replacement = "write-preview-candidate\n";
+    const baseHead = spawnSync("git", ["rev-parse", "HEAD"], {
+        cwd: environment.projectRoot, encoding: "utf8", windowsHide: true
+    }).stdout.trim();
+    const baseStatus = spawnSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+        cwd: environment.projectRoot, encoding: "utf8", windowsHide: true
+    }).stdout;
+    const baseContent = fs.readFileSync(path.join(environment.projectRoot, "tracked.txt"), "utf8");
+    try {
+        const before = resultOf(await environment.invoke({ command: "capabilities", responseMode: "compact" }));
+        assert.equal(before.codexAppServerWriteEnabled, true);
+        assert.equal(before.codexAppServerWriteConfigured, false);
+        assert.equal(before.codexAppServerWriteRuntimeAvailable, false);
+        assert.equal(before.codexAppServerStatus, "absent");
+
+        const response = await environment.invoke({
+            command: "run_and_wait",
+            worker: "codex",
+            mode: "write",
+            projectPath: environment.projectRoot,
+            task: `[[WRITE_TRACKED_BASE64=${Buffer.from(replacement, "utf8").toString("base64")}]]`,
+            fastMode: false,
+            validationProfile: "caller-profile-must-not-apply",
+            cwd: environment.projectRoot,
+            artifactPath: path.join(environment.projectRoot, "caller-artifact")
+        }, 30000);
+        assert.equal(response.status, "success", JSON.stringify(response));
+        const jobId = resultOf(response).jobId;
+        const meta = await waitForMeta(environment, jobId, true);
+        assert.equal(meta.state, "completed", JSON.stringify({ state: meta.state, errorCode: meta.errorCode }));
+        assert.equal(meta.jobKind, "write");
+        assert.equal(meta.executionBackend, "codex-app-server");
+        assert.equal(meta.validationProfile, "builtin-static-v1");
+        assert.equal(meta.validationPassed, true);
+        assert.equal(meta.candidateAvailable, true);
+        assert.equal(meta.fastMode, false);
+        assert.match(meta.resultCommit, /^[0-9a-f]{40,64}$/);
+        assert.equal(path.dirname(meta.worktreePath), fs.realpathSync.native(environment.workspaceBaseRoot));
+        assert.equal(fs.existsSync(meta.worktreePath), true);
+        assert.equal(spawnSync("git", ["rev-parse", "HEAD"], {
+            cwd: environment.projectRoot, encoding: "utf8", windowsHide: true
+        }).stdout.trim(), baseHead);
+        assert.equal(spawnSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+            cwd: environment.projectRoot, encoding: "utf8", windowsHide: true
+        }).stdout, baseStatus);
+        assert.equal(fs.readFileSync(path.join(environment.projectRoot, "tracked.txt"), "utf8"), baseContent);
+
+        const full = resultOf(await environment.invoke({
+            command: "query", jobId, wait: false, responseMode: "full"
+        }));
+        const compact = resultOf(await environment.invoke({
+            command: "query", jobId, wait: false, responseMode: "compact"
+        }));
+        for (const projected of [full, compact]) {
+            assert.equal(projected.state, "completed");
+            assert.equal(projected.candidateAvailable, true);
+            assert.equal(projected.baseRevision, baseHead);
+            assert.equal(projected.resultCommit, meta.resultCommit);
+            assert.equal(projected.worktreeRetained, true);
+            assert.equal(projected.worktreePath, meta.worktreePath);
+            assert.equal(projected.validation.passed, true);
+            assert.equal(projected.fastMode, false);
+            assert.deepEqual(projected.changedFiles, [{ status: "M", score: null, path: "tracked.txt", oldPath: null }]);
+            assert.equal(projected.output || "", "");
+            assert.equal(JSON.stringify(projected).includes("caller-profile-must-not-apply"), false);
+        }
+        const listed = resultOf(await environment.invoke({ command: "listJobs", limit: 10 }));
+        const listedWrite = listed.jobs.find(job => job.jobId === jobId);
+        assert.ok(listedWrite);
+        assert.equal(listedWrite.candidateAvailable, true);
+        assert.equal(listedWrite.resultCommit, meta.resultCommit);
+        assert.equal(listedWrite.worktreeRetained, true);
+        assert.equal(listedWrite.fastMode, false);
+
+        const after = resultOf(await environment.invoke({ command: "capabilities", responseMode: "compact" }));
+        assert.equal(after.codexAppServerWriteEnabled, true);
+        assert.equal(after.codexAppServerWriteConfigured, true);
+        assert.equal(after.codexAppServerWriteRuntimeAvailable, true);
+        assert.equal(after.codexAppServerWriteProtocolSupport, true);
+        assert.equal(after.codexAppServerWriteMaxConcurrency, 1);
+        assert.equal(after.appServerConcurrencyScope, "shared-analyze-patch-write");
     } finally {
         await environment.cleanup();
     }
@@ -1137,7 +1251,7 @@ test("capabilities observes without starting Sidecar and exposes both quotas", a
             assert.equal(result.codexAppServerPatchEnabled, fixture.patchFlag === "true");
             assert.equal(result.legacyMaxConcurrentJobs, 1);
             assert.equal(result.appServerMaxConcurrentJobs, 2);
-            assert.equal(result.appServerConcurrencyScope, "shared-analyze-patch");
+            assert.equal(result.appServerConcurrencyScope, "shared-analyze-patch-write");
             assert.equal(result.patchContractVersion, 1);
             assert.equal(result.patchMaxBytes, 524288);
             assert.equal(result.patchRepositoryPolicy, "clean-git-root");
@@ -1368,6 +1482,31 @@ function appServerPatchPrepared(worker, environment, task = "fixture patch task"
     return normalized.prepared;
 }
 
+function appServerWritePrepared(worker, environment, task = "fixture write task", extra = {}) {
+    const normalized = worker.normalizeRunRequest({
+        worker: "codex",
+        mode: "write",
+        projectPath: environment.projectRoot,
+        task,
+        ...extra
+    });
+    assert.equal(normalized.status, "success");
+    return normalized.prepared;
+}
+
+function fakeWriteClient(submitState = {}, behavior = {}) {
+    return {
+        submitWriteJob: async params => {
+            submitState.calls = (submitState.calls || 0) + 1;
+            submitState.params = params;
+            if (behavior.submitError) throw behavior.submitError;
+            return Object.prototype.hasOwnProperty.call(behavior, "response")
+                ? behavior.response
+                : { accepted: true };
+        }
+    };
+}
+
 function fakeAppServerClient(submitState = {}, behavior = {}) {
     return {
         inspectNoStart: async () => ({ status: "absent" }),
@@ -1416,6 +1555,182 @@ function jobMetaFiles(environment) {
     if (!fs.existsSync(directory)) return [];
     return fs.readdirSync(directory).filter(file => file.endsWith(".json") && !file.endsWith(".args.json"));
 }
+
+test("app-server write rejects old, unconfigured, and unknown submissions without legacy fallback", async () => {
+    const cases = [
+        ["old-sidecar", "AICW_APP_SERVER_WRITE_SIDECAR_UNSUPPORTED", "failed"],
+        ["not-configured", "AICW_APP_SERVER_WRITE_NOT_CONFIGURED", "failed"],
+        ["submission-unknown", "AICW_APP_SERVER_WRITE_SUBMISSION_UNKNOWN", "running"]
+    ];
+    for (const [label, code, expectedState] of cases) {
+        const environment = await createEnvironment({ writeFlag: "true", gitProject: true });
+        try {
+            const worker = require(environment.workerPath);
+            const prepared = appServerWritePrepared(worker, environment, `write rejection ${label}`, {
+                fastMode: false
+            });
+            const submitState = {};
+            const submitError = Object.assign(new Error(label), { code });
+            const response = await worker.cmdRunAppServerWrite(prepared, {
+                client: fakeWriteClient(submitState, { submitError })
+            });
+            assert.equal(response.status, "error", label);
+            assert.equal(response.errorCode, code, label);
+            assert.equal(response.state, expectedState, label);
+            assert.match(response.jobId, /^job_/);
+            assert.equal(submitState.calls, 1);
+            assert.equal(submitState.params.fastMode, undefined);
+            assert.equal(submitState.params.serviceTier, "default");
+            for (const forbidden of ["validationProfile", "command", "argv", "env", "cwd", "artifactPath", "metaPath", "outputPath"]) {
+                assert.equal(Object.prototype.hasOwnProperty.call(submitState.params, forbidden), false, `${label}:${forbidden}`);
+            }
+            const meta = readJson(metaPath(environment, response.jobId));
+            assert.equal(meta.state, expectedState, label);
+            assert.equal(meta.requestedExecutionBackend, "codex-app-server");
+            assert.notEqual(meta.executionBackend, "legacy-exec");
+            assert.equal(fs.existsSync(cleanupPaths(environment, response.jobId).argsPath), false);
+        } finally {
+            await environment.cleanup();
+        }
+    }
+});
+
+test("write submission unknown stays running and dead-instance reconciliation converges once", async () => {
+    const environment = await createEnvironment({ writeFlag: "true", gitProject: true });
+    try {
+        const worker = require(environment.workerPath);
+        const protocol = require(path.join(environment.pluginDir, "appserver", "protocol.js"));
+        const instanceId = "write-unknown-dead-instance";
+        const retainedWorktree = path.join(environment.workspaceBaseRoot, "retained-write-candidate");
+        fs.mkdirSync(retainedWorktree);
+        const submitState = { calls: 0 };
+        const response = await worker.cmdRunAppServerWrite(
+            appServerWritePrepared(worker, environment, "persist bound unknown write", { fastMode: false }),
+            {
+                client: {
+                    async submitWriteJob(params) {
+                        submitState.calls++;
+                        submitState.jobId = params.jobId;
+                        const current = readJson(metaPath(environment, params.jobId));
+                        protocol.writeJsonAtomic(metaPath(environment, params.jobId), {
+                            ...current,
+                            state: "running",
+                            submissionState: "submitting",
+                            executionBackend: "codex-app-server",
+                            sidecarInstanceId: instanceId,
+                            sidecarPid: 2147483647,
+                            jobPhase: "running",
+                            worktreePath: retainedWorktree,
+                            worktreeBranch: `vcp/aicw/${params.jobId}`,
+                            worktreeLockReason: `AICodeWorker write session ${params.jobId}`,
+                            worktreeLocked: true
+                        });
+                        throw Object.assign(new Error("response lost after submit"), { code: "SIDECAR_IPC_CLOSED" });
+                    }
+                }
+            }
+        );
+
+        assert.equal(response.status, "error");
+        assert.equal(response.state, "running");
+        assert.equal(response.submissionState, "unknown");
+        assert.equal(response.fallbackFrom, undefined);
+        assert.equal(submitState.calls, 1);
+        const unknownMeta = readJson(metaPath(environment, response.jobId));
+        assert.equal(unknownMeta.state, "running");
+        assert.equal(unknownMeta.jobPhase, "running");
+        assert.equal(unknownMeta.submissionState, "unknown");
+        assert.equal(unknownMeta.executionBackend, "codex-app-server");
+        assert.equal(unknownMeta.sidecarInstanceId, instanceId);
+        assert.equal(unknownMeta.worktreePath, retainedWorktree);
+        assert.equal(unknownMeta.worktreeLocked, true);
+        assert.equal(fs.existsSync(cleanupPaths(environment, response.jobId).argsPath), false);
+
+        const otherId = "job_write_unknown_other_instance";
+        const terminalId = "job_write_unknown_terminal";
+        fs.writeFileSync(metaPath(environment, otherId), JSON.stringify({
+            ...unknownMeta,
+            jobId: otherId,
+            sidecarInstanceId: "other-write-instance",
+            worktreePath: path.join(environment.workspaceBaseRoot, "other-retained")
+        }), "utf8");
+        fs.writeFileSync(metaPath(environment, terminalId), JSON.stringify({
+            ...unknownMeta,
+            jobId: terminalId,
+            state: "completed",
+            jobPhase: "completed",
+            submissionState: "accepted"
+        }), "utf8");
+
+        const first = await protocol.reconcileDeadSidecarJobs(environment.jobRoot, { instanceId });
+        assert.deepEqual(first, { reconciled: 1, complete: true, failures: [] });
+        const failedMeta = readJson(metaPath(environment, response.jobId));
+        assert.equal(failedMeta.state, "failed");
+        assert.equal(failedMeta.errorCode, "SIDECAR_PROCESS_EXITED");
+        assert.equal(failedMeta.worktreePath, retainedWorktree);
+        assert.equal(failedMeta.worktreeBranch, unknownMeta.worktreeBranch);
+        assert.equal(failedMeta.worktreeLockReason, unknownMeta.worktreeLockReason);
+        assert.equal(failedMeta.worktreeLocked, true);
+        assert.equal(fs.existsSync(retainedWorktree), true);
+        assert.deepEqual(
+            await protocol.reconcileDeadSidecarJobs(environment.jobRoot, { instanceId }),
+            { reconciled: 0, complete: true, failures: [] }
+        );
+        assert.equal(readJson(metaPath(environment, otherId)).state, "running");
+        assert.equal(readJson(metaPath(environment, terminalId)).state, "completed");
+        const query = await worker.cmdQuery({ jobId: response.jobId, wait: false });
+        assert.equal(query.state, "failed");
+        assert.equal(query.errorCode, "SIDECAR_PROCESS_EXITED");
+        assert.equal(submitState.calls, 1);
+    } finally {
+        await environment.cleanup();
+    }
+});
+
+test("write submission uncertainty does not rewrite concurrent accepted or terminal metadata", async () => {
+    const cases = [
+        { state: "running", submissionState: "accepted", jobPhase: "running", errorCode: null },
+        { state: "failed", submissionState: "unknown", jobPhase: "failed", errorCode: "SERVER_TERMINAL" }
+    ];
+    for (const fixture of cases) {
+        const environment = await createEnvironment({ writeFlag: "true", gitProject: true });
+        try {
+            const worker = require(environment.workerPath);
+            let persistedBytes;
+            let calls = 0;
+            const response = await worker.cmdRunAppServerWrite(
+                appServerWritePrepared(worker, environment, `confirmed ${fixture.state}`, { fastMode: false }),
+                {
+                    client: {
+                        async submitWriteJob(params) {
+                            calls++;
+                            const current = readJson(metaPath(environment, params.jobId));
+                            const confirmed = {
+                                ...current,
+                                ...fixture,
+                                executionBackend: "codex-app-server",
+                                sidecarInstanceId: "confirmed-write-instance",
+                                ...(fixture.state === "failed" ? {
+                                    completedAt: "2026-09-05T00:00:00.000Z",
+                                    exitCode: 1
+                                } : {})
+                            };
+                            persistedBytes = JSON.stringify(confirmed);
+                            fs.writeFileSync(metaPath(environment, params.jobId), persistedBytes, "utf8");
+                            throw Object.assign(new Error("late transport failure"), { code: "SIDECAR_IPC_CLOSED" });
+                        }
+                    }
+                }
+            );
+            assert.equal(response.state, fixture.state);
+            assert.equal(response.submissionState, fixture.submissionState);
+            assert.equal(calls, 1);
+            assert.equal(fs.readFileSync(metaPath(environment, response.jobId), "utf8"), persistedBytes);
+        } finally {
+            await environment.cleanup();
+        }
+    }
+});
 
 function assertCompactQuery(result) {
     for (const field of [
@@ -1998,7 +2313,7 @@ test("compact capabilities is a small routing-safe whitelist and full remains co
         const codex = compact.workers.find(worker => worker.name === "codex");
         assert.deepEqual(Object.keys(codex).sort(), [
             "available", "configuredReasoningEffort", "fastModeOmittedBehavior", "model", "modelSource", "name",
-            "reasoningEffortEffective", "reasoningEfforts", "supportsAppServerPatch",
+            "reasoningEffortEffective", "reasoningEfforts", "supportsAppServerPatch", "supportsAppServerWrite",
             "supportsPerTaskFastMode", "version"
         ].sort());
         assert.equal(codex.supportsPerTaskFastMode, true);
@@ -2010,7 +2325,7 @@ test("compact capabilities is a small routing-safe whitelist and full remains co
         assert.equal(compact.appServerMaxConcurrentJobs, 2);
         assert.equal(compact.codexAppServerAnalyzeEnabled, true);
         assert.equal(compact.codexAppServerPatchEnabled, true);
-        assert.equal(compact.appServerConcurrencyScope, "shared-analyze-patch");
+        assert.equal(compact.appServerConcurrencyScope, "shared-analyze-patch-write");
         assert.equal(compact.patchContractVersion, 1);
         assert.equal(compact.patchMaxBytes, 524288);
         assert.equal(compact.patchRepositoryPolicy, "clean-git-root");

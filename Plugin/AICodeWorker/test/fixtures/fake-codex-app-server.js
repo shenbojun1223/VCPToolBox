@@ -50,6 +50,11 @@ function finalText(text) {
     return match ? match[1] : `fake-final:${String(text || "")}`;
 }
 
+function requestedTrackedWrite(text) {
+    const match = String(text || "").match(/\[\[WRITE_TRACKED_BASE64=([A-Za-z0-9+/=]+)\]\]/);
+    return match ? Buffer.from(match[1], "base64").toString("utf8") : null;
+}
+
 function finishTurn(turn, status, omitJsonRpc = false) {
     if (turn.finished) return;
     turn.finished = true;
@@ -84,6 +89,8 @@ function emitResult(turn) {
     if (turn.finished) return;
     if (turn.failed) finishTurn(turn, "failed", turn.noJsonRpc);
     else {
+        const trackedWrite = requestedTrackedWrite(turn.text);
+        if (trackedWrite !== null) fs.writeFileSync(`${turn.cwd}/tracked.txt`, trackedWrite, "utf8");
         emitDelta(turn);
         finishTurn(turn, "completed", turn.noJsonRpc);
         const crashAfterCompleted = control(turn.text, "CRASH_AFTER_COMPLETED_MS");
@@ -110,6 +117,7 @@ function startTurn(request) {
         id: turnId,
         threadId,
         text,
+        cwd: request.params?.cwd,
         delta: finalText(text),
         timers: [],
         finished: false,

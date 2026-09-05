@@ -52,7 +52,7 @@ targetPath:「始」/app/VCPToolBox_new/Plugin/AICodeWorker/AICodeWorker.js「�
 
 - **analyze 模式**：只读分析代码结构、逻辑、bug，不修改任何文件
 - **patch 模式**：默认保持 legacy；可用独立且默认关闭的 app-server patch flag 生成、验证 unified diff 制品，始终需要人工审查与另行应用
-- **write 模式**：opencode 直接修改/新增文件，完成后输出变更摘要（可含删除操作）
+- **write 模式**：默认保持 legacy；Codex 可用独立且默认关闭的 app-server write flag，在隔离 Worktree 中生成并验证候选 commit，主工作树不会被自动修改
 - **同步/异步两种调用方式**：`run_and_wait` 直接等结果返回（日常首选）；`run` 立即返回 jobId 不等待，配合 `query`/`listJobs`/`cancel` 用于特别耗时的任务
 - **多 Worker**：默认 opencode（免费），复杂任务可点名 antigravity/agy（消耗 Gemini Pro 配额）
 
@@ -79,12 +79,19 @@ PROJECT_CONTEXT=
 FILE_SIZE_WARN_KB=200
 
 # ⚠️ legacy runner 并发上限（opencode、legacy Codex、antigravity共用），默认1。
-# app-server analyze/patch 另共享固定上限2；超限直接拒绝，不排队、不回退。
+# app-server analyze/patch/write 共享固定总上限2；write 另有串行上限1。
+# 超限直接拒绝，不排队、不回退；write 从创建 Worktree 起占位，uncertain/finalizationFailed 继续占位。
 MAX_CONCURRENT_JOBS=1
 
-# 两个 app-server flag 相互独立，只有严格的字符串 true 才启用；默认都关闭。
+# 三个 app-server flag 相互独立，只有严格的字符串 true 才启用；默认都关闭。
 ENABLE_CODEX_APP_SERVER_ANALYZE=false
 ENABLE_CODEX_APP_SERVER_PATCH=false
+ENABLE_CODEX_APP_SERVER_WRITE=false
+
+# write 还必须由 Sidecar 服务端独立确认：专用 Worktree 父目录与允许的真实 Git 仓库根。
+# 路径必须是已存在的绝对目录；多个允许根用逗号分隔。调用方不能覆盖这些值。
+CODEX_APP_SERVER_WRITE_WORKSPACE_ROOT=/srv/aicw-write-worktrees
+CODEX_APP_SERVER_WRITE_ALLOWED_PROJECT_ROOTS=/app/VCPToolBox_new,/app/myproject
 
 # 模型：BASE_URL/API_KEY 都留空 = 用 opencode 自带【免费】模型（不烧你的 token）。
 # 但 OPENCODE_MODEL 别留空（留空会回退到付费默认模型），填一个 opencode/ 开头的免费模型：
@@ -149,15 +156,14 @@ mode: analyze
 
 ## Codex app-server patch 安全契约
 
-`ENABLE_CODEX_APP_SERVER_PATCH=false` 是独立的默认值。它不会被
-`ENABLE_CODEX_APP_SERVER_ANALYZE` 隐式开启，反向也一样：
+`ENABLE_CODEX_APP_SERVER_PATCH=false` 是独立的默认值。它不会被 analyze/write flag
+隐式开启，反向也一样：
 
 - flag 关闭：`worker=codex, mode=patch` 完全保持 legacy 行为。
-- flag 开启：只有 `worker=codex, mode=patch` 走 app-server；非 Codex Worker 和
-  `mode=write` 始终 legacy。
+- flag 开启：只有 `worker=codex, mode=patch` 走 app-server；非 Codex Worker 不受影响。
 - app-server patch 第一版不接受 attachments 或 `sessionId`，不自动应用 patch，
-  更不开放 app-server write。
-- analyze 与 patch 共用 Sidecar 的 `maxConcurrency=2` 和 activeJobs 池。
+  也不会隐式开放 app-server write。
+- analyze、patch 与 write 共用 Sidecar 的 `maxConcurrency=2` 和 activeJobs 池。
 
 patch 路由还需要实际 Sidecar status 提供完整的正向 proof：
 `patchProtocolSupported=true`、`patchContractVersion=1`、`patchMaxBytes=524288`、
@@ -204,6 +210,40 @@ Monitor 不信任 meta 中自行写入的 `patchAvailable`；每次投影都会�
 > 对旧 Sidecar 做有界 shutdown，确认退出后再启动新实例。不要依赖 capabilities 自动启动、
 > 替换或热升级 Sidecar；无法从实际 status 证明 patch 协议时，能力值只能是 unknown/false。
 
+## Codex app-server Worktree Write Preview
+
+`ENABLE_CODEX_APP_SERVER_WRITE=false` 默认关闭。关闭时 `worker=codex, mode=write`
+保持既有 legacy 行为；开启后，只有实际 Sidecar status 同时证明 write protocol v1 且
+服务端配置可用，才走 app-server write。`capabilities` 仅观察当前状态，不启动、替换或
+重启 Sidecar，并分别报告：
+
+- `supportsAppServerWrite`：入口 flag 是否开启且实际协议/服务端配置均可用。
+- `codexAppServerWriteConfigured`：当前已连接 Sidecar 的服务端 roots、固定验证器与 profile
+  是否配置完整。
+- `codexAppServerWriteRuntimeAvailable`：当前 Sidecar 是否就绪且 write 配置可用。
+- `codexAppServerWriteProtocolSupport`：只表示实时 status 的协议 proof；旧 Sidecar 为 false。
+
+服务端不信任调用参数中的安全配置。它从插件配置独立读取并规范化允许的真实仓库根和专用
+Worktree 父目录；请求只能提交项目根、任务、模型、推理强度、Fast 三态与超时，不能指定
+shell、测试命令、验证 profile 正文、env、cwd 或制品路径。Worktree 路径和候选 ref 由
+服务端生成并锁定。
+
+内置固定验证 profile `builtin-static-v1` 会真实执行 `git diff --check HEAD --`，并对候选中
+变更的 JSON 执行 `JSON.parse`、对 `.js/.cjs/.mjs` 执行 `node --check`；它拒绝变更符号链接。
+这只是窄用途静态检查，不是项目测试，不会运行 `npm test` 或候选仓库脚本。通过后内核创建
+candidate commit；结果只表示可人工审查的候选，不表示主分支、主工作树或远端已被修改。
+
+write 串行上限为1，同时仍占用 Sidecar 的共享总额度2。占位从 Worktree 创建前开始；
+submission unknown 或 `finalizationFailed` 会保留占用，避免绕过串行。已选想运行 app-server
+write 后，旧 Sidecar、拒绝、失败、unknown 或最终化失败都不会回退 legacy，也不会重放
+validation/commit。继续用原 jobId 执行 `query`/`cancel`；full/compact、`listJobs` 和
+`run_and_wait` 沿用现有语义，并有限返回 baseRevision、resultCommit、changedFiles、validation
+摘要、Worktree 保留状态和脱敏错误。
+
+候选 Worktree/ref 默认保留供人工审查；本功能不 merge、不 push、不 cherry-pick，也不自动
+删除唯一候选产物。Worktree 只隔离 Git 工作区，不是 OS 安全边界；Codex 仍依赖
+`workspace-write` 沙箱、approval policy `never`、禁用网络和服务端路径门禁。
+
 
 ## Codex 逐任务 Fast mode
 
@@ -215,7 +255,7 @@ Monitor 不信任 meta 中自行写入的 `patchAvailable`；每次投影都会�
 | `false` | 请求将本 Job 档位覆盖为默认档（`serviceTier=default`） |
 | 不传或留空 | 继承 Codex `config.toml` / Profile 配置 |
 
-Legacy `codex exec` 与 app-server analyze/patch 两条执行链均支持。Fast mode 与
+Legacy `codex exec` 与 app-server analyze/patch/write 执行链均支持。Fast mode 与
 `reasoningEffort` 独立。显式覆盖是否可用、是否被后端采用取决于模型、计划、额度和
 服务容量；它可能增加额度消耗，但不保证加速。返回及 meta 中的 `fastMode` /
 `serviceTierOverride` 只记录请求的覆盖值，不表示后端实际采用的 tier。

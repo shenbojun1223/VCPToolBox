@@ -5,6 +5,13 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { TextDecoder } = require("node:util");
+const {
+    FILTER_CONFIG_QUERY_ARGS,
+    TRUSTED_GIT_CONFIG_ARGS,
+    resolveTrustedGitExecutable,
+    trustedGitEnvironment,
+    unsafeFilterConfigResult
+} = require("./trustedGitRuntime");
 const DEFAULT_TIMEOUT_MS = 10000;
 const MIN_TIMEOUT_MS = 250;
 const MAX_TIMEOUT_MS = 60000;
@@ -14,14 +21,6 @@ const MAX_OUTPUT_LIMIT_BYTES = 4 * 1024 * 1024;
 const SHA_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 const STATUS_SHA_RE = /^[0-9a-f]{64}$/i;
 const CANDIDATE_BRANCH_PREFIX = "vcp/aicw/";
-const CANDIDATE_IDENTITY_NAME = "VCP AICodeWorker";
-const CANDIDATE_IDENTITY_EMAIL = "aicodeworker@invalid.example";
-const CANDIDATE_GIT_CONFIG = Object.freeze([
-    "-c", "core.fsmonitor=false",
-    "-c", `core.hooksPath=${process.platform === "win32" ? "NUL" : "/dev/null"}`,
-    "-c", "commit.gpgSign=false",
-    "-c", "tag.gpgSign=false"
-]);
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const mutationGates = new Map();
 class GitWorktreeError extends Error {
@@ -163,35 +162,6 @@ function matchesExpectedIdentity(entry, expected, locked) {
         entry.branch === expected.branch && typeof entry.head === "string" &&
         entry.head.toLowerCase() === expected.head && entry.locked === locked &&
         (locked ? entry.lockReason === expected.lockReason : entry.lockReason === null);
-}
-function candidateGitEnvironment() {
-    const env = { ...process.env };
-    const blocked = new Set([
-        "EMAIL", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_ASKPASS", "GIT_AUTHOR_DATE",
-        "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_NAME", "GIT_COMMON_DIR", "GIT_CONFIG",
-        "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_SYSTEM", "GIT_DIR", "GIT_EDITOR", "GIT_EXTERNAL_DIFF", "GIT_INDEX_FILE",
-        "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY", "GIT_PREFIX", "GIT_QUARANTINE_PATH",
-        "GIT_REPLACE_REF_BASE", "GIT_SEQUENCE_EDITOR", "GIT_SHALLOW_FILE", "GIT_SSH", "GIT_SSH_COMMAND",
-        "GIT_WORK_TREE", "VISUAL", "EDITOR"
-    ]);
-    for (const key of Object.keys(env)) {
-        const upper = key.toUpperCase();
-        if (blocked.has(upper) || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(upper) ||
-            upper.startsWith("GIT_COMMITTER_")) {
-            delete env[key];
-        }
-    }
-    env.GIT_CONFIG_NOSYSTEM = "1";
-    env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
-    env.GIT_NO_REPLACE_OBJECTS = "1";
-    env.GIT_OPTIONAL_LOCKS = "0";
-    env.GIT_TERMINAL_PROMPT = "0";
-    env.GIT_AUTHOR_NAME = CANDIDATE_IDENTITY_NAME;
-    env.GIT_AUTHOR_EMAIL = CANDIDATE_IDENTITY_EMAIL;
-    env.GIT_COMMITTER_NAME = CANDIDATE_IDENTITY_NAME;
-    env.GIT_COMMITTER_EMAIL = CANDIDATE_IDENTITY_EMAIL;
-    return Object.freeze(env);
 }
 function strictGitPath(value) {
     const buffer = Buffer.from(value || "");
@@ -355,7 +325,7 @@ function runBoundedGit(request) {
         try {
             child = spawn(request.gitBin, request.args, {
                 cwd: request.cwd,
-                env: request.env || { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
+                env: request.env,
                 shell: false,
                 windowsHide: true,
                 stdio: ["ignore", "pipe", "pipe"]
@@ -378,6 +348,9 @@ class GitWorktreeAdapter {
     #timeoutMs;
     #outputLimitBytes;
     #trustedWorkspaceBaseRoot;
+    #gitExecutable;
+    #gitEnvironment;
+    #candidateGitEnvironment;
     constructor(options = {}) {
         if (Object.prototype.hasOwnProperty.call(options, "gitBin") ||
             Object.prototype.hasOwnProperty.call(options, "_spawnRunner")) {
@@ -393,15 +366,23 @@ class GitWorktreeAdapter {
         }
         this.#timeoutMs = timeoutMs;
         this.#outputLimitBytes = outputLimitBytes;
+        try {
+            this.#gitExecutable = resolveTrustedGitExecutable();
+        } catch {
+            fail("WORKTREE_GIT_UNAVAILABLE", "A trusted Git executable is unavailable");
+        }
+        this.#gitEnvironment = trustedGitEnvironment();
+        this.#candidateGitEnvironment = trustedGitEnvironment({ candidateIdentity: true });
         this.#trustedWorkspaceBaseRoot = options.workspaceBaseRoot == null
             ? null
             : trustedWorkspaceRoot(options.workspaceBaseRoot);
     }
     async #run(args, cwd, failureCode, failureMessage) {
         const request = Object.freeze({
-            gitBin: "git",
+            gitBin: this.#gitExecutable,
             cwd,
-            args: Object.freeze([...args]),
+            args: Object.freeze([...TRUSTED_GIT_CONFIG_ARGS, ...args]),
+            env: this.#gitEnvironment,
             timeoutMs: this.#timeoutMs,
             outputLimitBytes: this.#outputLimitBytes
         });
@@ -421,10 +402,10 @@ class GitWorktreeAdapter {
     }
     async #runCandidate(args, cwd, failureCode, failureMessage, acceptNonZero = false) {
         const request = Object.freeze({
-            gitBin: "git",
+            gitBin: this.#gitExecutable,
             cwd,
-            args: Object.freeze([...CANDIDATE_GIT_CONFIG, ...args]),
-            env: candidateGitEnvironment(),
+            args: Object.freeze([...TRUSTED_GIT_CONFIG_ARGS, ...args]),
+            env: this.#candidateGitEnvironment,
             timeoutMs: this.#timeoutMs,
             outputLimitBytes: this.#outputLimitBytes
         });
@@ -546,13 +527,13 @@ class GitWorktreeAdapter {
     }
     async #assertCandidateFiltersClosed(target) {
         const result = await this.#runCandidate(
-            ["config", "--includes", "--null", "--get-regexp", "^filter\\..*\\.(clean|smudge|process)$"],
+            FILTER_CONFIG_QUERY_ARGS,
             target, "WORKTREE_CANDIDATE_FILTER_UNSAFE", "Candidate filter configuration could not be verified", true
         );
         if (result.code !== 0 && result.code !== 1) {
             fail("WORKTREE_CANDIDATE_FILTER_UNSAFE", "Candidate filter configuration could not be verified");
         }
-        if (result.code === 0 || result.stdout.length !== 0) {
+        if (unsafeFilterConfigResult(result)) {
             fail("WORKTREE_CANDIDATE_FILTER_UNSAFE", "Candidate clean/smudge/process filters are not allowed");
         }
     }
@@ -567,7 +548,7 @@ class GitWorktreeAdapter {
     }
     async #candidateCachedRaw(target) {
         return (await this.#runCandidate(
-            ["diff", "--no-ext-diff", "--cached", "--raw", "-z", "--no-abbrev", "--"], target,
+            ["diff", "--no-ext-diff", "--no-textconv", "--cached", "--raw", "-z", "--no-abbrev", "--"], target,
             "WORKTREE_CANDIDATE_DIFF_FAILED", "Candidate staged diff could not be read"
         )).stdout;
     }
@@ -845,7 +826,7 @@ class GitWorktreeAdapter {
                 }
                 assertSupportedCandidateEntries(stagedEntries);
                 await this.#runCandidate(
-                    ["diff", "--no-ext-diff", "--cached", "--check", "--"], target,
+                    ["diff", "--no-ext-diff", "--no-textconv", "--cached", "--check", "--"], target,
                     "WORKTREE_CANDIDATE_DIFF_CHECK_FAILED", "Candidate staged diff failed validation"
                 );
                 const resultTree = await this.#candidateObjectId(
@@ -937,7 +918,7 @@ class GitWorktreeAdapter {
                     await this.#assertCandidateBaseStable(options.base, root);
                     const changedRaw = (await this.#runCandidate(
                         [
-                            "diff", "--no-ext-diff", "--raw", "-z", "--no-abbrev", "--find-renames",
+                            "diff", "--no-ext-diff", "--no-textconv", "--raw", "-z", "--no-abbrev", "--find-renames",
                             expected.head, resultCommit, "--"
                         ], root,
                         "WORKTREE_CANDIDATE_POST_VERIFY_FAILED", "Candidate changed paths could not be read"

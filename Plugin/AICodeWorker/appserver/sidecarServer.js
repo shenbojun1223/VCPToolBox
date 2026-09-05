@@ -9,6 +9,7 @@ const { CodexAppServerProcess } = require("./codexAppServerProcess");
 const { GitWorktreeAdapter } = require("./gitWorktreeAdapter");
 const { WorktreeWriteSession } = require("./worktreeWriteSession");
 const { TrustedValidationRunner } = require("./trustedValidationRunner");
+const { getWriteProtocolStatus } = require("./writeRuntimeConfig");
 const {
     SidecarError,
     runtimePaths,
@@ -49,6 +50,10 @@ const {
 
 const TERMINAL_STATES = new Set(["completed", "cancelled", "failed", "timeout"]);
 const SAFE_WRITE_VALIDATION_PROFILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const WRITE_REQUEST_FIELDS = new Set([
+    "jobId", "projectPath", "text", "model", "effort", "serviceTier", "timeoutSec",
+    "metaPath", "outputPath", "codexOutputPath"
+]);
 const UNCERTAIN_WRITE_CANDIDATE_CODES = new Set([
     "WORKTREE_CANDIDATE_OUTCOME_UNKNOWN",
     "WORKTREE_CANDIDATE_INDEX_ROLLBACK_UNCONFIRMED",
@@ -69,6 +74,45 @@ function safeValidationSteps(steps) {
         exitCode: Number.isInteger(step?.exitCode) ? step.exitCode : null,
         timedOut: step?.timedOut === true
     }));
+}
+
+function canonicalWriteRoots(values) {
+    if (!Array.isArray(values)) return [];
+    const roots = [];
+    for (const value of values) {
+        if (typeof value !== "string" || !path.isAbsolute(value)) return [];
+        try {
+            const resolved = path.resolve(value);
+            const stat = fs.lstatSync(resolved);
+            const realPath = fs.realpathSync.native(resolved);
+            if (!stat.isDirectory() || stat.isSymbolicLink() || realPath !== resolved) return [];
+            roots.push(realPath);
+        } catch {
+            return [];
+        }
+    }
+    return [...new Set(roots)];
+}
+
+function assertAllowedWriteProject(value, roots) {
+    const requested = assertAbsolutePath(value, "projectPath");
+    let stat;
+    let realPath;
+    try {
+        stat = fs.lstatSync(requested);
+        realPath = fs.realpathSync.native(requested);
+    } catch {
+        throw new SidecarError("AICW_WRITE_PROJECT_NOT_ALLOWED", "Write project path is unavailable");
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink() || realPath !== requested) {
+        throw new SidecarError("AICW_WRITE_PROJECT_NOT_ALLOWED", "Write project path is not canonical");
+    }
+    const allowed = roots.some(root => {
+        const relative = path.relative(root, realPath);
+        return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+    });
+    if (!allowed) throw new SidecarError("AICW_WRITE_PROJECT_NOT_ALLOWED", "Write project path is outside server allowed roots");
+    return realPath;
 }
 
 function validateServiceTierOverride(value) {
@@ -128,17 +172,26 @@ class SidecarServer extends EventEmitter {
         this.patchMonitorIntervalMs = Math.max(50, Number(options.patchMonitorIntervalMs || 500));
         this.patchArtifactHooks = options.patchArtifactHooks || {};
         this.patchMetaOptions = options.patchMetaOptions || {};
-        this._writeWorkspaceBaseRoot = options.writeWorkspaceBaseRoot ?? null;
+        this._writeEnabled = options.writeEnabled === true;
+        this._writeAllowedProjectRoots = canonicalWriteRoots(options.writeAllowedProjectRoots);
+        this._writeWorkspaceBaseRoot = this._writeEnabled ? options.writeWorkspaceBaseRoot ?? null : null;
         this._writeAdapter = this._writeWorkspaceBaseRoot === null
             ? null
             : new GitWorktreeAdapter({ workspaceBaseRoot: this._writeWorkspaceBaseRoot });
-        this._writeValidationRunner = options.writeValidationRunner instanceof TrustedValidationRunner
+        this._writeValidationRunner = this._writeEnabled && options.writeValidationRunner instanceof TrustedValidationRunner
             ? options.writeValidationRunner
             : null;
-        this._writeValidationProfile = typeof options.writeValidationProfile === "string" &&
+        this._writeValidationProfile = this._writeEnabled && typeof options.writeValidationProfile === "string" &&
             SAFE_WRITE_VALIDATION_PROFILE.test(options.writeValidationProfile)
             ? options.writeValidationProfile
             : null;
+        this._writeConfigured = Boolean(this._writeEnabled && this._writeAllowedProjectRoots.length > 0 &&
+            this._writeAdapter && this._writeValidationRunner && this._writeValidationProfile);
+        this._writeConfigurationErrorCode = this._writeConfigured
+            ? null
+            : this._writeEnabled
+                ? String(options.writeConfigurationErrorCode || "AICW_WRITE_CONFIGURATION_INVALID").slice(0, 64)
+                : null;
         this.activeJobs = new Map();
         this.seenJobs = new Set();
         this.sockets = new Set();
@@ -196,6 +249,10 @@ class SidecarServer extends EventEmitter {
             processStartedAt: new Date().toISOString(),
             processIdentity,
             ...getPatchProtocolProof(),
+            ...getWriteProtocolStatus({
+                configured: this._writeConfigured,
+                errorCode: this._writeConfigurationErrorCode
+            }),
             status: "starting",
             codexBin: this.codexBin,
             codexVersion: null,
@@ -323,6 +380,7 @@ class SidecarServer extends EventEmitter {
         if (method === "status") return this.status();
         if (method === "submitAnalyzeJob") return this._submitAnalyzeJob(params);
         if (method === "submitPatchJob") return this._submitPatchJob(params);
+        if (method === "submitWriteJob") return this._submitWriteJob(params);
         if (method === "cancel") return this._cancel(params);
         if (method === "shutdown") {
             setImmediate(() => { this.shutdown().catch(error => this.emit("protocolError", error)); });
@@ -342,21 +400,26 @@ class SidecarServer extends EventEmitter {
                 threadId: job.threadId,
                 turnId: job.turnId,
                 state: job.state,
+                kind: job.kind,
                 finalizationFailed: Boolean(job.finalizationFailed),
                 errorCode: job.finalizationError?.code || null
             })),
             maxConcurrency: this.maxConcurrency,
             serviceTierOverrideProtocolVersion: 1,
-            ...getPatchProtocolProof()
+            ...getPatchProtocolProof(),
+            ...getWriteProtocolStatus({
+                configured: this._writeConfigured,
+                errorCode: this._writeConfigurationErrorCode
+            })
         };
     }
 
     async _openWriteSession(params) {
-        if (!this._writeAdapter) {
+        if (!this._writeConfigured || !this._writeAdapter) {
             throw new SidecarError("AICW_WRITE_NOT_CONFIGURED", "Sidecar write sessions are not configured");
         }
         const jobId = assertJobId(params.jobId);
-        const projectPath = assertAbsolutePath(params.projectPath, "projectPath");
+        const projectPath = assertAllowedWriteProject(params.projectPath, this._writeAllowedProjectRoots);
         const session = new WorktreeWriteSession({
             adapter: this._writeAdapter,
             jobId,
@@ -368,7 +431,7 @@ class SidecarServer extends EventEmitter {
     }
 
     async _submitWriteJob(params) {
-        if (!this._writeAdapter || !this._writeValidationRunner || !this._writeValidationProfile) {
+        if (!this._writeConfigured || !this._writeAdapter || !this._writeValidationRunner || !this._writeValidationProfile) {
             throw new SidecarError("AICW_WRITE_NOT_CONFIGURED", "Sidecar write Jobs are not configured");
         }
         let plainParams = false;
@@ -379,13 +442,22 @@ class SidecarServer extends EventEmitter {
         if (!plainParams) {
             throw new SidecarError("AICW_WRITE_REQUEST_INVALID", "Write Job request must be a plain object");
         }
+        if (Object.keys(params).some(key => !WRITE_REQUEST_FIELDS.has(key))) {
+            throw new SidecarError("AICW_WRITE_REQUEST_INVALID", "Write Job request contains unsupported fields");
+        }
+        if (typeof params.jobId !== "string" || typeof params.projectPath !== "string" ||
+            typeof params.text !== "string" || params.text.length < 1 || params.text.length > 100_000 ||
+            (params.model !== undefined && (typeof params.model !== "string" || params.model.length > 128)) ||
+            (params.effort !== undefined && (typeof params.effort !== "string" || params.effort.length > 64))) {
+            throw new SidecarError("AICW_WRITE_REQUEST_INVALID", "Write Job request fields are invalid");
+        }
         if (this.draining || this.state?.status !== "ready") throw new SidecarError("SIDECAR_NOT_READY", "Sidecar is not ready");
         if ([...this.activeJobs.values()].some(job => job.kind === "write" && !job.terminal)) {
             throw new SidecarError("AICW_WRITE_CONCURRENCY_LIMIT", "Only one write Job may be active");
         }
         if (this.activeJobs.size >= this.maxConcurrency) throw new SidecarError("CONCURRENCY_LIMIT", "Sidecar concurrency limit reached");
         const jobId = assertJobId(params.jobId);
-        const projectPath = assertAbsolutePath(params.projectPath, "projectPath");
+        const projectPath = assertAllowedWriteProject(params.projectPath, this._writeAllowedProjectRoots);
         const serviceTier = validateServiceTierOverride(params.serviceTier);
         const timeoutSec = params.timeoutSec === undefined ? 600 : Number(params.timeoutSec);
         if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutSec > 86400) {
@@ -1152,6 +1224,7 @@ class SidecarServer extends EventEmitter {
 
     async _finalizeWrite(job) {
         try {
+            await job.session.verify();
             const validationStartedAt = new Date().toISOString();
             await this._updateWriteMeta(job, meta => {
                 meta.jobPhase = "validating";

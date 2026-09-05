@@ -14,6 +14,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { SidecarClient, hasOwnedChildTerminationProof } = require("./appserver/sidecarClient");
+const { isWriteProtocolProof } = require("./appserver/writeRuntimeConfig");
 const {
     SidecarError,
     withJobMetaLock,
@@ -69,6 +70,8 @@ function loadConfig() {
             String(raw.ENABLE_CODEX_APP_SERVER_ANALYZE || "").trim().toLowerCase() === "true",
         enableCodexAppServerPatch:
             String(raw.ENABLE_CODEX_APP_SERVER_PATCH || "").trim().toLowerCase() === "true",
+        enableCodexAppServerWrite:
+            String(raw.ENABLE_CODEX_APP_SERVER_WRITE || "").trim().toLowerCase() === "true",
         codexBin:          raw.CODEX_BIN            || "codex",
         codexModel:        raw.CODEX_MODEL          || "",
         codexProfile:      raw.CODEX_PROFILE        || "",
@@ -131,6 +134,12 @@ function isCodexAppServerAnalyzeRoute(worker, mode) {
     return CFG.enableCodexAppServerAnalyze &&
         String(worker || "").trim().toLowerCase() === "codex" &&
         String(mode || "").trim().toLowerCase() === "analyze";
+}
+
+function isCodexAppServerWriteRoute(worker, mode) {
+    return CFG.enableCodexAppServerWrite &&
+        String(worker || "").trim().toLowerCase() === "codex" &&
+        String(mode || "").trim().toLowerCase() === "write";
 }
 
 function safeErrorDetails(error) {
@@ -1563,8 +1572,11 @@ function buildTracePayload(jobId, meta, overrideMode = null) {
 function buildResult(jobId, meta, traceModeOverride = null) {
     const p = jobPaths(jobId);
     const artifactClass = classifyAppServerArtifactMeta(meta);
-    const patchProjection = buildPatchArtifactProjection(jobId, meta);
-    const canReadOutput = artifactClass === "legacy" || artifactClass === "analyze";
+    const writeJob = isAppServerWriteMeta(meta);
+    const artifactProjection = writeJob
+        ? buildWriteResultProjection(jobId, meta)
+        : buildPatchArtifactProjection(jobId, meta);
+    const canReadOutput = !writeJob && (artifactClass === "legacy" || artifactClass === "analyze");
 
     let output = "";
     // Codex 的 stdout 是 JSONL 事件流，直接从中提取报告会混入转义符和事件外壳。
@@ -1623,7 +1635,7 @@ function buildResult(jobId, meta, traceModeOverride = null) {
     const tracePayload = buildTracePayload(jobId, meta, traceModeOverride);
 
     return {
-        status:      "success",
+        status:      writeJob && ["unknown", "finalizationFailed"].includes(meta?.state) ? "error" : "success",
         jobId,
         state:       meta.state,
         exitCode:    meta.exitCode,
@@ -1661,7 +1673,7 @@ function buildResult(jobId, meta, traceModeOverride = null) {
         logSummary,
         outputFile: p.output,
         logFile:    p.log,
-        ...patchProjection,
+        ...artifactProjection,
         codexOutputFile: fs.existsSync(p.codexOutput) ? p.codexOutput : null,
         ...executionMetaPayload(meta),
         ...tracePayload,
@@ -1967,6 +1979,80 @@ function isAppServerPatchMeta(meta) {
     return classifyAppServerArtifactMeta(meta) === "patch";
 }
 
+function isAppServerWriteMeta(meta) {
+    return Boolean(meta && typeof meta === "object" && !Array.isArray(meta) &&
+        meta.mode === "write" && meta.jobKind === "write" &&
+        (meta.executionBackend === APP_SERVER_BACKEND || meta.requestedExecutionBackend === APP_SERVER_BACKEND));
+}
+
+function safeWriteHash(value) {
+    return /^[0-9a-f]{40,64}$/.test(String(value || "")) ? String(value) : null;
+}
+
+function safeWriteChangedFiles(value) {
+    if (!Array.isArray(value)) return [];
+    const allowedStatus = new Set(["A", "C", "D", "M", "R", "T", "U", "X", "B"]);
+    const safePath = candidate => {
+        if (typeof candidate !== "string" || candidate.length < 1 || candidate.length > 4096 ||
+            candidate.includes("\0") || path.isAbsolute(candidate)) return null;
+        const normalized = candidate.replace(/\\/g, "/");
+        if (normalized === ".." || normalized.startsWith("../") || normalized.includes("/../")) return null;
+        return normalized;
+    };
+    return value.slice(0, 256).map(entry => {
+        const changedPath = safePath(entry?.path);
+        const oldPath = entry?.oldPath === null || entry?.oldPath === undefined ? null : safePath(entry.oldPath);
+        const status = allowedStatus.has(entry?.status) ? entry.status : null;
+        if (!changedPath || !status || (entry?.oldPath != null && !oldPath)) return null;
+        return {
+            status,
+            score: Number.isInteger(entry?.score) && entry.score >= 0 && entry.score <= 100 ? entry.score : null,
+            path: changedPath,
+            oldPath
+        };
+    }).filter(Boolean);
+}
+
+function buildWriteResultProjection(jobId, meta) {
+    if (!isAppServerWriteMeta(meta)) return {};
+    const worktreePath = typeof meta.worktreePath === "string" && path.isAbsolute(meta.worktreePath) &&
+        path.basename(path.resolve(meta.worktreePath)) === jobId
+        ? path.resolve(meta.worktreePath)
+        : null;
+    const worktreeBranch = meta.worktreeBranch === `vcp/aicw/${jobId}` ? meta.worktreeBranch : null;
+    const worktreeRetained = Boolean(worktreePath && worktreeBranch && meta.worktreeLocked === true);
+    const baseRevision = safeWriteHash(meta.baseHead);
+    const resultCommit = safeWriteHash(meta.resultCommit);
+    const candidateAvailable = Boolean(meta.state === "completed" && meta.validationPassed === true &&
+        meta.candidateAvailable === true && baseRevision && resultCommit && worktreeRetained);
+    const validationSteps = Array.isArray(meta.validationSteps)
+        ? meta.validationSteps.slice(0, 64).map(step => ({
+            name: typeof step?.name === "string" ? step.name.slice(0, 64) : "unknown",
+            status: typeof step?.status === "string" ? step.status.slice(0, 32) : "unknown",
+            exitCode: Number.isInteger(step?.exitCode) ? step.exitCode : null,
+            timedOut: step?.timedOut === true
+        }))
+        : [];
+    return {
+        candidateAvailable,
+        baseRevision,
+        resultCommit: candidateAvailable ? resultCommit : null,
+        changedFiles: candidateAvailable ? safeWriteChangedFiles(meta.changedFiles) : [],
+        validation: {
+            profile: typeof meta.validationProfile === "string" ? meta.validationProfile.slice(0, 64) : null,
+            passed: meta.validationPassed === true,
+            steps: validationSteps
+        },
+        worktreeRetained,
+        worktreePath: worktreeRetained ? worktreePath : null,
+        worktreeBranch: worktreeRetained ? worktreeBranch : null,
+        worktreeLocked: worktreeRetained,
+        writeErrorCode: typeof meta.errorCode === "string" && /^[A-Z0-9_-]{1,64}$/.test(meta.errorCode)
+            ? meta.errorCode
+            : null
+    };
+}
+
 function buildPatchArtifactProjection(jobId, meta) {
     const artifactClass = classifyAppServerArtifactMeta(meta);
     if (artifactClass === "patch") {
@@ -2021,7 +2107,9 @@ function buildCompactQueryResult(jobId, meta, options = {}) {
     let summary = options.summary;
     if (summary === undefined) summary = readCompactSummary(jobId, meta);
     const result = {
-        status: "success",
+        status: isAppServerWriteMeta(meta) && ["unknown", "finalizationFailed"].includes(meta?.state)
+            ? "error"
+            : "success",
         jobId,
         state: meta?.state || "unknown",
         exitCode: meta?.exitCode ?? null,
@@ -2041,7 +2129,9 @@ function buildCompactQueryResult(jobId, meta, options = {}) {
         outputFile: p.output,
         codexOutputFile: fs.existsSync(p.codexOutput) ? p.codexOutput : null,
         logFile: p.log,
-        ...buildPatchArtifactProjection(jobId, meta),
+        ...(isAppServerWriteMeta(meta)
+            ? buildWriteResultProjection(jobId, meta)
+            : buildPatchArtifactProjection(jobId, meta)),
         ...executionMetaPayload(meta),
         traceAvailable: fs.existsSync(p.output)
     };
@@ -2068,14 +2158,18 @@ function compactCapabilitiesResult(full) {
                 reasoningEffortEffective: worker.reasoningEffortDefault || null,
                 supportsPerTaskFastMode: worker.supportsPerTaskFastMode === true,
                 fastModeOmittedBehavior: worker.fastModeOmittedBehavior || "inherit_codex_config",
-                supportsAppServerPatch: worker.supportsAppServerPatch === true
+                supportsAppServerPatch: worker.supportsAppServerPatch === true,
+                supportsAppServerWrite: worker.supportsAppServerWrite === true
             }
             : { name: worker?.name || "unknown", available: Boolean(worker?.available) }),
         codexAppServerAnalyzeEnabled: Boolean(full.codexAppServerAnalyzeEnabled),
         codexAppServerPatchEnabled: Boolean(full.codexAppServerPatchEnabled),
+        codexAppServerWriteEnabled: Boolean(full.codexAppServerWriteEnabled),
+        codexAppServerWriteConfigured: Boolean(full.codexAppServerWriteConfigured),
+        codexAppServerWriteRuntimeAvailable: Boolean(full.codexAppServerWriteRuntimeAvailable),
         legacyMaxConcurrentJobs: full.legacyMaxConcurrentJobs,
         appServerMaxConcurrentJobs: full.appServerMaxConcurrentJobs,
-        appServerConcurrencyScope: "shared-analyze-patch",
+        appServerConcurrencyScope: "shared-analyze-patch-write",
         codexAppServerStatus: full.codexAppServerStatus || "unknown",
         codexAppServerActiveJobs: Number(full.codexAppServerActiveJobs || 0),
         codexAppServerErrorCode: full.codexAppServerErrorCode || null,
@@ -2083,6 +2177,13 @@ function compactCapabilitiesResult(full) {
             full.codexAppServerPatchProtocolSupport === true
                 ? true
                 : full.codexAppServerPatchProtocolSupport || false,
+        codexAppServerWriteProtocolSupport:
+            full.codexAppServerWriteProtocolSupport === true
+                ? true
+                : full.codexAppServerWriteProtocolSupport || false,
+        codexAppServerWriteConfigurationErrorCode: full.codexAppServerWriteConfigurationErrorCode || null,
+        codexAppServerWriteMaxConcurrency: 1,
+        codexAppServerWriteValidationPolicy: full.codexAppServerWriteValidationPolicy || null,
         patchContractVersion: PATCH_CONTRACT_VERSION,
         patchMaxBytes: PATCH_MAX_BYTES,
         patchRepositoryPolicy: "clean-git-root",
@@ -2110,9 +2211,14 @@ async function cmdCapabilities(input = {}) {
         instanceId: null,
         pid: null,
         errorCode: null,
-        patchProtocolSupported: false
+        patchProtocolSupported: false,
+        writeProtocolSupported: false,
+        writeConfigured: false,
+        writeConfigurationErrorCode: null,
+        writeValidationPolicy: null
     };
-    const appServerConfigured = CFG.enableCodexAppServerAnalyze || CFG.enableCodexAppServerPatch;
+    const appServerConfigured = CFG.enableCodexAppServerAnalyze || CFG.enableCodexAppServerPatch ||
+        CFG.enableCodexAppServerWrite;
     if (appServerConfigured) {
         try {
             appServerInspection = await createSidecarClient().inspectNoStart();
@@ -2124,7 +2230,11 @@ async function cmdCapabilities(input = {}) {
                 instanceId: null,
                 pid: null,
                 errorCode: error?.code || "SIDECAR_INSPECTION_FAILED",
-                patchProtocolSupported: "unknown"
+                patchProtocolSupported: "unknown",
+                writeProtocolSupported: "unknown",
+                writeConfigured: false,
+                writeConfigurationErrorCode: null,
+                writeValidationPolicy: null
             };
         }
     }
@@ -2148,6 +2258,14 @@ async function cmdCapabilities(input = {}) {
         appServerInspection,
         CFG.enableCodexAppServerPatch
     );
+    const writeProtocolSupport = isWriteProtocolProof(appServerInspection)
+        ? true
+        : appServerInspection?.writeProtocolSupported === false
+            ? false
+            : CFG.enableCodexAppServerWrite ? "unknown" : false;
+    const writeConfigured = CFG.enableCodexAppServerWrite && writeProtocolSupport === true &&
+        appServerInspection.writeConfigured === true;
+    const writeRuntimeAvailable = writeConfigured && appServerInspection.status === "ready";
 
     const result = {
         status: "success",
@@ -2177,6 +2295,7 @@ async function cmdCapabilities(input = {}) {
                 supportsLegacyExec: true,
                 supportsAppServerAnalyze: CFG.enableCodexAppServerAnalyze,
                 supportsAppServerPatch: CFG.enableCodexAppServerPatch && patchProtocolSupport === true,
+                supportsAppServerWrite: writeRuntimeAvailable,
                 legacyMaxConcurrentJobs: CFG.maxConcurrentJobs,
                 appServerMaxConcurrentJobs: CFG.appServerMaxConcurrentJobs,
                 sandboxModes: [
@@ -2232,14 +2351,22 @@ async function cmdCapabilities(input = {}) {
         ],
         codexAppServerAnalyzeEnabled: CFG.enableCodexAppServerAnalyze,
         codexAppServerPatchEnabled: CFG.enableCodexAppServerPatch,
+        codexAppServerWriteEnabled: CFG.enableCodexAppServerWrite,
+        codexAppServerWriteConfigured: writeConfigured,
+        codexAppServerWriteRuntimeAvailable: writeRuntimeAvailable,
         legacyMaxConcurrentJobs: CFG.maxConcurrentJobs,
         appServerMaxConcurrentJobs: CFG.appServerMaxConcurrentJobs,
-        appServerConcurrencyScope: "shared-analyze-patch",
+        appServerConcurrencyScope: "shared-analyze-patch-write",
         patchContractVersion: PATCH_CONTRACT_VERSION,
         patchMaxBytes: PATCH_MAX_BYTES,
         patchRepositoryPolicy: "clean-git-root",
         patchOperations: ["modify-existing-tracked-file"],
         codexAppServerPatchProtocolSupport: patchProtocolSupport,
+        codexAppServerWriteProtocolSupport: writeProtocolSupport,
+        codexAppServerWriteConfigurationErrorCode: appServerInspection.writeConfigurationErrorCode || null,
+        codexAppServerWriteMaxConcurrency: 1,
+        codexAppServerWriteWorkspacePolicy: appServerInspection.writeWorkspacePolicy || null,
+        codexAppServerWriteValidationPolicy: appServerInspection.writeValidationPolicy || null,
         codexAppServerStatus: appServerConfigured
             ? (appServerInspection.status || "error")
             : "disabled",
@@ -2407,9 +2534,11 @@ function appServerSubmissionResult(jobId, meta) {
         warnings: artifactClass === "legacy" ? (meta?.warnings || []) : [],
         outputFile: p.output,
         logFile: p.log,
-        ...(artifactClass === "legacy"
-            ? { patchFile: null }
-            : buildPatchArtifactProjection(jobId, meta)),
+        ...(isAppServerWriteMeta(meta)
+            ? buildWriteResultProjection(jobId, meta)
+            : artifactClass === "legacy"
+                ? { patchFile: null }
+                : buildPatchArtifactProjection(jobId, meta)),
         codexOutputFile: fs.existsSync(p.codexOutput) ? p.codexOutput : null,
         ...executionMetaPayload(meta),
         message: `任务已提交。使用 query 命令查询进度：command=query, jobId=${jobId}`
@@ -2511,6 +2640,45 @@ function buildAppServerPatchMeta(jobId, p, prepared, projectPath, timeoutS) {
     };
 }
 
+function buildAppServerWriteMeta(jobId, p, prepared, projectPath, timeoutS) {
+    return {
+        jobId,
+        state: "running",
+        pid: null,
+        workerPid: null,
+        worker: "codex",
+        mode: "write",
+        jobKind: "write",
+        jobPhase: "prepared",
+        projectPath,
+        startedAt: new Date().toISOString(),
+        timeoutSec: timeoutS,
+        traceMode: prepared.normalizedTraceMode,
+        summaryHint: prepared.summaryHint || null,
+        warnings: [...preflightCheck(prepared.task, "write"), ...checkFileSizes(prepared.task)],
+        requestedExecutionBackend: APP_SERVER_BACKEND,
+        submissionState: "prepared",
+        validationPassed: false,
+        candidateAvailable: false,
+        metaRevision: 0,
+        exitCode: null,
+        completedAt: null,
+        codexModel: prepared.reasoningMetadata.codexModel,
+        codexModelSource: prepared.reasoningMetadata.codexModelSource,
+        reasoningEffort: prepared.reasoningMetadata.reasoningEffort,
+        reasoningEffortEffective: prepared.reasoningMetadata.reasoningEffortEffective,
+        reasoningEffortSource: prepared.reasoningMetadata.reasoningEffortSource,
+        reasoningEffortSupported: prepared.reasoningMetadata.reasoningEffortSupported,
+        modelDefaultReasoningEffort: prepared.reasoningMetadata.modelDefaultReasoningEffort,
+        configuredReasoningEffort: prepared.reasoningMetadata.configuredReasoningEffort,
+        fastMode: prepared.normalizedFastMode,
+        serviceTierOverride: prepared.serviceTierOverride,
+        output: p.output,
+        log: p.log,
+        codexOutput: p.codexOutput
+    };
+}
+
 function bestEffortRemoveAppServerInitFiles(paths, unlink = fs.unlinkSync) {
     for (const filePath of [paths.output, paths.log, paths.codexOutput]) {
         try { unlink(filePath); } catch {}
@@ -2526,12 +2694,17 @@ async function initializeAppServerJob(jobId, paths, meta, dependencies = {}) {
     const writeMeta = dependencies.writeJsonAtomic || writeJsonAtomic;
     const unlink = dependencies.unlinkSync || fs.unlinkSync;
     const patchJob = meta?.jobKind === "patch";
+    const writeJob = meta?.jobKind === "write";
     const initErrorCode = patchJob
         ? "AICW_APP_SERVER_PATCH_META_FAILED"
-        : "AICW_APP_SERVER_META_INIT_FAILED";
+        : writeJob
+            ? "AICW_APP_SERVER_WRITE_META_FAILED"
+            : "AICW_APP_SERVER_META_INIT_FAILED";
     const finalizationErrorCode = patchJob
         ? "AICW_APP_SERVER_PATCH_META_FINALIZATION_FAILED"
-        : "AICW_APP_SERVER_META_FINALIZATION_FAILED";
+        : writeJob
+            ? "AICW_APP_SERVER_WRITE_META_FINALIZATION_FAILED"
+            : "AICW_APP_SERVER_META_FINALIZATION_FAILED";
 
     return lock(CFG.jobRoot, jobId, async () => {
         createExclusive(paths.meta, meta);
@@ -3032,6 +3205,169 @@ async function cmdRunAppServerPatch(prepared, dependencies = {}) {
     return appServerSubmissionResult(jobId, readMeta(jobId) || meta);
 }
 
+function mapAppServerWriteSubmissionError(error) {
+    const code = String(error?.code || "");
+    if (code === "AICW_APP_SERVER_WRITE_SUBMISSION_UNKNOWN" || APP_SERVER_UNKNOWN_SUBMISSION_CODES.has(code)) {
+        return {
+            errorCode: "AICW_APP_SERVER_WRITE_SUBMISSION_UNKNOWN",
+            state: "running",
+            submissionState: "unknown",
+            message: "Codex app-server write 提交结果未知；已保留原 jobId，禁止回退或重放。"
+        };
+    }
+    const mapped = new Map([
+        ["AICW_APP_SERVER_WRITE_SIDECAR_UNSUPPORTED", "AICW_APP_SERVER_WRITE_SIDECAR_UNSUPPORTED"],
+        ["AICW_APP_SERVER_WRITE_NOT_CONFIGURED", "AICW_APP_SERVER_WRITE_NOT_CONFIGURED"],
+        ["AICW_WRITE_NOT_CONFIGURED", "AICW_APP_SERVER_WRITE_NOT_CONFIGURED"],
+        ["AICW_WRITE_CONCURRENCY_LIMIT", "AICW_APP_SERVER_WRITE_CONCURRENCY_LIMIT"],
+        ["CONCURRENCY_LIMIT", "AICW_APP_SERVER_WRITE_CONCURRENCY_LIMIT"],
+        ["AICW_WRITE_PROJECT_NOT_ALLOWED", "AICW_APP_SERVER_WRITE_PROJECT_NOT_ALLOWED"],
+        ["AICW_WRITE_REQUEST_INVALID", "AICW_APP_SERVER_WRITE_REQUEST_INVALID"],
+        ["AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED", "AICW_SERVICE_TIER_SIDECAR_UNSUPPORTED"]
+    ]).get(code) || "AICW_APP_SERVER_WRITE_SUBMISSION_REJECTED";
+    return {
+        errorCode: mapped,
+        state: "failed",
+        submissionState: "rejected",
+        message: "Codex app-server write 被拒绝；未修改主工作区，也未回退到 legacy。"
+    };
+}
+
+async function cmdRunAppServerWrite(prepared, dependencies = {}) {
+    if (!CFG.enableCodexAppServerWrite) {
+        return appServerErrorResult(null, {
+            error: "Codex app-server write 未启用。",
+            errorCode: "AICW_APP_SERVER_WRITE_UNAVAILABLE"
+        });
+    }
+    if (!CFG.enableCodex) {
+        return appServerErrorResult(null, {
+            error: "Codex 已被禁用（ENABLE_CODEX=false）。",
+            errorCode: "AICW_APP_SERVER_WRITE_UNAVAILABLE"
+        });
+    }
+    if (prepared.sessionId) {
+        return appServerErrorResult(null, {
+            error: "Codex app-server write 不接受 sessionId。",
+            errorCode: "AICW_APP_SERVER_WRITE_SESSION_UNSUPPORTED"
+        });
+    }
+    if (prepared.attachments.length > 0) {
+        return appServerErrorResult(null, {
+            error: "Codex app-server write 不支持附件。",
+            errorCode: "AICW_APP_SERVER_WRITE_ATTACHMENTS_UNSUPPORTED"
+        });
+    }
+
+    const client = dependencies.client || createSidecarClient();
+    ensureJobDirs();
+    const timeoutS = Number(prepared.timeoutSec) || CFG.defaultTimeout;
+    const projectPath = path.resolve(prepared.projectPath);
+    let jobId;
+    let p;
+    let meta;
+    let initialized;
+
+    for (let attempt = 0; attempt < 8 && !initialized; attempt++) {
+        jobId = generateJobId();
+        p = jobPaths(jobId);
+        meta = buildAppServerWriteMeta(jobId, p, prepared, projectPath, timeoutS);
+        try {
+            initialized = await initializeAppServerJob(jobId, p, meta, dependencies);
+            if (initialized.status === "failed" || initialized.status === "finalization-failed") break;
+        } catch (error) {
+            if (error?.code === "META_ALREADY_EXISTS" && attempt < 7) continue;
+            return appServerErrorResult(error, {
+                error: "Codex app-server write 元数据创建失败。",
+                errorCode: error?.code === "META_CREATE_FINALIZATION_FAILED"
+                    ? "AICW_APP_SERVER_WRITE_META_FINALIZATION_FAILED"
+                    : "AICW_APP_SERVER_WRITE_META_FAILED",
+                jobId,
+                state: error?.code === "META_CREATE_FINALIZATION_FAILED" ? "unknown" : "failed"
+            });
+        }
+    }
+
+    if (!initialized || initialized.status === "failed" || initialized.status === "finalization-failed") {
+        return appServerErrorResult(initialized?.terminalError || initialized?.error, {
+            error: initialized?.status === "finalization-failed"
+                ? "Codex app-server write 元数据终态无法可靠落盘。"
+                : "Codex app-server write 元数据初始化失败。",
+            errorCode: initialized?.status === "finalization-failed"
+                ? "AICW_APP_SERVER_WRITE_META_FINALIZATION_FAILED"
+                : "AICW_APP_SERVER_WRITE_META_FAILED",
+            jobId,
+            state: initialized?.status === "finalization-failed" ? "unknown" : "failed",
+            submissionState: "rejected"
+        });
+    }
+    meta = initialized.meta;
+
+    const submissionAlreadyConfirmed = value => TERMINAL_STATES.has(value?.state) ||
+        (value?.submissionState === "accepted" && value?.state === "running");
+    const persistOutcome = async outcome => updateAppServerMeta(jobId, p.meta, readMeta(jobId) || meta, value => {
+        if (submissionAlreadyConfirmed(value)) return undefined;
+        value.state = outcome.state;
+        value.jobPhase = outcome.state;
+        value.submissionState = outcome.submissionState;
+        value.validationPassed = false;
+        value.candidateAvailable = false;
+        value.errorCode = outcome.errorCode;
+        value.exitCode = outcome.state === "failed" ? 1 : null;
+        if (outcome.state === "failed") value.completedAt = new Date().toISOString();
+        return value;
+    });
+
+    let submitted;
+    try {
+        submitted = await client.submitWriteJob({
+            jobId,
+            projectPath,
+            text: wrapTask(prepared.task, "write"),
+            timeoutSec: timeoutS,
+            model: prepared.codexCapabilities?.model || undefined,
+            effort: prepared.normalizedReasoningEffort || undefined,
+            ...(prepared.serviceTierOverride ? { serviceTier: prepared.serviceTierOverride } : {})
+        });
+    } catch (error) {
+        const current = readMeta(jobId) || meta;
+        if (submissionAlreadyConfirmed(current)) {
+            return appServerSubmissionResult(jobId, current);
+        }
+        const outcome = mapAppServerWriteSubmissionError(error);
+        const persisted = await persistOutcome(outcome);
+        if (outcome.state === "running" && submissionAlreadyConfirmed(persisted)) {
+            return appServerSubmissionResult(jobId, persisted);
+        }
+        return appServerErrorResult(error, {
+            error: outcome.message,
+            errorCode: outcome.errorCode,
+            jobId,
+            state: persisted?.state || outcome.state,
+            submissionState: persisted?.submissionState || outcome.submissionState
+        });
+    }
+
+    if (!submitted || typeof submitted !== "object" || Array.isArray(submitted) || submitted.accepted !== true) {
+        const invalid = new SidecarError("INVALID_SIDECAR_RESPONSE", "Sidecar write response is not a confirmed acceptance");
+        const current = readMeta(jobId) || meta;
+        if (submissionAlreadyConfirmed(current)) return appServerSubmissionResult(jobId, current);
+        const outcome = mapAppServerWriteSubmissionError(invalid);
+        const persisted = await persistOutcome(outcome);
+        if (outcome.state === "running" && submissionAlreadyConfirmed(persisted)) {
+            return appServerSubmissionResult(jobId, persisted);
+        }
+        return appServerErrorResult(invalid, {
+            error: outcome.message,
+            errorCode: outcome.errorCode,
+            jobId,
+            state: persisted?.state || outcome.state,
+            submissionState: persisted?.submissionState || outcome.submissionState
+        });
+    }
+    return appServerSubmissionResult(jobId, readMeta(jobId) || meta);
+}
+
 async function cmdRun(input) {
     const normalized = normalizeRunRequest(input);
     if (normalized.status === "error") return normalized;
@@ -3047,6 +3383,9 @@ async function cmdRun(input) {
     }
     if (isCodexAppServerPatchRoute(prepared.worker, prepared.mode)) {
         return cmdRunAppServerPatch(prepared);
+    }
+    if (isCodexAppServerWriteRoute(prepared.worker, prepared.mode)) {
+        return cmdRunAppServerWrite(prepared);
     }
     return cmdRunLegacy(prepared);
 }
@@ -3561,7 +3900,12 @@ async function cmdQuery(input) {
             hint: shouldWait
                 ? "任务仍在运行，请再调用一次 query；也可用 command=trace 即时查看已有执行轨迹。"
                 : "任务仍在运行。本次 wait=false，已立即返回当前状态与已有轨迹。",
-            ...(classifyAppServerArtifactMeta(meta) === "legacy" ? {} : buildPatchArtifactProjection(jobId, meta)),
+            ...(isAppServerWriteMeta(meta)
+                ? buildWriteResultProjection(jobId, meta)
+                : classifyAppServerArtifactMeta(meta) === "legacy"
+                    ? {}
+                    : buildPatchArtifactProjection(jobId, meta)),
+            ...executionMetaPayload(meta),
             ...buildTracePayload(jobId, meta, traceModeOverride)
         };
     }
@@ -3668,7 +4012,10 @@ async function cmdListJobs(input) {
             const artifactClass = classifyAppServerArtifactMeta(m);
             if (m?.jobId !== metaFileJobId) continue;
             m = checkAndMarkDead(m, metaFileJobId, "listJobs");
-            const patchProjection = artifactClass === "legacy"
+            const writeProjection = isAppServerWriteMeta(m)
+                ? buildWriteResultProjection(metaFileJobId, m)
+                : null;
+            const patchProjection = (writeProjection || artifactClass === "legacy")
                 ? null
                 : buildPatchArtifactProjection(metaFileJobId, m);
             jobs.push({
@@ -3684,6 +4031,7 @@ async function cmdListJobs(input) {
                     patchBytes: patchProjection.patchBytes,
                     patchFileCount: patchProjection.patchFileCount
                 } : {}),
+                ...(writeProjection || {}),
                 startedAt: m.startedAt, completedAt: m.completedAt, exitCode: m.exitCode,
                 traceMode: m.traceMode || CFG.defaultTraceMode,
                 codexModel: m.codexModel || null,
@@ -3895,6 +4243,8 @@ module.exports = {
     isAppServerPatchMeta,
     isCodexAppServerAnalyzeRoute,
     isCodexAppServerPatchRoute,
+    isCodexAppServerWriteRoute,
+    isAppServerWriteMeta,
     shouldFallbackToLegacyBeforeJob,
     parseAppServerExecutionTrace,
     buildTracePayload,
@@ -3903,6 +4253,7 @@ module.exports = {
     isMachineCompactSummaryLine,
     readCompactSummary,
     buildPatchArtifactProjection,
+    buildWriteResultProjection,
     buildCompactQueryResult,
     compactCapabilitiesResult,
     cleanupOldJobs,
@@ -3912,6 +4263,7 @@ module.exports = {
     initializeAppServerJob,
     cmdRunAppServerAnalyze,
     cmdRunAppServerPatch,
+    cmdRunAppServerWrite,
     cmdCapabilities,
     cmdRun,
     cmdRunAndWait,

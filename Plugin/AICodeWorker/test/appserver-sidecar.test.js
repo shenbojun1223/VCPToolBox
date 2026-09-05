@@ -40,6 +40,7 @@ const { JsonLineRpcConnection } = require("../appserver/jsonLineRpcConnection");
 const { SidecarServer } = require("../appserver/sidecarServer");
 const { parseWorktreeListPorcelainZ } = require("../appserver/gitWorktreeAdapter");
 const { TrustedValidationRunner } = require("../appserver/trustedValidationRunner");
+const { getWriteProtocolStatus } = require("../appserver/writeRuntimeConfig");
 
 const fixturePath = path.join(__dirname, "fixtures", "fake-codex-app-server.js");
 const entryPath = path.join(__dirname, "..", "appserver", "sidecar-entry.js");
@@ -401,7 +402,7 @@ async function createEnvironment(options = {}) {
     return environment;
 }
 
-async function createDormantWriteEnvironment(expectedContent = "write-approved\n") {
+async function createDormantWriteEnvironment(expectedContent = "write-approved\n", options = {}) {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vcp-aicodeworker-dormant-write-"));
     const pluginDir = path.join(tempRoot, "plugin");
     const jobRoot = path.join(tempRoot, "jobs");
@@ -414,7 +415,9 @@ async function createDormantWriteEnvironment(expectedContent = "write-approved\n
     initializeGitProject(projectRoot, { "tracked.txt": "base-value\n" });
     const canonicalProjectRoot = fs.realpathSync.native(projectRoot);
     const canonicalWorkspaceBaseRoot = fs.realpathSync.native(workspaceBaseRoot);
-    const validationScript = `const fs=require("node:fs");process.exit(fs.readFileSync("tracked.txt","utf8")===${JSON.stringify(expectedContent)}?0:1)`;
+    const validationScript = typeof options.validationScriptFactory === "function"
+        ? options.validationScriptFactory(tempRoot)
+        : `const fs=require("node:fs");process.exit(fs.readFileSync("tracked.txt","utf8")===${JSON.stringify(expectedContent)}?0:1)`;
     assert.equal(/[\r\n]/.test(validationScript), false);
     const validationRunner = new TrustedValidationRunner({
         profiles: {
@@ -440,6 +443,8 @@ async function createDormantWriteEnvironment(expectedContent = "write-approved\n
         ],
         maxConcurrency: 2,
         requestTimeoutMs: 5000,
+        writeEnabled: true,
+        writeAllowedProjectRoots: [canonicalProjectRoot],
         writeWorkspaceBaseRoot: canonicalWorkspaceBaseRoot,
         writeValidationRunner: validationRunner,
         writeValidationProfile: "write-check"
@@ -456,13 +461,14 @@ async function createDormantWriteEnvironment(expectedContent = "write-approved\n
         createWriteMeta(jobId) {
             return createMeta(jobRoot, jobId);
         },
-        submitWrite(jobId, text, paths) {
+        submitWrite(jobId, text, paths, options = {}) {
             return server._submitWriteJob({
                 jobId,
                 projectPath: canonicalProjectRoot,
                 text,
                 model: "gpt-5-codex",
                 effort: "high",
+                ...options,
                 metaPath: paths.metaPath,
                 outputPath: paths.outputPath,
                 codexOutputPath: paths.codexOutputPath
@@ -699,10 +705,14 @@ test("Sidecar status returns the exact patch protocol proof", async () => {
         assert.equal(status.pid, process.pid);
         assert.equal(status.codexPid, null);
         assert.ok(Array.isArray(status.activeJobs));
+        assert.equal(status.writeProtocolSupported, true);
+        assert.equal(status.writeProtocolVersion, 1);
+        assert.equal(status.writeConfigured, false);
+        assert.equal(status.writeMaxConcurrency, 1);
     } finally { await environment.close(); }
 });
 
-test("Sidecar write session primitive stays dormant when unconfigured", async () => {
+test("Sidecar write RPC stays fail-closed when server write is unconfigured", async () => {
     const environment = await createEnvironment({ gitProject: true });
     const server = new SidecarServer({ pluginDir: environment.pluginDir, jobRoot: environment.jobRoot });
     const beforeWorktrees = gitFixture(environment.projectRoot, ["worktree", "list", "--porcelain", "-z"]);
@@ -713,7 +723,7 @@ test("Sidecar write session primitive stays dormant when unconfigured", async ()
         );
         await assert.rejects(
             server._dispatch("submitWriteJob", { jobId: "write_unconfigured", projectPath: environment.projectRoot }),
-            error => error instanceof SidecarError && error.code === "UNKNOWN_METHOD"
+            error => error instanceof SidecarError && error.code === "AICW_WRITE_NOT_CONFIGURED"
         );
         assert.equal(
             gitFixture(environment.projectRoot, ["worktree", "list", "--porcelain", "-z"]),
@@ -728,10 +738,27 @@ test("Sidecar opens and holds a configured Worktree write session", async () => 
     const workspaceBaseRoot = path.join(environment.tempRoot, "write-workspaces");
     fs.mkdirSync(workspaceBaseRoot, { recursive: true });
     const canonicalWorkspaceBaseRoot = fs.realpathSync.native(workspaceBaseRoot);
+    const validationRunner = new TrustedValidationRunner({
+        profiles: {
+            "write-check": {
+                steps: [{
+                    name: "test-check",
+                    display: "Test-only write check",
+                    executable: fs.realpathSync.native(process.execPath),
+                    args: ["-e", "process.exit(0)"],
+                    timeoutMs: 5000
+                }]
+            }
+        }
+    });
     const server = new SidecarServer({
         pluginDir: environment.pluginDir,
         jobRoot: environment.jobRoot,
-        writeWorkspaceBaseRoot: canonicalWorkspaceBaseRoot
+        writeEnabled: true,
+        writeAllowedProjectRoots: [environment.projectRoot],
+        writeWorkspaceBaseRoot: canonicalWorkspaceBaseRoot,
+        writeValidationRunner: validationRunner,
+        writeValidationProfile: "write-check"
     });
     const jobId = "write_configured";
     const primaryHead = gitFixture(environment.projectRoot, ["rev-parse", "HEAD"]);
@@ -783,7 +810,7 @@ test("Sidecar opens and holds a configured Worktree write session", async () => 
     assert.equal(fs.existsSync(environment.tempRoot), false);
 });
 
-test("dormant write submission stays internal and fail-closed", async () => {
+test("write submission RPC is exposed and rejects invalid requests before side effects", async () => {
     const environment = await createDormantWriteEnvironment();
     const jobId = "write_internal_only";
     const paths = environment.createWriteMeta(jobId);
@@ -797,7 +824,17 @@ test("dormant write submission stays internal and fail-closed", async () => {
     try {
         await assert.rejects(
             environment.server._dispatch("submitWriteJob", { jobId }),
-            error => error instanceof SidecarError && error.code === "UNKNOWN_METHOD"
+            error => error instanceof SidecarError && error.code === "AICW_WRITE_REQUEST_INVALID"
+        );
+        await assert.rejects(
+            environment.server._dispatch("submitWriteJob", {
+                jobId,
+                projectPath: environment.projectRoot,
+                text: "forbidden overrides",
+                validationProfile: "caller-profile",
+                cwd: environment.projectRoot
+            }),
+            error => error instanceof SidecarError && error.code === "AICW_WRITE_REQUEST_INVALID"
         );
         await assert.rejects(
             unconfigured._submitWriteJob({ jobId, projectPath: environment.projectRoot }),
@@ -1045,6 +1082,42 @@ test("dormant write validation failure retains locked Worktree without candidate
     }
 });
 
+test("write identity drift fails before the validation process starts", async () => {
+    let validationMarker;
+    const environment = await createDormantWriteEnvironment("unused\n", {
+        validationScriptFactory(tempRoot) {
+            validationMarker = path.join(tempRoot, "validation-runner-started.txt");
+            return `require("node:fs").writeFileSync(${JSON.stringify(validationMarker)},"started")`;
+        }
+    });
+    const jobId = "write_identity_drift_before_validation";
+    const paths = environment.createWriteMeta(jobId);
+    try {
+        const submission = environment.submitWrite(jobId, "[[DELAY_MS=1200]]", paths);
+        await waitFor(() => Boolean(readJsonOrNull(paths.metaPath)?.worktreePath));
+        const worktreePath = readJsonOrNull(paths.metaPath).worktreePath;
+        gitFixture(environment.projectRoot, ["worktree", "unlock", worktreePath]);
+        gitFixture(environment.projectRoot, [
+            "worktree", "lock", "--reason", "fixture identity drift", worktreePath
+        ]);
+        await submission;
+        await waitFor(() => readJsonOrNull(paths.metaPath)?.state === "failed", 10000);
+        const meta = readJsonOrNull(paths.metaPath);
+        assert.equal(meta.errorCode, "WORKTREE_SESSION_IDENTITY_MISMATCH");
+        assert.equal(meta.validationPassed, false);
+        assert.equal(meta.candidateAvailable, false);
+        assert.equal(Object.prototype.hasOwnProperty.call(meta, "validationStartedAt"), false);
+        assert.equal(fs.existsSync(validationMarker), false, "validation runner start count must remain zero");
+        assert.equal(fs.existsSync(worktreePath), true);
+        const official = environment.worktrees().find(entry => path.resolve(entry.path) === path.resolve(worktreePath));
+        assert.ok(official);
+        assert.equal(official.locked, true);
+        assert.equal(official.lockReason, "fixture identity drift");
+    } finally {
+        await environment.close();
+    }
+});
+
 test("second dormant write is rejected before meta Worktree or RPC side effects", async () => {
     const expectedContent = "write-approved\n";
     const environment = await createDormantWriteEnvironment(expectedContent);
@@ -1070,6 +1143,49 @@ test("second dormant write is rejected before meta Worktree or RPC side effects"
         await firstSubmission;
         await waitFor(() => readJsonOrNull(firstPaths.metaPath)?.state === "completed", 10000);
         assert.equal(readJsonOrNull(firstPaths.metaPath).candidateAvailable, true);
+    } finally {
+        await environment.close();
+    }
+});
+
+test("write cancel retains the locked Worktree and does not create a candidate", async () => {
+    const environment = await createDormantWriteEnvironment();
+    const jobId = "write_cancel_retained";
+    const paths = environment.createWriteMeta(jobId);
+    try {
+        const submission = await environment.submitWrite(jobId, "[[DELAY_MS=5000]]", paths);
+        assert.equal(submission.accepted, true);
+        await waitFor(() => Boolean(readJsonOrNull(paths.metaPath)?.worktreePath));
+        await environment.server._cancel({ jobId });
+        await waitFor(() => readJsonOrNull(paths.metaPath)?.state === "cancelled", 10000);
+        const meta = readJsonOrNull(paths.metaPath);
+        assert.equal(meta.candidateAvailable, false);
+        assert.equal(meta.validationPassed, false);
+        assert.equal(Object.prototype.hasOwnProperty.call(meta, "resultCommit"), false);
+        assert.equal(fs.existsSync(meta.worktreePath), true);
+        const official = environment.worktrees().find(entry => path.resolve(entry.path) === path.resolve(meta.worktreePath));
+        assert.ok(official);
+        assert.equal(official.locked, true);
+    } finally {
+        await environment.close();
+    }
+});
+
+test("write timeout retains the locked Worktree and does not create a candidate", async () => {
+    const environment = await createDormantWriteEnvironment();
+    const jobId = "write_timeout_retained";
+    const paths = environment.createWriteMeta(jobId);
+    try {
+        await environment.submitWrite(jobId, "[[DELAY_MS=5000]]", paths, { timeoutSec: 0.1 });
+        await waitFor(() => readJsonOrNull(paths.metaPath)?.state === "timeout", 10000);
+        const meta = readJsonOrNull(paths.metaPath);
+        assert.equal(meta.candidateAvailable, false);
+        assert.equal(meta.validationPassed, false);
+        assert.equal(Object.prototype.hasOwnProperty.call(meta, "resultCommit"), false);
+        assert.equal(fs.existsSync(meta.worktreePath), true);
+        const official = environment.worktrees().find(entry => path.resolve(entry.path) === path.resolve(meta.worktreePath));
+        assert.ok(official);
+        assert.equal(official.locked, true);
     } finally {
         await environment.close();
     }
@@ -3329,4 +3445,59 @@ test("SidecarClient direct submits reject explicit service tiers before submit R
         );
     }
     assert.equal(submitRpcCalls, 0);
+});
+
+test("SidecarClient write preflight binds proof and submit to one instance with fixed Job paths", async () => {
+    const jobRoot = path.join(__dirname, "jobs-write-client-fixture");
+    const client = new SidecarClient({ pluginDir: __dirname, jobRoot });
+    let rpcCalls = 0;
+    let ensuredState;
+    let submittedParams;
+    client._callWithState = async (state, method, params) => {
+        rpcCalls++;
+        assert.equal(state, ensuredState);
+        assert.equal(method, "submitWriteJob");
+        submittedParams = params;
+        return { accepted: true };
+    };
+
+    ensuredState = { instanceId: "old", controlToken: "token", endpoint: "endpoint" };
+    client.ensure = async () => ensuredState;
+    await assert.rejects(
+        client.submitWriteJob({ jobId: "job_write_old", projectPath: __dirname, text: "old" }),
+        error => error.code === "AICW_APP_SERVER_WRITE_SIDECAR_UNSUPPORTED"
+    );
+    assert.equal(rpcCalls, 0);
+
+    ensuredState = {
+        instanceId: "unconfigured", controlToken: "token", endpoint: "endpoint",
+        ...getWriteProtocolStatus({ configured: false, errorCode: "AICW_WRITE_WORKSPACE_ROOT_INVALID" })
+    };
+    await assert.rejects(
+        client.submitWriteJob({ jobId: "job_write_unconfigured", projectPath: __dirname, text: "unconfigured" }),
+        error => error.code === "AICW_APP_SERVER_WRITE_NOT_CONFIGURED" &&
+            error.details?.cause === "AICW_WRITE_WORKSPACE_ROOT_INVALID"
+    );
+    assert.equal(rpcCalls, 0);
+
+    ensuredState = {
+        instanceId: "configured", controlToken: "token", endpoint: "endpoint",
+        serviceTierOverrideProtocolVersion: 1,
+        ...getWriteProtocolStatus({ configured: true })
+    };
+    const response = await client.submitWriteJob({
+        jobId: "job_write_bound",
+        projectPath: __dirname,
+        text: "bound",
+        serviceTier: "default",
+        metaPath: "C:\\caller\\meta.json",
+        outputPath: "C:\\caller\\output.txt",
+        codexOutputPath: "C:\\caller\\codex.txt"
+    });
+    assert.deepEqual(response, { accepted: true });
+    assert.equal(rpcCalls, 1);
+    const fixed = jobPaths(jobRoot, "job_write_bound");
+    assert.equal(submittedParams.metaPath, fixed.metaPath);
+    assert.equal(submittedParams.outputPath, fixed.outputPath);
+    assert.equal(submittedParams.codexOutputPath, fixed.codexOutputPath);
 });

@@ -15,10 +15,16 @@ const {
     normalizeWorktreeId,
     normalizeLockReason
 } = require("../appserver/gitWorktreeAdapter");
+const {
+    TRUSTED_GIT_CONFIG_ARGS,
+    resolveTrustedGitExecutable,
+    trustedGitEnvironment
+} = require("../appserver/trustedGitRuntime");
 
 const suiteRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vcp-aicodeworker-worktree-adapter-"));
 const fixtures = [];
 let nextFixture = 1;
+const trustedGitExecutable = resolveTrustedGitExecutable();
 
 function samePath(left, right) {
     const a = path.resolve(left);
@@ -27,12 +33,12 @@ function samePath(left, right) {
 }
 
 function git(cwd, args, allowFailure = false) {
-    const result = spawnSync("git", args, {
+    const result = spawnSync(trustedGitExecutable, [...TRUSTED_GIT_CONFIG_ARGS, ...args], {
         cwd,
         shell: false,
         windowsHide: true,
         encoding: "buffer",
-        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" }
+        env: trustedGitEnvironment()
     });
     if (!allowFailure) {
         assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${String(result.stderr || "")}`);
@@ -109,6 +115,43 @@ test("constructor rejects an explicitly undefined spawn runner override", () => 
     assert.throws(() => new GitWorktreeAdapter({ _spawnRunner: undefined }), error => {
         return error instanceof GitWorktreeError && error.code === "WORKTREE_OPTION_INVALID";
     });
+});
+
+test("adapter pins real Git and ignores executable sentinels in the repository cwd", async t => {
+    assert.equal(path.isAbsolute(trustedGitExecutable), true);
+    assert.equal(fs.realpathSync.native(trustedGitExecutable), trustedGitExecutable);
+    if (process.platform !== "win32") {
+        t.diagnostic("Windows git.exe/git.com executable sentinel proof is not applicable on this platform");
+        return;
+    }
+
+    const marker = path.join(suiteRoot, "cwd-git-sentinel-marker.txt");
+    const bootstrap = path.join(suiteRoot, "cwd-git-sentinel-bootstrap.js");
+    fs.writeFileSync(bootstrap, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "executed")`, "utf8");
+    const originalNodeOptions = process.env.NODE_OPTIONS;
+    process.env.NODE_OPTIONS = `--require=${JSON.stringify(bootstrap)}`;
+    let fixture;
+    const sentinels = [];
+    try {
+        fixture = createFixture();
+        for (const name of ["git.exe", "git.com"]) {
+            const sentinel = path.join(fixture.repoRoot, name);
+            fs.copyFileSync(process.execPath, sentinel);
+            sentinels.push(sentinel);
+        }
+        const entries = await fixture.adapter.list(fixture.repoRoot);
+        assert.equal(entries.length, 1);
+        assert.equal(samePath(entries[0].path, fixture.repoRoot), true);
+        assert.equal(fs.existsSync(marker), false, "candidate cwd Git sentinel must never start");
+    } finally {
+        if (originalNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+        else process.env.NODE_OPTIONS = originalNodeOptions;
+        for (const sentinel of sentinels) {
+            try { fs.unlinkSync(sentinel); } catch {}
+        }
+        try { fs.unlinkSync(bootstrap); } catch {}
+    }
+    assert.equal(fs.existsSync(marker), false);
 });
 
 async function addWorktree(fixture, id = `workspace-${nextFixture}`, reason = "slice-4a fixture") {
@@ -724,8 +767,9 @@ test("rejects symlink or junction aliases when the platform permits creating one
     assert.equal(fs.existsSync(path.join(fixture.workspaceBaseRoot, "alias")), false);
 });
 
-test("production adapter source keeps Git execution fixed and passes static safety guards", () => {
+test("production adapter source keeps trusted Git execution fixed and passes static safety guards", () => {
     const source = fs.readFileSync(path.resolve(__dirname, "../appserver/gitWorktreeAdapter.js"), "utf8").toLowerCase();
+    const runtimeSource = fs.readFileSync(path.resolve(__dirname, "../appserver/trustedGitRuntime.js"), "utf8").toLowerCase();
     for (const forbidden of [
         "--force", "shell: true", "fs.rm", "rmsync", "unlinksync", "rmdirsync", "renamesync",
         "copyfile", "copysync", "cpsync", "manifest", "wal", "perforce", "path lease",
@@ -736,12 +780,14 @@ test("production adapter source keeps Git execution fixed and passes static safe
     }
     assert.equal(source.includes("#gitbin"), false);
     assert.equal(source.includes("#spawnrunner"), false);
-    assert.equal(source.includes('gitbin: "git"'), true);
+    assert.equal(source.includes('gitbin: "git"'), false);
+    assert.equal(source.includes("gitbin: this.#gitexecutable"), true);
+    assert.equal(source.includes("resolvetrustedgitexecutable()"), true);
     assert.equal(source.includes("const result = await runboundedgit(request);"), true);
     assert.equal(source.includes("object.freeze({"), true);
-    assert.equal(source.includes("args: object.freeze([...args])"), true);
+    assert.equal(source.includes("args: object.freeze([...trusted_git_config_args, ...args])"), true);
     assert.equal(source.includes("shell: false"), true);
-    assert.equal(source.includes("git_terminal_prompt"), true);
+    assert.equal(runtimeSource.includes("git_terminal_prompt"), true);
     assert.equal(source.includes("const mutationgates = new map()"), true);
     assert.equal(source.includes("withmutationgate(root"), true);
     assert.equal(source.includes("asser pinnedworkspacebaseroot"), false);
@@ -751,13 +797,14 @@ test("production adapter source keeps Git execution fixed and passes static safe
     assert.equal(source.includes('"commit-tree"'), true);
     assert.equal(source.includes('"update-ref"'), true);
     assert.equal(source.includes('"read-tree", "--reset"'), true);
-    assert.equal(source.includes('git_config_nosystem = "1"'), true);
-    assert.equal(source.includes("git_config_global"), true);
-    assert.equal(source.includes("git_namespace"), true);
-    assert.equal(source.includes('"core.fsmonitor=false"'), true);
-    assert.equal(source.includes('core.hookspath=${process.platform === "win32" ? "nul" : "/dev/null"}'), true);
-    assert.equal(source.includes("^filter\\\\..*\\\\.(clean|smudge|process)$"), true);
+    assert.equal(runtimeSource.includes('git_config_nosystem = "1"'), true);
+    assert.equal(runtimeSource.includes("git_config_global"), true);
+    assert.equal(runtimeSource.includes("/^git_/i"), true);
+    assert.equal(runtimeSource.includes('"core.fsmonitor=false"'), true);
+    assert.equal(runtimeSource.includes('core.hookspath=${process.platform === "win32" ? "nul" : "/dev/null"}'), true);
+    assert.equal(runtimeSource.includes("^filter\\\\..*\\\\.(clean|smudge|process)$"), true);
     assert.equal(source.includes('"--no-ext-diff"'), true);
+    assert.equal(source.includes('"--no-textconv"'), true);
     assert.equal(source.includes("vcp aicodeworker candidate"), true);
     const captureStart = source.indexOf("async capturebase(");
     const captureEnd = source.indexOf("async assertbasestable(", captureStart);
