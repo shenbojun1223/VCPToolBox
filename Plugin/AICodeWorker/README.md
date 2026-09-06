@@ -1,65 +1,50 @@
-
 # AICodeWorker - AI 代码工程 Worker
 
-让 VCP Agent 可以安全调度服务器本地的 [opencode](https://opencode.ai)、OpenAI Codex CLI（及可选的 antigravity/agy），作为下游代码分析、patch 生成、文件修改 Worker。核心理念：**把耗 Token 的代码读写任务交给免费的本地工具执行，VCP 模型只管下命令和看结果**。
+## Agent 调用规则（本部署，2026-09-05）
 
-## 最快上手：`run_and_wait` + 7 个预设（低算力模型直接抄）
+- 每次显式传 worker=codex；插件底层默认 worker 仍为 opencode，不传不会自动选择 Codex。
+- Fast 默认不启用：所有 Codex run/run_and_wait 都显式传 fastMode=false。只有用户明确要求本任务开启 Fast 才传 true；“继续”“尽快”“并发”不构成 Fast 授权。不要把一次授权扩展到后续任务。
+- API 兼容语义未改变：省略/null/空字符串会继承 Codex 配置，不等于关闭 Fast。上述默认关闭是 Agent 调用规范，不是后端强制默认。
+- 纯搬砖任务（目标、路径和验收已明确的机械修改、批量实现、按既定方案补测试）使用 model=gpt-5.6-luna、reasoningEffort=max。不得因是 write 模式就一律用 Luna；架构判断、需求不清及独立审查另行选型。
+- 派任务前查 capabilities，针对拟用模型核对可用性与合法推理档位；能力不符则报告，不静默换模型。模型默认档位随配置变化，不硬编码。
+- app-server analyze/patch/write 共享总额度3，其中 Write最多2；legacy Worker共用独立额度1（以实时 capabilities 为准）。2W+1A/P、1W+2A/P、3A/P可行；第三个Write或第四个总任务拒绝，不排队。
+- 额度按仍持有所有权的任务计数，创建Worktree、验证、提交和未释放的终态均占槽；不能仅因模型停止输出就认为名额释放。
+- 默认 command=run。收到成功提交与 jobId 后结束当轮，不自动连续轮询；用户说“跑完了/继续/查结果”后单次 query，优先 wait=false,responseMode=compact。run_and_wait仅在用户明确要求同步等待时使用。
+- 超时/中断/提交结果unknown先查询原jobId和落盘证据，禁止直接重发；取消要核实目标任务已收敛，不全局杀进程。
 
-日常 80% 的需求不用自己写任务书，填两三个参数即可：
+## 快速使用
 
-```text
-command: run_and_wait
-preset: [预设名]
-targetPath: [文件或目录的绝对路径]
-```
-
-| preset | 说明 | 必填参数 | 可选参数 |
-|--------|------|---------|---------|
-| `index` | 列出文件所有函数索引（行号·名称·功能） | targetPath | — |
-| `read` | 读取文件完整内容并原文输出 | targetPath | — |
-| `scan` | 扫描目录树 + 每个文件用途说明 | targetPath | depth |
-| `bug` | 分析某个错误的根本原因 | targetPath, error | detail |
-| `set` | 修改文件中某个配置项/变量的值 | targetPath, key, value | — |
-| `append` | 在文件末尾追加内容 | targetPath, content | position |
-| `create` | 创建或覆写一个文件 | targetPath, what | — |
-
-示例（看文件函数索引）：
+以下仅为普通字段示例，不是可执行工具请求块：
 
 ```text
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AICodeWorker「末」,
-command:「始」run_and_wait「末」,
-preset:「始」index「末」,
-targetPath:「始」/app/VCPToolBox_new/Plugin/AICodeWorker/AICodeWorker.js「末」
-<<<[END_TOOL_REQUEST]>>>
+command: run
+worker: codex
+projectPath: <白名单内干净Git仓库根>
+task: <目标、相对文件路径、禁区与验收要求>
+mode: write
+model: gpt-5.6-luna
+reasoningEffort: max
+fastMode: false
+traceMode: events
+timeoutSec: 1200
 ```
 
-用户说的话怎么对应 preset？
+提交后保存jobId；用户要求查结果时单次query。Write结果是独立Worktree中的候选commit，不自动应用到原分支。复杂分析或审查不要机械套用搬砖模型。
 
-| 用户说的话 | 选这个 preset |
-|-----------|-------------|
-| "看看这个文件/函数" | index |
-| "读一下/给我看内容" | read |
-| "扫一下目录" | scan |
-| "查一下这个报错" | bug（+ error 参数） |
-| "把XXX改成YYY" | set（+ key/value） |
-| "在文件末尾加一行" | append（+ content） |
-| "创建一个文件" | create（+ what） |
+## 说明如何进入Agent
 
-预设满足不了的复杂任务，自己写 `task` 参数（见下方「进阶」一节），`run_and_wait` 仍然同步等结果返回，不用走 query 轮询。**完整调用说明以 `plugin-manifest.json` 的 `invocationCommands.description` 为准**（任何算力的 agent 读插件本身就懂，这是单一真相源；本 README 是给人看的补充材料，可能滞后于 manifest）。
+`plugin-manifest.json → capabilities.invocationCommands[].description → Plugin.js/buildVCPDescription → {{VCPAICodeWorker}} → messageProcessor变量展开`。`{{VCPAllTools}}`包含全部已生成说明；`{{VCPDynamicTools}}`走动态选择，具体注入由动态注册器决定。README仅供人工阅读。Lucy还有`Agent/Lucy.txt`的长期调用规范，需要与工具说明保持一致。
 
-## 功能
+manifest元数据监听会重建工具说明并发出tools_changed；Agent文件有缓存失效监听。正常后续请求读取新说明，不需要重启Codex Sidecar。磁盘修改不等于当前会话历史文本已被改写；运行态刷新仍需实际核验。
 
-- **analyze 模式**：只读分析代码结构、逻辑、bug，不修改任何文件
-- **patch 模式**：默认保持 legacy；可用独立且默认关闭的 app-server patch flag 生成、验证 unified diff 制品，始终需要人工审查与另行应用
-- **write 模式**：默认保持 legacy；Codex 可用独立且默认关闭的 app-server write flag，在隔离 Worktree 中生成并验证候选 commit，主工作树不会被自动修改
-- **同步/异步两种调用方式**：`run_and_wait` 直接等结果返回（日常首选）；`run` 立即返回 jobId 不等待，配合 `query`/`listJobs`/`cancel` 用于特别耗时的任务
-- **多 Worker**：默认 opencode（免费），复杂任务可点名 antigravity/agy（消耗 Gemini Pro 配额）
+## 模式与前提
 
-## 前置条件
-
-服务器上需安装 [opencode CLI](https://opencode.ai)，安装后确认 `opencode --version` 可用。
-未安装时 `capabilities` 命令会返回 `available: false`，此时不可调用 run。
+- analyze：只读。
+- app-server patch：只读生成并验证patch，不自动apply，要求干净Git根及受支持文件操作。
+- app-server write：干净原仓库 → 独立Worktree → 修改 → 固定静态验证 → 候选commit；不自动合并。使用相对文件路径，不指示Worker写原工作区。
+- 静态验证不是项目功能测试；超时/unknown不重放。
+- 安装默认与本部署启用状态不同，实际以capabilities确认。
+- legacy预设index/read/scan/bug/set/append/create保留，但不作为本部署默认调用方式。
 
 ## 配置
 
@@ -94,8 +79,8 @@ ENABLE_CODEX_APP_SERVER_WRITE=false
 CODEX_APP_SERVER_WRITE_WORKSPACE_ROOT=/srv/aicw-write-worktrees
 CODEX_APP_SERVER_WRITE_ALLOWED_PROJECT_ROOTS=/app/VCPToolBox_new,/app/myproject
 
-# 模型：BASE_URL/API_KEY 都留空 = 用 opencode 自带【免费】模型（不烧你的 token）。
-# 但 OPENCODE_MODEL 别留空（留空会回退到付费默认模型），填一个 opencode/ 开头的免费模型：
+# 可选opencode配置示例，非本部署默认；免费资格和费用取决于所选模型及服务商。
+# 显式选择并核验OPENCODE_MODEL，不能仅凭示例名认定当前免费：
 #   opencode/deepseek-v4-flash-free（推荐，代码强）/ opencode/north-mini-code-free（轻量）
 #   / opencode/mimo-v2.5-free / opencode/big-pickle
 # 用 `opencode models | grep opencode/` 看最新清单。
@@ -148,8 +133,9 @@ JOB_ROOT=C:\VCP\VCPToolBox\Plugin\AICodeWorker\jobs
 调用示例：
 
 ```text
-command: run_and_wait
+command: run
 worker: codex
+fastMode: false
 projectPath: C:\VCP\VCPToolBox
 task: 请只读分析指定模块，给出文件依据与验证结论，不修改文件。
 mode: analyze
@@ -258,6 +244,8 @@ validation/commit。继续用原 jobId 执行 `query`/`cancel`；full/compact、
 
 ## Codex 逐任务 Fast mode
 
+**Agent规范：默认显式传 `fastMode=false`；仅用户明确要求本任务Fast才传true。以下三态是API兼容语义，不代表允许Agent默认继承Fast。**
+
 `fastMode` 是 Codex 专用的三态逐任务开关：
 
 | 调用值 | 行为 |
@@ -277,8 +265,9 @@ app-server 会以当前连接的 Sidecar `status` 实时握手。旧 Sidecar 不
 Sidecar 已通过逐任务档位覆盖协议握手。
 
 ```text
-command: run_and_wait
+command: run
 worker: codex
+fastMode: false
 mode: analyze
 fastMode: true
 projectPath: C:\VCP\VCPToolBox
@@ -300,7 +289,7 @@ task: 请只读分析指定模块，不修改文件。
 | `max` | 最困难问题的最大推理深度 |
 | `ultra` | 最大推理并自动委托子任务；使用量可能显著增加 |
 
-当前模型自身默认是 `low`；本机 Codex 配置显式设为 `medium`，因此不传时当前有效默认值为 `medium`。
+不传 reasoningEffort 时继承当前 Codex 配置，未覆盖时使用模型默认值；实际默认与合法档位用 capabilities 针对所选 model 查询，不在说明中写死。上述表格是档位一般含义，不覆盖本部署选型：纯搬砖任务显式使用 gpt-5.6-luna / max，并显式 fastMode=false。
 
 插件会按以下优先级确定实际模型：
 1. 单次调用的 `model`
@@ -311,8 +300,9 @@ task: 请只读分析指定模块，不修改文件。
 随后从 `models_cache.json` 读取该模型的 `supported_reasoning_levels`。未知模型或无法验证时会拒绝覆盖，不会盲传。
 
 ```text
-command: run_and_wait
+command: run
 worker: codex
+fastMode: false
 mode: analyze
 reasoningEffort: xhigh
 projectPath: C:\VCP\VCPToolBox
@@ -406,62 +396,23 @@ state 含义：`running` 进行中 / `completed` 成功 / `failed` 失败 / `tim
 ## 依赖
 
 - Node.js >= 16
-- opencode CLI（需单独安装）
+- 所选Worker的CLI：本部署使用Codex；opencode/antigravity仅在选择对应后端时需要
 - 无 npm 额外依赖
 
 
-## 多 Worker：opencode（免费）/ antigravity（agy，复杂任务）
+## 可选 Worker 与并发边界
 
-用 `worker` 参数选择由谁执行：
+本部署 Agent 默认显式选择 worker=codex；插件 API 的 worker 缺省值仍为 opencode，二者不要混淆。
 
-| worker | 底层模型 | 成本 | 适用 |
-|--------|---------|------|------|
-| `opencode`（默认） | 自带免费 zen 模型 | 免费、基本无限 | 常规/批量/简单代码活 |
-| `codex` | Codex CLI 当前登录配置 | 按 Codex 账户/API 计费 | 严谨开发、改码、测试、审查 |
-| `antigravity`（即 agy） | Gemini 3.x / Claude 4.6 等 | 吃 Gemini Pro 配额(约1500/天,60/分钟) | 复杂、需严谨设计、点名 agy 的任务 |
+| worker | 定位 | 使用条件 |
+|---|---|---|
+| codex | 本部署默认代码执行器；纯搬砖使用 gpt-5.6-luna / max | capabilities确认模型与档位；默认fastMode=false |
+| opencode | 可选legacy后端 | 用户另行指定且实际可用；模型与费用以服务商为准 |
+| antigravity | 可选legacy后端 | 用户另行指定且实际启用；模型与配额以实际配置为准 |
 
-- 需 `config.env` 设 `ENABLE_ANTIGRAVITY=true` 才有 antigravity；未开启则只用 opencode（行为同以前）。
-- agy 依赖 `AGY_BIN`（建议绝对路径）和 `AGY_PROXY`（连 Google 的代理，墙内必填）。详见 config.env.example。
-
-### agy 可用模型（填 AGY_MODEL 或调用时传 model；用 label 全名含括号）
-- `Gemini 3.5 Flash (High)`（默认,快）/ `(Medium)` / `(Low)`
-- `Gemini 3.1 Pro (High)`（最强,啃硬骨头）/ `(Low)`
-- `Claude Opus 4.6 (Thinking)` / `Claude Sonnet 4.6 (Thinking)` / `GPT-OSS 120B (Medium)`
-- 查最新清单：`agy models`
-
-### 抄作业①：点名用 agy（低算力模型直接照填）
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AICodeWorker「末」,
-command:「始」run_and_wait「末」,
-worker:「始」antigravity「末」,
-projectPath:「始」/app/VCPToolBox_new「末」,
-task:「始」分析 server.js 的请求处理流程，指出潜在并发问题，不修改任何文件。「末」,
-mode:「始」analyze「末」
-<<<[END_TOOL_REQUEST]>>>
-（要用最强模型做最难的活，再加一行）  model:「始」Gemini 3.1 Pro (High)「末」
-
-### 抄作业②：多协作（opencode 干粗活 + agy 啃硬骨头，并行）
-第1步 简单部分派 opencode（用 run 异步，记下返回 jobId）：
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AICodeWorker「末」,
-command:「始」run「末」,
-worker:「始」opencode「末」,
-projectPath:「始」/app/VCPToolBox_new「末」,
-task:「始」统计 modules 目录有哪些文件、各自行数。「末」,
-mode:「始」analyze「末」
-<<<[END_TOOL_REQUEST]>>>
-第2步 复杂部分派 agy（用 run 异步，记下 jobId）：
-<<<[TOOL_REQUEST]>>>
-tool_name:「始」AICodeWorker「末」,
-command:「始」run「末」,
-worker:「始」antigravity「末」,
-projectPath:「始」/app/VCPToolBox_new「末」,
-task:「始」分析 modules/vcpLoop 的工具调用解析逻辑，评估健壮性与边界处理。「末」,
-mode:「始」analyze「末」
-<<<[END_TOOL_REQUEST]>>>
-第3步 分别用 query 查这两个 jobId 的结果，收齐后综合成一份报告回复。
-
-⚠️ **两条铁律**：
-1. 并行的两个任务书必须操作【不相交的文件】，否则写冲突；有先后依赖的任务串行做。
-2. **内存铁律**：每个 opencode/agy 实例启动后占用约 1.5~2G 内存，本服务器内存上限 6G。**严禁同时并发派出多个 AICodeWorker 任务**（哪怕一个 opencode 一个 agy 也不行），否则会撑爆内存导致服务器卡死——这不是假设，2026-06-26 真实发生过一次（两个 opencode 并发分析任务，内存被打到99%）。正确做法永远是：**串行调用**——等上一个 `run_and_wait`/`query` 返回结果后，再发下一个。上面这个"并行多协作"示例仅作历史参考，**当前不推荐这样用**，请改成串行执行。
-   ⚠️ 2026-06-27此规则已升级为**代码强制**：超过 `MAX_CONCURRENT_JOBS`(默认1)时提交会被直接拒绝报错（不会排队、不会卡死，opencode和antigravity共用同一计数）。这是双重保险——子进程清理已修复（不会再堆积僵尸进程拖垮服务器），但并发任务瞬时资源冲击的风险仍存在，所以保留这道硬闸门。
+- app-server analyze/patch/write共享总额度3，Write最多2；2W+1A/P、1W+2A/P或3A/P均可。
+- legacy Codex exec、opencode、antigravity共用独立额度，默认1；不能把legacy单并发限制套到app-server。
+- 第三个Write或第四个app-server任务拒绝，不排队；已有任务未释放ownership前继续占槽。
+- 同仓两个Write各自产生独立Worktree和候选commit，不直接覆盖彼此；候选之间仍可能有语义或合并冲突，不自动合并。有先后依赖的任务按依赖顺序执行。
+- 提交成功拿到jobId后停止自动轮询；用户要求查结果时单次query。取消与异常恢复的必要状态核验不受此限制。
+- 不自动改全局模型、Fast或服务配置；不能因用户说“尽快”就开启Fast。
