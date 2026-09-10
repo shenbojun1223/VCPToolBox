@@ -36,6 +36,30 @@ const {
 } = require("../transport/ndjson");
 
 const unhealthyHistoryTopics = new Map();
+const SQLITE_BUSY_RETRY_DELAYS_MS = [100, 300];
+
+function isSqliteBusyError(error) {
+  return error?.code === "SQLITE_BUSY"
+    || /database is (?:locked|busy)/i.test(String(error?.message || error));
+}
+
+async function runWithSqliteBusyRetry(operation) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return operation();
+    } catch (error) {
+      if (
+        !isSqliteBusyError(error)
+        || attempt >= SQLITE_BUSY_RETRY_DELAYS_MS.length
+      ) {
+        throw error;
+      }
+      await new Promise((resolve) => {
+        setTimeout(resolve, SQLITE_BUSY_RETRY_DELAYS_MS[attempt]);
+      });
+    }
+  }
+}
 
 function markHistoryTopicUnhealthy(topicId, error) {
   if (typeof topicId === "string" && topicId.length > 0) {
@@ -610,11 +634,21 @@ async function ingestHistoryToDb(filePath, topicId, source = "watcher") {
   const logger = getLogger();
   if (!db) throw new Error("Database not initialized");
 
+  let canonical;
   try {
     const { history } = await readHistoryStrict(filePath);
-    const canonical = canonicalizeHistory(history, topicId);
+    canonical = canonicalizeHistory(history, topicId);
+    // Source health is about the JSON/canonical history itself. A later
+    // operational database failure must not leave a permanent source poison.
+    clearHistoryTopicUnhealthy(topicId);
+  } catch (e) {
+    markHistoryTopicUnhealthy(topicId, e);
+    logger.logOperation("messages", "ingest", topicId, "error", e.message);
+    throw e;
+  }
+
+  try {
     const now = Date.now();
-    const fingerprints = [];
     let attachmentCount = 0;
 
     // Canonical messages are the only values allowed to influence wire hashes.
@@ -626,6 +660,11 @@ async function ingestHistoryToDb(filePath, topicId, source = "watcher") {
 
     const liveIds = new Set(validMessages.map((message) => message.id));
     const applyIndex = db.transaction(() => {
+      // Keep retry-local derived state inside the transaction callback. If a
+      // busy failure occurs after partial callback execution, the next attempt
+      // must not reuse fingerprints or counters from the rolled-back attempt.
+      const fingerprints = [];
+      let transactionAttachmentCount = 0;
       const existing = db
         .prepare(
           "SELECT msg_id FROM message_index WHERE topic_id = ? AND deleted_at IS NULL",
@@ -646,7 +685,7 @@ async function ingestHistoryToDb(filePath, topicId, source = "watcher") {
                 att.name || "unnamed",
                 att.createdAt ?? now,
               );
-              attachmentCount++;
+              transactionAttachmentCount++;
             }
           });
         }
@@ -676,8 +715,9 @@ async function ingestHistoryToDb(filePath, topicId, source = "watcher") {
         const { computeAggregatedHashes } = require("../index");
         computeAggregatedHashes(db, logger);
       }
+      return transactionAttachmentCount;
     });
-    applyIndex();
+    attachmentCount = await runWithSqliteBusyRetry(() => applyIndex());
     clearHistoryTopicUnhealthy(topicId);
 
     if (source !== "reconcile") {
@@ -699,7 +739,8 @@ async function ingestHistoryToDb(filePath, topicId, source = "watcher") {
       );
     }
   } catch (e) {
-    markHistoryTopicUnhealthy(topicId, e);
+    // Database contention and index failures are operational faults, not proof
+    // that history.json is corrupt. Leave the topic retryable.
     logger.logOperation("messages", "ingest", topicId, "error", e.message);
     throw e;
   }

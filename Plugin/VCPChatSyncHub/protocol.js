@@ -7,11 +7,23 @@ const LEGACY_MOBILE_COMPAT_VERSION = "1.0.0";
 const WIRE_PROTOCOL_VERSION = "1.2";
 const STRICT_PLUGIN_VERSION = "1.2.0";
 const WIRE_14_PROTOCOL_VERSION = "1.4";
-const EXPECTED_PLUGIN_VERSION = "1.4.0";
+const WIRE_15_PROTOCOL_VERSION = "1.5";
+const EXPECTED_PLUGIN_VERSION = "2.0.0";
+// Wire 1.4 的 ACK 必须广告一份稳定的兼容包版本，不能泄漏会随 manifest
+// 漂移的真实包版本。1.1 广告 1.1.0、1.2 广告 1.2.0 均如此；1.4 客户端
+// 同样锁死了这一契约，包版本升级到 2.x 不应改变握手广告值。
+const WIRE_14_PLUGIN_VERSION = "1.4.0";
+const VERSION_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+const BACKEND_MODES = new Set(["legacy", "cds"]);
 const SUPPORTED_WIRE_PROTOCOL_VERSIONS = new Set([
   LEGACY_WIRE_PROTOCOL_VERSION,
   WIRE_PROTOCOL_VERSION,
   WIRE_14_PROTOCOL_VERSION,
+  WIRE_15_PROTOCOL_VERSION,
+]);
+const STRICT_WIRE_PROTOCOL_VERSIONS = new Set([
+  WIRE_14_PROTOCOL_VERSION,
+  WIRE_15_PROTOCOL_VERSION,
 ]);
 const WIRE_14_PHASES = new Set([
   "owner_metadata",
@@ -142,21 +154,169 @@ function requireNonEmptyString(value, field) {
   return value;
 }
 
-function resolveWireProtocol(payload) {
-  const protocolVersion = payload?.protocolVersion === undefined
-    ? LEGACY_WIRE_PROTOCOL_VERSION
-    : requireNonEmptyString(
-      payload.protocolVersion,
-      "VERSION_CHECK.protocolVersion",
+function requireVersionToken(value, field, code = "PROTOCOL_INVALID") {
+  if (typeof value !== "string" || !VERSION_TOKEN_PATTERN.test(value)) {
+    const error = new Error(
+      `${field} must be a 1-64 byte safe ASCII version token`,
     );
+    error.code = code;
+    throw error;
+  }
+  return value;
+}
+
+/**
+ * 检测 VERSION_CHECK 是否为 Wire 1.5 声明式格式。
+ * 新版移动端协议用 versions[] 数组替代旧版扁平字段。
+ */
+function isWire15VersionCheck(payload) {
+  return Boolean(
+    payload &&
+    payload.type === "VERSION_CHECK" &&
+    Array.isArray(payload.versions),
+  );
+}
+
+/**
+ * 从 versions[] 声明中提取 wire 组件版本号。
+ * 不存在返回 null 表示走旧版扁平字段路径。
+ */
+function extractWireVersionFromClaims(payload) {
+  if (!payload || !Array.isArray(payload.versions)) return null;
+  for (const claim of payload.versions) {
+    if (
+      claim &&
+      typeof claim === "object" &&
+      !Array.isArray(claim) &&
+      claim.component === "wire"
+    ) {
+      return typeof claim.version === "string" ? claim.version : null;
+    }
+  }
+  return null;
+}
+
+function resolveWireProtocol(payload) {
+  const claimsWire = extractWireVersionFromClaims(payload);
+  const protocolVersion = claimsWire !== null
+    ? requireVersionToken(
+      claimsWire,
+      "VERSION_CHECK.versions[wire]",
+      "VERSION_CHECK_INVALID",
+    )
+    : payload?.protocolVersion === undefined
+      ? LEGACY_WIRE_PROTOCOL_VERSION
+      : requireNonEmptyString(
+        payload.protocolVersion,
+        "VERSION_CHECK.protocolVersion",
+      );
   if (!SUPPORTED_WIRE_PROTOCOL_VERSIONS.has(protocolVersion)) {
     const error = new Error(
-      `wire protocol mismatch: supported ${LEGACY_WIRE_PROTOCOL_VERSION}, ${WIRE_PROTOCOL_VERSION}, or ${WIRE_14_PROTOCOL_VERSION}, received ${protocolVersion}`,
+      `wire protocol mismatch: supported ${[...SUPPORTED_WIRE_PROTOCOL_VERSIONS].join(", ")}, received ${protocolVersion}`,
     );
     error.code = "PROTOCOL_MISMATCH";
     throw error;
   }
   return protocolVersion;
+}
+
+/**
+ * Wire 1.5 声明式版本协商。
+ *
+ * 移动端发送 { type, versions: [{component,version}...] }，服务端返回
+ * 同样结构的 ACK 并附带 backendMode。mode 由 Hub 部署形态决定：当前云端
+ * SyncHub 为 legacy（自维护 SQLite + AppData），不驱动 CDS 分支。
+ */
+function negotiateWire15VersionCheck(payload, { desktopPluginVersion, backendMode }) {
+  if (!payload || payload.type !== "VERSION_CHECK") {
+    const error = new Error("expected VERSION_CHECK");
+    error.code = "VERSION_CHECK_INVALID";
+    throw error;
+  }
+  if (!Array.isArray(payload.versions) || payload.versions.length !== 2) {
+    const error = new Error(
+      "VERSION_CHECK.versions must contain exactly 2 entries",
+    );
+    error.code = "VERSION_CHECK_INVALID";
+    throw error;
+  }
+  const expectedComponents = new Set(["mobile_app", "wire"]);
+  const versions = new Map();
+  for (const [index, claim] of payload.versions.entries()) {
+    if (!claim || typeof claim !== "object" || Array.isArray(claim)) {
+      const error = new Error(
+        `VERSION_CHECK.versions[${index}] must be an object`,
+      );
+      error.code = "VERSION_CHECK_INVALID";
+      throw error;
+    }
+    requireExactKeys(
+      claim,
+      ["component", "version"],
+      `VERSION_CHECK.versions[${index}]`,
+      "VERSION_CHECK_INVALID",
+    );
+    if (
+      typeof claim.component !== "string" ||
+      !expectedComponents.has(claim.component)
+    ) {
+      const error = new Error(
+        `VERSION_CHECK.versions[${index}] has an unexpected component`,
+      );
+      error.code = "VERSION_CHECK_INVALID";
+      throw error;
+    }
+    requireVersionToken(
+      claim.version,
+      `VERSION_CHECK.versions[${index}].version`,
+      "VERSION_CHECK_INVALID",
+    );
+    if (versions.has(claim.component)) {
+      const error = new Error(
+        `VERSION_CHECK.versions contains duplicate component ${claim.component}`,
+      );
+      error.code = "VERSION_CHECK_INVALID";
+      throw error;
+    }
+    versions.set(claim.component, claim.version);
+  }
+  if (!versions.has("mobile_app") || !versions.has("wire")) {
+    const error = new Error(
+      "VERSION_CHECK.versions is missing a required component",
+    );
+    error.code = "VERSION_CHECK_INVALID";
+    throw error;
+  }
+  const wireVersion = versions.get("wire");
+  if (wireVersion !== WIRE_15_PROTOCOL_VERSION) {
+    const error = new Error(
+      `wire protocol mismatch: expected ${WIRE_15_PROTOCOL_VERSION}, received ${wireVersion}`,
+    );
+    error.code = "PROTOCOL_MISMATCH";
+    throw error;
+  }
+  const packageVersion = requireVersionToken(
+    desktopPluginVersion,
+    "desktop plugin version",
+  );
+  if (!BACKEND_MODES.has(backendMode)) {
+    const error = new Error("backendMode must be legacy or cds");
+    error.code = "PROTOCOL_INVALID";
+    throw error;
+  }
+  return {
+    ack: {
+      type: "VERSION_ACK",
+      versions: [
+        { component: "desktop_plugin", version: packageVersion },
+        { component: "wire", version: WIRE_15_PROTOCOL_VERSION },
+      ],
+      backendMode,
+    },
+    peer: {
+      mobileAppVersion: versions.get("mobile_app"),
+    },
+  };
 }
 
 function createVersionAck(payload, pluginVersion) {
@@ -165,15 +325,16 @@ function createVersionAck(payload, pluginVersion) {
     error.code = "VERSION_CHECK_INVALID";
     throw error;
   }
-  requireNonEmptyString(payload.mobileVersion, "VERSION_CHECK.mobileVersion");
-  const protocolVersion = resolveWireProtocol(payload);
-  if (pluginVersion !== EXPECTED_PLUGIN_VERSION) {
+  if (isWire15VersionCheck(payload)) {
     const error = new Error(
-      `plugin package mismatch: expected ${EXPECTED_PLUGIN_VERSION}, received ${pluginVersion}`,
+      "VERSION_CHECK with versions[] must use negotiateWire15VersionCheck",
     );
-    error.code = "PLUGIN_VERSION_MISMATCH";
+    error.code = "VERSION_CHECK_INVALID";
     throw error;
   }
+  requireNonEmptyString(payload.mobileVersion, "VERSION_CHECK.mobileVersion");
+  const protocolVersion = resolveWireProtocol(payload);
+  requireVersionToken(pluginVersion, "pluginVersion");
   if (protocolVersion === LEGACY_WIRE_PROTOCOL_VERSION) {
     return {
       type: "VERSION_ACK",
@@ -192,12 +353,12 @@ function createVersionAck(payload, pluginVersion) {
   }
   return {
     type: "VERSION_ACK",
-    pluginVersion,
+    pluginVersion: WIRE_14_PLUGIN_VERSION,
     protocolVersion: WIRE_14_PROTOCOL_VERSION,
   };
 }
 
-function requireExactKeys(payload, fields, label) {
+function requireExactKeys(payload, fields, label, code = "PROTOCOL_INVALID") {
   const expected = new Set(fields);
   const actual = Object.keys(payload);
   if (
@@ -205,25 +366,33 @@ function requireExactKeys(payload, fields, label) {
     actual.some((field) => !expected.has(field))
   ) {
     const error = new Error(`${label} has unexpected or missing fields`);
-    error.code = "PROTOCOL_INVALID";
+    error.code = code;
     throw error;
   }
 }
 
 /**
- * Wire 1.4 deliberately uses exact request shapes and compound identities.
- * Older negotiated connections keep their existing permissive frame contract.
+ * Wire 1.4 与 1.5 均使用精确请求形状。
+ * 更早的协商连接保留其宽松帧契约。
  */
 function validateSyncRequestFrame(payload, protocolVersion) {
-  if (protocolVersion !== WIRE_14_PROTOCOL_VERSION) return payload;
+  if (!STRICT_WIRE_PROTOCOL_VERSIONS.has(protocolVersion)) return payload;
 
   switch (payload.type) {
     case "VERSION_CHECK":
-      requireExactKeys(
-        payload,
-        ["type", "mobileVersion", "protocolVersion"],
-        payload.type,
-      );
+      if (protocolVersion === WIRE_15_PROTOCOL_VERSION) {
+        requireExactKeys(
+          payload,
+          ["type", "versions"],
+          payload.type,
+        );
+      } else {
+        requireExactKeys(
+          payload,
+          ["type", "mobileVersion", "protocolVersion"],
+          payload.type,
+        );
+      }
       break;
     case "PHASE_START":
       requireExactKeys(payload, ["type", "phase"], payload.type);
@@ -367,9 +536,13 @@ module.exports = {
   LEGACY_WIRE_PROTOCOL_VERSION,
   STRICT_PLUGIN_VERSION,
   WIRE_PROTOCOL_VERSION,
+  WIRE_14_PLUGIN_VERSION,
   WIRE_14_PROTOCOL_VERSION,
+  WIRE_15_PROTOCOL_VERSION,
   createPhaseAck,
   createVersionAck,
+  isWire15VersionCheck,
+  negotiateWire15VersionCheck,
   parseJsonWithoutDuplicateKeys,
   resolveDeleteTimestamp,
   resolveWireProtocol,

@@ -4,7 +4,10 @@
 
 const { getDb } = require("../core/db");
 const { getLogger } = require("../core/logger");
-const { LEGACY_WIRE_PROTOCOL_VERSION } = require("../protocol");
+const {
+  LEGACY_WIRE_PROTOCOL_VERSION,
+  WIRE_PROTOCOL_VERSION,
+} = require("../protocol");
 const { assertHistoryTopicHealthy } = require("./message");
 
 const MAX_MANIFEST_ITEMS = 10_000;
@@ -203,20 +206,32 @@ function normalizeRemoteManifestItem(item, dataType, index, options = {}) {
     throw syncContractError(`Manifest item ${index} must be an object`);
   }
   const id = requireNonEmptyString(item.id, `Manifest item ${index} id`);
+  const deletedAt = requireOptionalTombstone(
+    item.deletedAt,
+    `Manifest item ${id} deletedAt`,
+  );
   const legacyTopic =
     dataType === "topic" &&
     options.protocolVersion === LEGACY_WIRE_PROTOCOL_VERSION;
+  const wire12EmptyTopicPlaceholder =
+    dataType === "topic" &&
+    options.protocolVersion === WIRE_PROTOCOL_VERSION &&
+    item.hash === "" &&
+    item.configHash === "" &&
+    item.contentHash === "";
+  const allowEmptyTopicHash =
+    legacyTopic || wire12EmptyTopicPlaceholder;
   const normalized = {
     id,
     hash: requireHash(item.hash, `Manifest item ${id} hash`, {
-      allowEmpty: legacyTopic,
+      allowEmpty: allowEmptyTopicHash,
     }),
     ts: requireTimestamp(item.ts, `Manifest item ${id} timestamp`),
-    deletedAt: requireOptionalTombstone(
-      item.deletedAt,
-      `Manifest item ${id} deletedAt`,
-    ),
+    deletedAt,
   };
+  if (wire12EmptyTopicPlaceholder) {
+    normalized.wire12EmptyTopicPlaceholder = true;
+  }
 
   if (dataType === "avatar") {
     requireAvatarOwner(id);
@@ -226,7 +241,7 @@ function normalizeRemoteManifestItem(item, dataType, index, options = {}) {
   normalized.configHash = requireHash(
     item.configHash,
     `Manifest item ${id} configHash`,
-    { allowEmpty: legacyTopic },
+    { allowEmpty: allowEmptyTopicHash },
   );
   normalized.contentHash = requireHash(
     item.contentHash,
@@ -381,6 +396,16 @@ function handleSyncManifest(payload, database = getDb(), options = {}) {
         id: local.id,
         action: "PUSH_DELETE",
         deletedAt: local.deletedAt,
+        ...actionIdentity(local, dataType),
+      });
+      processedIds.add(local.id);
+    } else if (remote.wire12EmptyTopicPlaceholder) {
+      // Wire 1.2 mobile emits an all-empty placeholder for an existing empty
+      // topic. Never let that placeholder win by timestamp; repair it from the
+      // authoritative desktop index instead.
+      results.push({
+        id: local.id,
+        action: "PULL",
         ...actionIdentity(local, dataType),
       });
       processedIds.add(local.id);

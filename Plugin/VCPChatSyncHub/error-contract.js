@@ -128,6 +128,7 @@ const ERROR_DEFINITIONS = Object.freeze({
   PHASE3_RESPONSE_TIMEOUT: definition("messages", "connection", "manual", "mobile_sync"),
   FINAL_ACK_TIMEOUT: definition("finalize", "connection", "manual", "mobile_sync"),
   PROTOCOL_MISMATCH: definition("handshake", "compatibility", "after_user_action"),
+  WIRE_VERSION_MISMATCH: definition("handshake", "compatibility", "after_user_action"),
   PLUGIN_VERSION_MISMATCH: definition("handshake", "compatibility", "after_user_action"),
   MOBILE_SYNC_ERROR: definition("shutdown", "internal", "manual", "mobile_sync"),
   SYNC_PROTOCOL_INVALID: definition("owner_metadata", "protocol", "after_user_action"),

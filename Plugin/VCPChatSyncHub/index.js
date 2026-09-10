@@ -37,6 +37,8 @@ const { getLogger, resetLogger } = require("./core/logger");
 const {
   createPhaseAck,
   createVersionAck,
+  isWire15VersionCheck,
+  negotiateWire15VersionCheck,
   resolveDeleteTimestamp,
 } = require("./protocol");
 const { withSyncErrorContext } = require("./error-contract");
@@ -115,17 +117,17 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
             "info",
             `manifestType=${payload.manifestType}`,
           );
-          return handleManifest14(payload, appDataPath);
+          return handleManifest14(payload, appDataPath, { protocolVersion: connection.protocolVersion });
         }
         case "SYNC_TOPIC_DIFF_REQUEST": {
           const topicCount = Array.isArray(payload.topics) ? payload.topics.length : 0;
           logger.logOperation("websocket", "message", payload.type, "info", `topics=${topicCount}`);
-          return handleTopicDiff14(payload, appDataPath);
+          return handleTopicDiff14(payload, appDataPath, { protocolVersion: connection.protocolVersion });
         }
         case "SYNC_MESSAGE_DIFF_REQUEST": {
           const topicCount = Array.isArray(payload.topics) ? payload.topics.length : 0;
           logger.logOperation("websocket", "message", payload.type, "info", `topics=${topicCount}`);
-          return handleMessageDiff14(payload, appDataPath);
+          return handleMessageDiff14(payload, appDataPath, { protocolVersion: connection.protocolVersion });
         }
         case "SYNC_MANIFEST": {
           logger.logOperation("websocket", "message", payload.type, "info", `dataType=${payload.dataType}`);
@@ -224,17 +226,36 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
         }
         case "VERSION_CHECK": {
           const manifest = require("./plugin-manifest.json");
+          // Wire 1.5 replaced the flat `mobileVersion` field with a structured
+          // `versions` claim array, so the diagnostic log must not assume it.
+          const mobileLabel = typeof payload.mobileVersion === "string"
+            ? payload.mobileVersion
+            : `claims(${(payload.versions || []).map((claim) => `${claim?.component}=${claim?.version}`).join(",")})`;
           logger.logOperation(
             "websocket",
             "version_check",
             "mobile",
             "info",
-            `mobileVersion=${payload.mobileVersion}, wire=${connection.protocolVersion}, pluginVersion=${manifest.version}`,
+            `mobileVersion=${mobileLabel}, wire=${connection.protocolVersion}, pluginVersion=${manifest.version}`,
           );
+          if (isWire15VersionCheck(payload)) {
+            const { ack, peer } = negotiateWire15VersionCheck(payload, {
+              desktopPluginVersion: manifest.version,
+              backendMode: "legacy",
+            });
+            logger.logOperation(
+              "websocket",
+              "version_check",
+              "mobile",
+              "info",
+              `wire15 mobileApp=${peer.mobileAppVersion}, backendMode=legacy`,
+            );
+            return ack;
+          }
           return createVersionAck(payload, manifest.version);
         }
         case "SYNC_ENTITY_DELETE": {
-          if (connection.protocolVersion === "1.4") {
+          if (["1.4", "1.5"].includes(connection.protocolVersion)) {
             return handleDelete14(payload, appDataPath);
           }
           const { id: rawId, dataType, topicId } = payload;
@@ -842,6 +863,7 @@ function getTopicIdFromPath(filePath) {
  * 摄取配置文件到索引
  */
 async function ingestConfigToDb(configPath, type) {
+  const { extractAgentDTO, extractGroupDTO, extractTopicDTO } = require("./dto");
   const db = getDb();
   if (!db) return;
 
@@ -854,8 +876,9 @@ async function ingestConfigToDb(configPath, type) {
     const id = config.id || path.basename(path.dirname(configPath));
 
     // 索引主实体
+    const ownerDto = type === "agent" ? extractAgentDTO(config) : extractGroupDTO(config);
     const hash = computeDtoHash(
-      config,
+      ownerDto,
       type === "agent" ? AGENT_SYNC_FIELDS : GROUP_SYNC_FIELDS,
     );
     upsertEntityIndex(id, type, configPath, hash, now);
@@ -867,7 +890,7 @@ async function ingestConfigToDb(configPath, type) {
       for (const topic of config.topics) {
         if (topic.id === "default") continue;
         const topicHash = computeDtoHash(
-          topic,
+          extractTopicDTO(topic, id, type),
           type === "group" ? GROUP_TOPIC_SYNC_FIELDS : AGENT_TOPIC_SYNC_FIELDS,
         );
         upsertEntityIndex(topic.id, "topic", configPath, topicHash, now);

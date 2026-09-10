@@ -14,9 +14,13 @@ const { sanitizeId } = require("./entity");
 const {
   extractAgentDTO,
   extractGroupDTO,
+  applyAgentDTO,
+  applyGroupDTO,
   AGENT_SYNC_FIELDS,
   GROUP_SYNC_FIELDS,
 } = require("../dto");
+
+const { createAgentConfig, createGroupConfig } = require("../config/defaults");
 
 const LOCAL_ONLY_KEY = /(?:path|dir|directory|executable)$/i;
 const SECRET_KEY = /(?:api[_-]?key|token|secret|password|credential)/i;
@@ -143,7 +147,7 @@ async function compareDesktopConfigManifest(appDataPath, remoteItems) {
   return { actions: results };
 }
 
-async function downloadDesktopConfigs(items) {
+async function downloadDesktopConfigs(items, { ownerDto = false } = {}) {
   const results = [];
   for (const item of Array.isArray(items) ? items : []) {
     const id = sanitizeId(item?.id);
@@ -156,7 +160,14 @@ async function downloadDesktopConfigs(items) {
       results.push({
         id,
         type,
-        data: sanitizeDesktopConfig(config),
+        data: ownerDto
+          ? (() => {
+              if (!config || typeof config !== "object" || Array.isArray(config)) {
+                throw new TypeError("Owner config must be an object");
+              }
+              return type === "agent" ? extractAgentDTO(config) : extractGroupDTO(config);
+            })()
+          : sanitizeDesktopConfig(config),
         hash: row.hash,
         ts: row.updated_at,
       });
@@ -167,12 +178,12 @@ async function downloadDesktopConfigs(items) {
   return { items: results };
 }
 
-async function uploadDesktopConfigs(appDataPath, items) {
+async function uploadDesktopConfigs(appDataPath, items, { ownerDto = false } = {}) {
   const results = [];
   for (const item of Array.isArray(items) ? items : []) {
     const id = sanitizeId(item?.id);
     const type = item?.type === "group" ? "group" : item?.type === "agent" ? "agent" : "";
-    if (!id || !type || !item.data || typeof item.data !== "object") {
+    if (!id || !type || !item.data || typeof item.data !== "object" || (ownerDto && Array.isArray(item.data))) {
       results.push({ id: id || item?.id, type, success: false, error: "Invalid item" });
       continue;
     }
@@ -192,31 +203,61 @@ async function uploadDesktopConfigs(appDataPath, items) {
     const release = await acquireLock(filePath);
     try {
       let existing = {};
+      let missing = false;
       try {
         existing = JSON.parse(await fs.readFile(filePath, "utf8"));
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
+        missing = true;
       }
-      const topics = Array.isArray(existing.topics) ? existing.topics : [];
-      const incoming = sanitizeDesktopConfig(item.data);
-      const merged = { ...existing, ...incoming, topics };
-      delete merged.avatarUrl;
+      let merged;
+      if (ownerDto) {
+        if (!existing || typeof existing !== "object" || Array.isArray(existing)) {
+          throw new TypeError("Owner config must be an object");
+        }
+        const fields = type === "agent" ? AGENT_SYNC_FIELDS : GROUP_SYNC_FIELDS;
+        const incoming = {};
+        for (const field of fields) {
+          if (Object.prototype.hasOwnProperty.call(item.data, field) &&
+              item.data[field] !== undefined) {
+            incoming[field] = item.data[field];
+          }
+        }
+        if (missing) {
+          merged = type === "agent"
+            ? createAgentConfig(id, incoming)
+            : createGroupConfig(id, incoming);
+        } else {
+          merged = { ...existing };
+          if (type === "agent") applyAgentDTO(merged, incoming);
+          else applyGroupDTO(merged, incoming);
+        }
+      } else {
+        const topics = Array.isArray(existing.topics) ? existing.topics : [];
+        const incoming = sanitizeDesktopConfig(item.data);
+        merged = { ...existing, ...incoming, topics };
+        delete merged.avatarUrl;
+      }
       if (type === "group") merged.id = id;
 
-      const tempPath = `${filePath}.tmp_${process.pid}_${Date.now()}`;
-      await fs.writeFile(tempPath, JSON.stringify(merged, null, 2), "utf8");
-      await fs.rename(tempPath, filePath);
-
+      // Finish DTO extraction, hashing and serialization before replacing the file.
+      // This does not make the subsequent file/index updates a single transaction.
+      const dto = type === "agent" ? extractAgentDTO(merged) : extractGroupDTO(merged);
+      const dtoHash = computeDtoHash(dto, type === "agent" ? AGENT_SYNC_FIELDS : GROUP_SYNC_FIELDS);
       const hash = computeDesktopConfigHash(merged);
       const updatedAt = Number(item.ts) || Date.now();
-      upsertDesktopConfigIndex(id, type, filePath, hash, updatedAt);
+      const serialized = JSON.stringify(merged, null, 2);
 
-      const dto = type === "agent" ? extractAgentDTO(merged) : extractGroupDTO(merged);
+      const tempPath = `${filePath}.tmp_${process.pid}_${Date.now()}`;
+      await fs.writeFile(tempPath, serialized, "utf8");
+      await fs.rename(tempPath, filePath);
+
+      upsertDesktopConfigIndex(id, type, filePath, hash, updatedAt);
       upsertEntityIndex(
         id,
         type,
         filePath,
-        computeDtoHash(dto, type === "agent" ? AGENT_SYNC_FIELDS : GROUP_SYNC_FIELDS),
+        dtoHash,
         updatedAt,
       );
       results.push({ id, type, success: true, hash, ts: updatedAt });

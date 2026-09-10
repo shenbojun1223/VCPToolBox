@@ -34,6 +34,8 @@ const {
   GROUP_TOPIC_SYNC_FIELDS,
   extractTopicDTO,
   applyTopicDTO,
+  extractAgentDTO,
+  extractGroupDTO,
 } = require("./dto");
 const {
   readNdjsonLines,
@@ -139,7 +141,7 @@ async function readPhysicalTopic(appDataPath, ownerType, ownerId, topicId) {
   return { config, configPath, topic };
 }
 
-async function scanPhysicalTopics(appDataPath) {
+async function scanPhysicalTopics(appDataPath, { strict = false, targetedOwners = null } = {}) {
   const results = [];
   for (const [ownerType, folder] of [["agent", "Agents"], ["group", "AgentGroups"]]) {
     const basePath = path.join(appDataPath, folder);
@@ -152,6 +154,7 @@ async function scanPhysicalTopics(appDataPath) {
     for (const entry of entries) {
       if (!entry.isDirectory() || sanitizeId(entry.name) !== entry.name) continue;
       const ownerId = entry.name;
+      if (targetedOwners && !targetedOwners.has(identityKey({ ownerType, ownerId }, "owner"))) continue;
       const configPath = path.join(basePath, ownerId, "config.json");
       try {
         const [raw, stats] = await Promise.all([
@@ -159,9 +162,27 @@ async function scanPhysicalTopics(appDataPath) {
           fs.stat(configPath),
         ]);
         const config = JSON.parse(raw);
+        if (strict && (!config || typeof config !== "object" || Array.isArray(config) ||
+            (config.topics !== undefined && !Array.isArray(config.topics)))) {
+          throw contractError("Invalid owner Topic list", "SYNC_ENTITY_READ_FAILED");
+        }
+        const seenTopics = new Set();
         for (const topic of Array.isArray(config.topics) ? config.topics : []) {
+          if (strict) {
+            requireId(topic?.id, "Topic id");
+            if (seenTopics.has(topic.id)) throw contractError("Duplicate Topic identity");
+            seenTopics.add(topic.id);
+          }
           if (!topic?.id || sanitizeId(topic.id) !== topic.id) continue;
           const dto = extractTopicDTO(topic, ownerId, ownerType);
+          if (strict) {
+            requireTimestamp(dto.createdAt, "Topic createdAt");
+            if (typeof dto.name !== "string" ||
+                (ownerType === "agent" &&
+                 (typeof dto.locked !== "boolean" || typeof dto.unread !== "boolean"))) {
+              throw contractError("Topic DTO contains invalid field types");
+            }
+          }
           results.push({
             ownerType,
             ownerId,
@@ -187,6 +208,7 @@ async function scanPhysicalTopics(appDataPath) {
             error.message,
           );
         }
+        if (strict) throw error;
       }
     }
   }
@@ -325,7 +347,7 @@ function validateTargetedOwners(manifestType, value) {
   return result;
 }
 
-function normalizeManifestItem(item, manifestType, index) {
+function normalizeManifestItem(item, manifestType, index, { protocolVersion = "1.4" } = {}) {
   if (!item || typeof item !== "object" || Array.isArray(item)) {
     throw contractError(`Manifest item ${index} must be an object`);
   }
@@ -352,6 +374,21 @@ function normalizeManifestItem(item, manifestType, index) {
       updatedAt: requireTimestamp(item.updatedAt, `Manifest item ${index} updatedAt`),
     };
   }
+  // VCPMobile 1.1.6 TopicManifestLive is metadata-only.
+  // Content hashes belong to Owner aggregation and the separate Topic diff.
+  // Keep Wire 1.4's six-field contract unchanged.
+  if (manifestType === "topic" && protocolVersion === "1.5") {
+    requireExactKeys(
+      item,
+      ["ownerType", "ownerId", "topicId", "configHash", "updatedAt"],
+      `Manifest item ${index}`,
+    );
+    return {
+      ...identity,
+      configHash: requireHash(item.configHash, `Manifest item ${index} configHash`),
+      updatedAt: requireTimestamp(item.updatedAt, `Manifest item ${index} updatedAt`),
+    };
+  }
   requireExactKeys(
     item,
     manifestType === "topic"
@@ -367,7 +404,7 @@ function normalizeManifestItem(item, manifestType, index) {
   };
 }
 
-async function localManifest14(manifestType, targetedOwners, appDataPath) {
+async function localManifest14(manifestType, targetedOwners, appDataPath, { protocolVersion = "1.4" } = {}) {
   const db = ensureWire14Tombstones();
 
   if (manifestType === "owner") {
@@ -383,6 +420,48 @@ async function localManifest14(manifestType, targetedOwners, appDataPath) {
           updatedAt: requireTimestamp(row.updated_at, `Owner ${row.id} updatedAt`),
         }
       : { ownerType: row.type, ownerId: row.id, deletedAt: row.deleted_at });
+    if (protocolVersion === "1.5") {
+      // Mobile config hashes describe the raw-config DTO, not desktop sanitized data.
+      // Owner content aggregation is handled separately; do not reuse the legacy index root.
+      const live = items.filter((item) => item.deletedAt === undefined);
+      const response = await downloadDesktopConfigs(
+        live.map((item) => ({ id: item.ownerId, type: item.ownerType })),
+        { ownerDto: true },
+      );
+      const found = new Map((response.items || []).map((item) => [
+        `${item.type}\0${item.id}`, item,
+      ]));
+      for (const item of live) {
+        const value = found.get(identityKey(item, "owner"));
+        if (!value || Object.prototype.hasOwnProperty.call(value, "error") ||
+            !value.data || typeof value.data !== "object" || Array.isArray(value.data)) {
+          throw contractError("Cannot read mobile owner DTO for manifest", "SYNC_ENTITY_READ_FAILED");
+        }
+        const dto = extractOwnerEntityDTO(value.data, item.ownerType);
+        item.configHash = requireHash(
+          computeDtoHash(dto, Object.keys(dto)), "Mobile owner configHash",
+        );
+      }
+      // Wire 1.5: aggregate live Topic identity/config/content leaves, not the legacy index root.
+      const ownerKeys = new Set(live.map((item) => identityKey(item, "owner")));
+      const topics = ownerKeys.size
+        ? await localManifest14("topic", ownerKeys, appDataPath, { protocolVersion })
+        : [];
+      const leavesByOwner = new Map(live.map((item) => [identityKey(item, "owner"), []]));
+      for (const topic of topics) {
+        if (topic.deletedAt !== undefined) continue;
+        const leaves = leavesByOwner.get(identityKey(topic, "owner"));
+        if (!leaves) throw contractError("Unexpected owner in mobile Topic aggregate");
+        leaves.push(crypto.createHash("sha256").update(stableStringify14({
+          topicId: topic.topicId,
+          configHash: requireHash(topic.configHash, "Topic configHash"),
+          contentHash: requireHash(topic.contentHash, "Topic contentHash", { empty: true }),
+        })).digest("hex"));
+      }
+      for (const item of live) {
+        item.contentHash = aggregateHashes14(leavesByOwner.get(identityKey(item, "owner")));
+      }
+    }
     const byIdentity = new Map(items.map((item) => [identityKey(item, "owner"), item]));
     for (const tombstone of wire14Tombstones("owner")) {
       const item = {
@@ -418,7 +497,9 @@ async function localManifest14(manifestType, targetedOwners, appDataPath) {
     return [...byIdentity.values()];
   }
 
-  const items = (await scanPhysicalTopics(appDataPath)).filter((item) =>
+  const items = (await scanPhysicalTopics(appDataPath, protocolVersion === "1.5"
+    ? { strict: true, targetedOwners }
+    : {})).filter((item) =>
     !targetedOwners || targetedOwners.has(identityKey(item, "owner"))
   );
   const byIdentity = new Map(items.map((item) => [identityKey(item, "topic"), item]));
@@ -433,10 +514,17 @@ async function localManifest14(manifestType, targetedOwners, appDataPath) {
       byIdentity.set(identityKey(item, "topic"), item);
     }
   }
+  if (protocolVersion === "1.5") {
+    for (const item of byIdentity.values()) {
+      if (item.deletedAt !== undefined) continue;
+      const state = await desktopMessageState14(appDataPath, item, { protocolVersion });
+      item.contentHash = requireHash(state.contentHash, "Topic contentHash", { empty: true });
+    }
+  }
   return [...byIdentity.values()];
 }
 
-async function handleManifest14(payload, appDataPath) {
+async function handleManifest14(payload, appDataPath, { protocolVersion = "1.4" } = {}) {
   const { manifestType, items, targetedOwners } = payload;
   if (!["owner", "topic", "avatar"].includes(manifestType)) {
     throw contractError(`Unsupported manifestType ${manifestType}`);
@@ -445,7 +533,7 @@ async function handleManifest14(payload, appDataPath) {
     throw contractError(`${manifestType} manifest must contain at most 10000 items`);
   }
   const ownerFilter = validateTargetedOwners(manifestType, targetedOwners);
-  const remote = items.map((item, index) => normalizeManifestItem(item, manifestType, index));
+  const remote = items.map((item, index) => normalizeManifestItem(item, manifestType, index, { protocolVersion }));
   const remoteMap = new Map();
   for (const item of remote) {
     if (manifestType === "topic" && !ownerFilter.has(identityKey(item, "owner"))) {
@@ -455,7 +543,7 @@ async function handleManifest14(payload, appDataPath) {
     if (remoteMap.has(key)) throw contractError(`${manifestType} manifest contains a duplicate identity`);
     remoteMap.set(key, item);
   }
-  const local = await localManifest14(manifestType, ownerFilter, appDataPath);
+  const local = await localManifest14(manifestType, ownerFilter, appDataPath, { protocolVersion });
   const localMap = new Map(local.map((item) => [identityKey(item, manifestType), item]));
   const results = [];
   const processed = new Set();
@@ -503,7 +591,7 @@ async function handleManifest14(payload, appDataPath) {
   return { type: "SYNC_MANIFEST_RESULT", manifestType, results };
 }
 
-async function handleTopicDiff14(payload, appDataPath) {
+async function handleTopicDiff14(payload, appDataPath, { protocolVersion = "1.4" } = {}) {
   if (!Array.isArray(payload.topics) || payload.topics.length > MAX_MANIFEST_ITEMS) {
     throw contractError("SYNC_TOPIC_DIFF_REQUEST.topics must be an array of at most 10000 items");
   }
@@ -544,7 +632,7 @@ async function handleTopicDiff14(payload, appDataPath) {
         ? GROUP_TOPIC_SYNC_FIELDS
         : AGENT_TOPIC_SYNC_FIELDS,
     );
-    const desktop = await desktopMessageState14(appDataPath, state);
+    const desktop = await desktopMessageState14(appDataPath, state, { protocolVersion });
     if (configHash !== state.configHash || desktop.contentHash !== state.contentHash) {
       changedTopics.push(actionIdentity(state, "topic"));
     }
@@ -604,7 +692,7 @@ function validateMessageState(value) {
     Number.isSafeInteger(value.updatedAt) && value.updatedAt >= 0;
 }
 
-async function desktopMessageState14(appDataPath, state) {
+async function desktopMessageState14(appDataPath, state, { protocolVersion = "1.4" } = {}) {
   const physical = await readPhysicalTopic(
     appDataPath,
     state.ownerType,
@@ -648,12 +736,18 @@ async function desktopMessageState14(appDataPath, state) {
   return {
     messages,
     contentHash: aggregateHashes14(
-      [...messages.values()].filter((item) => item.deletedAt == null).map((item) => item.hash),
+      [...messages.entries()]
+        .filter(([, item]) => item.deletedAt == null)
+        .map(([id, item]) => protocolVersion === "1.5"
+          ? crypto.createHash("sha256")
+              .update(stableStringify14({ id, hash: item.hash }))
+              .digest("hex")
+          : item.hash),
     ),
   };
 }
 
-async function handleMessageDiff14(payload, appDataPath) {
+async function handleMessageDiff14(payload, appDataPath, { protocolVersion = "1.4" } = {}) {
   if (!Array.isArray(payload.topics) || payload.topics.length > MAX_MANIFEST_ITEMS) {
     throw contractError("SYNC_MESSAGE_DIFF_REQUEST.topics must be an array of at most 10000 items");
   }
@@ -690,7 +784,7 @@ async function handleMessageDiff14(payload, appDataPath) {
 
     const identity = actionIdentity(state, "topic");
     try {
-      const desktop = await desktopMessageState14(appDataPath, state);
+      const desktop = await desktopMessageState14(appDataPath, state, { protocolVersion });
       const mobileHasTombstones = Object.values(state.messages).some((item) =>
         Object.prototype.hasOwnProperty.call(item, "deletedAt")
       );
@@ -838,23 +932,68 @@ function entityPublic(item) {
     : { entityType: "owner", ownerType: item.ownerType, ownerId: item.ownerId };
 }
 
+/**
+ * Owner 实体的对外 DTO 必须与客户端 VCPMobileSync 2.0.0 同源：
+ * 只暴露 AGENT_SYNC_FIELDS / GROUP_SYNC_FIELDS 白名单字段。
+ * 直接回吐桌面全量配置（uiCollapseStates/customCss/top_p/…）会被
+ * 移动端 untagged enum EntityPullData 以“无变体匹配”整批拒绝。
+ */
+async function extractTopicPullDTO(physical, item, mobileDto) {
+  const dto = extractTopicDTO(physical.topic, item.ownerId, item.ownerType);
+  if (!mobileDto) return dto;
+  if (!Number.isSafeInteger(dto.createdAt)) {
+    throw contractError("Topic createdAt must be a safe integer");
+  }
+  if (typeof dto.id !== "string" || typeof dto.name !== "string" ||
+      typeof dto.ownerId !== "string" ||
+      (item.ownerType === "agent" &&
+       (typeof dto.locked !== "boolean" || typeof dto.unread !== "boolean"))) {
+    throw contractError("Topic DTO contains invalid field types");
+  }
+  const fields = item.ownerType === "group"
+    ? GROUP_TOPIC_SYNC_FIELDS : AGENT_TOPIC_SYNC_FIELDS;
+  const configHash = requireHash(computeDtoHash(dto, fields), "Topic configHash");
+  const stats = await fs.stat(physical.configPath);
+  // Match the current physical Topic manifest timestamp policy.
+  // Per-Topic version persistence and snapshot consistency need separate validation.
+  const updatedAt = requireTimestamp(Math.trunc(stats.mtimeMs), "Topic updatedAt");
+  return { ...dto, configHash, updatedAt };
+}
+
+function extractOwnerEntityDTO(config, ownerType) {
+  const source =
+    config && typeof config === "object" && !Array.isArray(config) ? config : {};
+  return ownerType === "group"
+    ? extractGroupDTO(source)
+    : extractAgentDTO(source);
+}
+
 function resultError(error, fallback) {
   return normalizeSyncError(error, fallback);
 }
 
-async function pullEntities14(items, appDataPath) {
+async function pullEntities14(items, appDataPath, { ownerDto = true } = {}) {
   await refreshDesktopConfigIndex(appDataPath);
   const owners = items.filter((item) => item.entityType === "owner");
   const topics = items.filter((item) => item.entityType === "topic");
   const results = [];
   if (owners.length) {
-    const response = await downloadDesktopConfigs(owners.map((item) => ({ id: item.ownerId, type: item.ownerType })));
+    const response = await downloadDesktopConfigs(owners.map((item) => ({ id: item.ownerId, type: item.ownerType })), { ownerDto });
     const found = new Map((response.items || []).map((item) => [`${item.type}\0${item.id}`, item]));
     for (const item of owners) {
       const value = found.get(`${item.ownerType}\0${item.ownerId}`);
-      results.push(value
-        ? { ...entityPublic(item), ok: true, data: value.data }
-        : { ...entityPublic(item), ok: false, error: resultError("entity not found", { code: "SYNC_ENTITY_NOT_FOUND", stage: "owner_metadata" }) });
+      if (!value) {
+        results.push({ ...entityPublic(item), ok: false, error: resultError("entity not found", { code: "SYNC_ENTITY_NOT_FOUND", stage: "owner_metadata" }) });
+      } else if (Object.prototype.hasOwnProperty.call(value, "error") ||
+                 !value.data || typeof value.data !== "object" || Array.isArray(value.data)) {
+        results.push({ ...entityPublic(item), ok: false, error: resultError(value.error || "Invalid owner DTO", { code: "SYNC_ENTITY_READ_FAILED", stage: "owner_metadata" }) });
+      } else {
+        try {
+          results.push({ ...entityPublic(item), ok: true, data: ownerDto ? extractOwnerEntityDTO(value.data, item.ownerType) : value.data });
+        } catch (error) {
+          results.push({ ...entityPublic(item), ok: false, error: resultError(error, { code: "SYNC_ENTITY_READ_FAILED", stage: "owner_metadata" }) });
+        }
+      }
     }
   }
   if (topics.length) {
@@ -870,11 +1009,7 @@ async function pullEntities14(items, appDataPath) {
           ? {
               ...entityPublic(item),
               ok: true,
-              data: extractTopicDTO(
-                physical.topic,
-                item.ownerId,
-                item.ownerType,
-              ),
+              data: await extractTopicPullDTO(physical, item, ownerDto),
             }
           : {
               ...entityPublic(item),
@@ -901,7 +1036,7 @@ async function pullEntities14(items, appDataPath) {
   return results;
 }
 
-async function pushEntities14(items, appDataPath) {
+async function pushEntities14(items, appDataPath, { ownerDto = true } = {}) {
   const owners = items.filter((item) => item.entityType === "owner");
   const topics = items.filter((item) => item.entityType === "topic");
   const results = [];
@@ -911,7 +1046,7 @@ async function pushEntities14(items, appDataPath) {
       type: item.ownerType,
       data: item.data,
       ts: Date.now(),
-    })));
+    })), { ownerDto });
     const found = new Map((response.items || []).map((item) => [`${item.type}\0${item.id}`, item]));
     for (const item of owners) {
       const value = found.get(`${item.ownerType}\0${item.ownerId}`);
@@ -948,7 +1083,7 @@ async function pushEntities14(items, appDataPath) {
   return results;
 }
 
-async function pullMessages14(topic, appDataPath) {
+async function pullMessages14(topic, appDataPath, { ownerDto = false } = {}) {
   const physical = await readPhysicalTopic(
     appDataPath,
     topic.ownerType,
@@ -982,6 +1117,7 @@ async function pullMessages14(topic, appDataPath) {
   }
   const messages = selected.map((message) => {
     const { contentHash, ...value } = message;
+    if (ownerDto) value.contentHash = messageHash14(message);
     value.updatedAt = Number.isSafeInteger(value.updatedAt)
       ? value.updatedAt
       : Number.isSafeInteger(value.timestamp)
@@ -1123,6 +1259,15 @@ function sendRouteError(res, status, error, fallback) {
   return res.status(status).json(createHttpErrorBody(error, fallback));
 }
 
+// Representation selection only; the parent router still authenticates every request.
+// An absent header selects the mobile DTO contract. Older desktop clients must upgrade.
+function resolveHttpOwnerContract(req) {
+  const contract = req.headers?.["x-vcp-sync-contract"];
+  if (contract === undefined) return { ownerDto: true };
+  if (contract === "desktop-full-v1") return { ownerDto: false };
+  throw contractError("Unsupported X-VCP-Sync-Contract", "SYNC_REQUEST_INVALID");
+}
+
 function registerWire14Routes(router, { appDataPath }) {
   router.post("/entities/pull", express.json({ limit: "10mb" }), async (req, res) => {
     try {
@@ -1137,7 +1282,7 @@ function registerWire14Routes(router, { appDataPath }) {
         if (seen.has(key)) throw contractError("Entity batch contains a duplicate identity", "SYNC_REQUEST_INVALID");
         seen.add(key);
       }
-      res.json({ results: await pullEntities14(items, appDataPath) });
+      res.json({ results: await pullEntities14(items, appDataPath, resolveHttpOwnerContract(req)) });
     } catch (error) {
       sendRouteError(res, error.code === "SYNC_REQUEST_INVALID" || error.code === "SYNC_PROTOCOL_INVALID" ? 400 : 500, error, {
         code: error.code || "SYNC_ENTITY_READ_FAILED",
@@ -1159,7 +1304,7 @@ function registerWire14Routes(router, { appDataPath }) {
         if (seen.has(key)) throw contractError("Entity batch contains a duplicate identity", "SYNC_REQUEST_INVALID");
         seen.add(key);
       }
-      res.json({ results: await pushEntities14(items, appDataPath) });
+      res.json({ results: await pushEntities14(items, appDataPath, resolveHttpOwnerContract(req)) });
     } catch (error) {
       sendRouteError(res, error.code === "SYNC_REQUEST_INVALID" || error.code === "SYNC_PROTOCOL_INVALID" ? 400 : 500, error, {
         code: error.code || "SYNC_ENTITY_WRITE_FAILED",
@@ -1170,6 +1315,7 @@ function registerWire14Routes(router, { appDataPath }) {
 
   router.post("/messages/pull", express.json({ limit: "5mb" }), async (req, res) => {
     try {
+      const contract = resolveHttpOwnerContract(req);
       requireExactKeys(req.body || {}, ["topics"], "Message pull request");
       const topics = req.body.topics;
       if (!Array.isArray(topics) || topics.length === 0) {
@@ -1184,7 +1330,7 @@ function registerWire14Routes(router, { appDataPath }) {
       res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
       for (const topic of topics) {
         try {
-          res.write(`${JSON.stringify(await pullMessages14(topic, appDataPath))}\n`);
+          res.write(`${JSON.stringify(await pullMessages14(topic, appDataPath, contract))}\n`);
         } catch (error) {
           res.write(`${JSON.stringify({
             kind: "topic",

@@ -24,6 +24,10 @@ function initDb(dbPath) {
 
   closeDb();
   db = new Database(dbPath);
+  // Wait out short-lived cross-process write contention instead of failing
+  // immediately and poisoning an otherwise valid topic for the whole session.
+  db.pragma("busy_timeout = 2000");
+  db.pragma("journal_mode = WAL");
 
   // 1. 实体索引表 (Agent, Group, Topic)
   db.exec(`

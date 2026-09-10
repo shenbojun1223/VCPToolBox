@@ -592,6 +592,123 @@ test("Wire 1.1 topic manifest 可省略 ownerId 和临时空 hash，Wire 1.2 保
   );
 });
 
+test("Wire 1.2 仅接受精确的空 Topic 占位哈希形态", () => {
+  const database = fakeManifestDatabase();
+  const emptyTopic = {
+    id: "topic-wire12-empty",
+    hash: "",
+    configHash: "",
+    contentHash: "",
+    ts: 1,
+    ownerType: "agent",
+    ownerId: "agent-a",
+  };
+  const payload = {
+    dataType: "topic",
+    phase: 2,
+    targetedOwners: ["agent-a"],
+    data: [emptyTopic],
+  };
+
+  assert.deepEqual(
+    handleSyncManifest(payload, database, { protocolVersion: "1.2" }).data,
+    [{
+      id: "topic-wire12-empty",
+      action: "PUSH",
+      ownerType: "agent",
+      ownerId: "agent-a",
+    }],
+  );
+
+  assert.deepEqual(
+    handleSyncManifest(
+      {
+        ...payload,
+        data: [{ ...emptyTopic, deletedAt: 2 }],
+      },
+      database,
+      { protocolVersion: "1.2" },
+    ).data,
+    [{
+      id: "topic-wire12-empty",
+      action: "DELETE",
+      deletedAt: 2,
+      ownerType: "agent",
+      ownerId: "agent-a",
+    }],
+  );
+
+  const authoritativeHash = "e".repeat(64);
+  const existingDatabase = fakeManifestDatabase({
+    entities: [{
+      id: "topic-wire12-empty",
+      type: "topic",
+      file_path: "/app/Agents/agent-a/config.json",
+      hash: authoritativeHash,
+      aggregated_hash: "",
+      updated_at: 1,
+      deleted_at: null,
+    }],
+  });
+  assert.deepEqual(
+    handleSyncManifest(
+      {
+        ...payload,
+        data: [{ ...emptyTopic, ts: 999 }],
+      },
+      existingDatabase,
+      { protocolVersion: "1.2" },
+    ).data,
+    [{
+      id: "topic-wire12-empty",
+      action: "PULL",
+      ownerType: "agent",
+      ownerId: "agent-a",
+    }],
+  );
+
+  assert.throws(
+    () => handleSyncManifest(payload, database, { protocolVersion: "1.4" }),
+    (error) => error.code === "SYNC_PROTOCOL_INVALID",
+  );
+  assert.throws(
+    () => handleSyncManifest(
+      {
+        ...payload,
+        data: [{ ...emptyTopic, deletedAt: -1 }],
+      },
+      database,
+      { protocolVersion: "1.2" },
+    ),
+    (error) => error.code === "SYNC_PROTOCOL_INVALID",
+  );
+  assert.throws(
+    () => handleSyncManifest(
+      {
+        ...payload,
+        data: [{ ...emptyTopic, hash: "not-a-sha256" }],
+      },
+      database,
+      { protocolVersion: "1.2" },
+    ),
+    (error) => error.code === "SYNC_PROTOCOL_INVALID",
+  );
+  assert.throws(
+    () => handleSyncManifest(
+      {
+        ...payload,
+        data: [{
+          ...emptyTopic,
+          configHash: "d".repeat(64),
+        }],
+      },
+      database,
+      { protocolVersion: "1.2" },
+    ),
+    (error) => error.code === "SYNC_PROTOCOL_INVALID",
+  );
+});
+
 test("损坏 history 的旧索引不能走 topic hash 或消息 manifest 快速成功", () => {
   const topicId = "topic-unhealthy";
   markHistoryTopicUnhealthy(topicId, new Error("invalid JSON"));

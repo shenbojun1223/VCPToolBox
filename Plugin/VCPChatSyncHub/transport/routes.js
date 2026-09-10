@@ -93,7 +93,7 @@ function registerRoutes(app, { syncToken, appDataPath, centralSync = null }) {
   // CORS 和认证中间件
   router.use(async (req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Headers", "x-sync-token, Authorization, Content-Type");
+    res.header("Access-Control-Allow-Headers", "x-sync-token, Authorization, Content-Type, X-VCP-Sync-Contract");
     if (req.method === "OPTIONS") return res.sendStatus(200);
 
     let providedToken = req.headers["x-sync-token"] || req.query.token;

@@ -14,8 +14,9 @@ const {
   validateSyncRequestFrame,
 } = require("../Plugin/VCPChatSyncHub/protocol");
 
-test("插件包升级到 1.4，同时保持 Wire 1.2 的广告版本", () => {
-  assert.equal(manifest.version, "1.4.0");
+test("插件包升级不改变 Wire 1.2 的广告版本", () => {
+  // 包版本随 manifest 演进，但 Wire 1.2 的握手必须始终广告 1.2.0。
+  assert.equal(manifest.version, "2.0.0");
   assert.deepEqual(
     createVersionAck(
       {
@@ -34,8 +35,9 @@ test("插件包升级到 1.4，同时保持 Wire 1.2 的广告版本", () => {
   );
 });
 
-test("VCPChat desktop 协商 Wire 1.4", () => {
+test("VCPChat desktop 协商 Wire 1.4 且广告稳定的兼容版本", () => {
   assert.equal(WIRE_14_PROTOCOL_VERSION, "1.4");
+  // 客户端锁死 1.4.0 契约；包升级到 2.x 也不得把真实 manifest 版本透传出去。
   assert.deepEqual(
     createVersionAck(
       {

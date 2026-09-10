@@ -275,6 +275,58 @@ test("Wire 1.4 handshake, compound manifest, diff and unified HTTP routes", { ti
   assert.equal(ownerBody.results[0].ok, true);
   assert.equal(ownerBody.results[0].data.name, "Wire 14");
   assert.equal(ownerBody.results[0].data.topics, undefined);
+  // Owner token HTTP roundtrip regression: only synthetic temporary AppData.
+  const ownerConfigFile = path.join(appDataPath, "Agents", ownerId, "config.json");
+  const ownerBefore = JSON.parse(await fs.readFile(ownerConfigFile, "utf8"));
+  ownerBefore.customCss = ".owner-roundtrip { color: teal; }";
+  ownerBefore.uiCollapseStates = { fixture: true };
+  await fs.writeFile(ownerConfigFile, JSON.stringify(ownerBefore), "utf8");
+  const ownerDto = {
+    ...ownerBody.results[0].data,
+    contextTokenLimit: 12345,
+    maxOutputTokens: 6789,
+  };
+  const ownerSelector = { entityType: "owner", ownerType: "agent", ownerId };
+  const ownerPushResponse = await fetch(`${baseUrl}/entities/push`, {
+    method: "POST", headers,
+    body: JSON.stringify({ items: [{ ...ownerSelector, data: ownerDto }] }),
+  });
+  assert.equal(ownerPushResponse.status, 200);
+  const ownerPushResult = await ownerPushResponse.json();
+  assert.equal(ownerPushResult.results.length, 1);
+  assert.equal(ownerPushResult.results[0].ok, true);
+  const ownerAfter = JSON.parse(await fs.readFile(ownerConfigFile, "utf8"));
+  assert.equal(ownerAfter.contextTokenLimit, 12345);
+  assert.equal(ownerAfter.maxOutputTokens, 6789);
+  assert.equal(ownerAfter.customCss, ownerBefore.customCss);
+  assert.deepEqual(ownerAfter.uiCollapseStates, ownerBefore.uiCollapseStates);
+  assert.deepEqual(ownerAfter.topics, ownerBefore.topics);
+
+  const ownerRoundtripResponse = await fetch(`${baseUrl}/entities/pull`, {
+    method: "POST", headers,
+    body: JSON.stringify({ items: [ownerSelector] }),
+  });
+  assert.equal(ownerRoundtripResponse.status, 200);
+  const ownerRoundtrip = await ownerRoundtripResponse.json();
+  assert.equal(ownerRoundtrip.results.length, 1);
+  assert.equal(ownerRoundtrip.results[0].ok, true);
+  assert.deepEqual(ownerRoundtrip.results[0].data, ownerDto);
+  assert.deepEqual(Object.keys(ownerRoundtrip.results[0].data).sort(), [
+    "name", "systemPrompt", "model", "temperature",
+    "contextTokenLimit", "maxOutputTokens", "streamOutput",
+  ].sort());
+
+  const fullOwnerResponse = await fetch(`${baseUrl}/entities/pull`, {
+    method: "POST",
+    headers: { ...headers, "X-VCP-Sync-Contract": "desktop-full-v1" },
+    body: JSON.stringify({ items: [ownerSelector] }),
+  });
+  assert.equal(fullOwnerResponse.status, 200);
+  const fullOwner = await fullOwnerResponse.json();
+  assert.equal(fullOwner.results[0].ok, true);
+  assert.equal(fullOwner.results[0].data.customCss, ownerBefore.customCss);
+  assert.deepEqual(fullOwner.results[0].data.uiCollapseStates, ownerBefore.uiCollapseStates);
+  assert.equal(fullOwner.results[0].data.topics, undefined);
 
   const topicPull = await fetch(`${baseUrl}/entities/pull`, {
     method: "POST",
@@ -297,6 +349,65 @@ test("Wire 1.4 handshake, compound manifest, diff and unified HTTP routes", { ti
   assert.equal(messageFrame.ok, true);
   assert.equal(messageFrame.messages[0].id, message.id);
   assert.equal(Number.isSafeInteger(messageFrame.messages[0].updatedAt), true);
+
+  // Unmarked HTTP requests use the mobile DTO representation.
+  const mobileTopic = topicBody.results[0].data;
+  assert.deepEqual(Object.keys(mobileTopic).sort(), [
+    "id", "name", "createdAt", "locked", "unread", "ownerId",
+    "configHash", "updatedAt",
+  ].sort());
+  assert.equal(mobileTopic.configHash, getEntityIndex(topicId, "topic").hash);
+  assert.equal(Number.isSafeInteger(mobileTopic.updatedAt), true);
+  assert.ok(mobileTopic.updatedAt >= 0);
+  assert.equal(messageFrame.messages[0].contentHash, messageHash14(message));
+
+  // Explicit desktop requests retain their existing wire representation.
+  const desktopHeaders = { ...headers, "X-VCP-Sync-Contract": "desktop-full-v1" };
+  const desktopTopicResponse = await fetch(`${baseUrl}/entities/pull`, {
+    method: "POST",
+    headers: desktopHeaders,
+    body: JSON.stringify({
+      items: [{ entityType: "topic", ownerType: "agent", ownerId, topicId }],
+    }),
+  });
+  assert.equal(desktopTopicResponse.status, 200);
+  const desktopTopicBody = await desktopTopicResponse.json();
+  assert.equal(desktopTopicBody.results[0].ok, true);
+  const { configHash: mobileConfigHash, updatedAt: mobileUpdatedAt, ...baseTopic } = mobileTopic;
+  assert.deepEqual(desktopTopicBody.results[0].data, baseTopic);
+
+  const desktopMessageResponse = await fetch(`${baseUrl}/messages/pull`, {
+    method: "POST",
+    headers: desktopHeaders,
+    body: JSON.stringify({
+      topics: [{ topicId, ownerType: "agent", ownerId, messageIds: [message.id] }],
+    }),
+  });
+  assert.equal(desktopMessageResponse.status, 200);
+  const desktopMessageFrame = JSON.parse((await desktopMessageResponse.text()).trim());
+  assert.equal(desktopMessageFrame.ok, true);
+  const { contentHash: mobileMessageHash, ...baseMessage } = messageFrame.messages[0];
+  assert.deepEqual(desktopMessageFrame.messages, [baseMessage]);
+
+  // Invalid selectors fail before any successful NDJSON frame is emitted.
+  for (const [endpoint, body] of [
+    ["/entities/pull", {
+      items: [{ entityType: "owner", ownerType: "agent", ownerId }],
+    }],
+    ["/messages/pull", {
+      topics: [{ topicId, ownerType: "agent", ownerId, messageIds: [message.id] }],
+    }],
+  ]) {
+    const rejected = await fetch(`${baseUrl}${endpoint}`, {
+      method: "POST",
+      headers: { ...headers, "X-VCP-Sync-Contract": "invalid-contract" },
+      body: JSON.stringify(body),
+    });
+    assert.equal(rejected.status, 400, endpoint);
+    const rejectedText = await rejected.text();
+    assert.doesNotThrow(() => JSON.parse(rejectedText));
+    assert.equal(rejectedText.includes('"kind":"topic"'), false);
+  }
 
   const pushedMessage = {
     id: "message-wire14-pushed",

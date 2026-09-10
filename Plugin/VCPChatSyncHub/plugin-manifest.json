@@ -1,8 +1,8 @@
 {
   "name": "VCPChatSyncHub",
   "displayName": "VCPChat Central Sync Hub",
-  "version": "1.4.0",
-  "description": "Central bidirectional sync hub for VCPChat desktop clients and VCPMobile Wire 1.1/1.2/1.4.",
+  "version": "2.0.0",
+  "description": "Central bidirectional sync hub for VCPChat desktop clients and VCPMobile. Supports Wire 1.1 legacy, Wire 1.2 strict, Wire 1.4 compound-identity and Wire 1.5 structured component handshake with backendMode declaration.",
   "author": "Nova",
   "pluginType": "service",
   "entryPoint": {
