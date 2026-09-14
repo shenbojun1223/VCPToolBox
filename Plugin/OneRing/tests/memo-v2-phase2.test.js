@@ -315,6 +315,16 @@ test('reducer enforces status, thread id, safety, and quantity limits', () => {
     ]) {
         assert.throws(() => validateReduction({ facts: [{ text, sourceMessageIds: ['68'] }], threadUpdates: [] }, { delta }), error => error.code === 'MEMO_V2_UNSAFE_TEXT');
     }
+    for (const token of [NEW_THREAD_WIRE_TOKEN, NO_ASSIGNEE_WIRE_TOKEN]) {
+        assert.throws(
+            () => validateReduction({ facts: [{ text: `非法正文 ${token}`, sourceMessageIds: ['68'] }], threadUpdates: [] }, { delta }),
+            error => error.code === 'MEMO_V2_RESERVED_TOKEN_MISUSE'
+        );
+        assert.throws(
+            () => validateReduction({ facts: [{ text: '合法正文', sourceMessageIds: [token] }], threadUpdates: [] }, { delta }),
+            error => error.code === 'MEMO_V2_RESERVED_TOKEN_MISUSE'
+        );
+    }
     const tooMany = Array.from({ length: MAX_FACTS + 1 }, (_, index) => ({ text: `事实 ${index}`, sourceMessageIds: ['68'] }));
     assert.throws(() => validateReduction({ facts: tooMany, threadUpdates: [] }, { delta }), error => error.code === 'MEMO_V2_LIMIT_EXCEEDED');
 });
@@ -938,11 +948,6 @@ test('semantic, unsafe, assignee, length, and safety failures never format-retry
         },
         {
             delta: makeDelta([event(68, '2026-08-21 10:00:00', 'Lucy')]),
-            reduction: { facts: [], threadUpdates: [{ ...validReduction().threadUpdates[0], status: 'invalid' }] },
-            code: 'MEMO_V2_INVALID_STATUS'
-        },
-        {
-            delta: makeDelta([event(68, '2026-08-21 10:00:00', 'Lucy')]),
             reduction: null,
             finishReason: 'length',
             code: 'MEMO_V2_MODEL_TRUNCATED'
@@ -978,6 +983,77 @@ test('semantic, unsafe, assignee, length, and safety failures never format-retry
         assert.equal(result.stats.formatRetryCount, 0);
         assert.equal(result.cursorAdvanced, false);
     }
+});
+
+test('invalid status retries the complete format once and preserves strict validation', async () => {
+    const delta = makeDelta([event(68, '2026-08-21 10:00:00', 'Lucy')]);
+    const invalid = { ...validReduction(), threadUpdates: [{ ...validReduction().threadUpdates[0], status: 'invalid' }] };
+    const requests = [];
+    let calls = 0;
+    let writes = 0;
+    const result = await generateShadowCandidate({
+        agentName: 'fixture-agent',
+        delta,
+        previousState: delta.previousState,
+        model: 'offline',
+        writeCandidate: true,
+        store: { writeCandidate: () => { writes++; } },
+        modelClient: {
+            complete: async request => {
+                requests.push(request);
+                calls++;
+                return calls === 1 ? toolResponse(invalid) : toolResponse(validReduction());
+            }
+        }
+    });
+    assert.equal(result.ok, true);
+    assert.equal(calls, 2);
+    assert.equal(writes, 1);
+    assert.equal(result.stats.modelCallCount, 2);
+    assert.equal(result.stats.formatRetryCount, 1);
+    assert.deepEqual(result.stats.formatFailureCodes, ['MEMO_V2_INVALID_STATUS']);
+    assert.equal(result.stats.batchFormatAttempts[0], 2);
+    assert.equal(requests.length, 2);
+    assert.equal(result.state.cursor.lastMessageId, 100);
+
+    assert.throws(
+        () => validateReduction(invalid, { delta }),
+        error => error.code === 'MEMO_V2_INVALID_STATUS'
+    );
+});
+
+test('three invalid status attempts exhaust the bounded retry budget without candidate', async () => {
+    const delta = makeDelta([event(68, '2026-08-21 10:00:00', 'Lucy')]);
+    const invalid = { ...validReduction(), threadUpdates: [{ ...validReduction().threadUpdates[0], status: 'invalid' }] };
+    let calls = 0;
+    let writes = 0;
+    const result = await generateShadowCandidate({
+        agentName: 'fixture-agent',
+        delta,
+        previousState: delta.previousState,
+        model: 'offline',
+        writeCandidate: true,
+        store: { writeCandidate: () => { writes++; } },
+        modelClient: {
+            complete: async () => {
+                calls++;
+                return toolResponse(invalid);
+            }
+        }
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, 'MEMO_V2_INVALID_STATUS');
+    assert.equal(result.error.batchIndex, 0);
+    assert.equal(calls, 3);
+    assert.equal(writes, 0);
+    assert.equal(result.candidateWritten, false);
+    assert.equal(result.stats.modelCallCount, 3);
+    assert.equal(result.stats.formatRetryCount, 2);
+    assert.deepEqual(result.stats.formatFailureCodes, [
+        'MEMO_V2_INVALID_STATUS',
+        'MEMO_V2_INVALID_STATUS',
+        'MEMO_V2_INVALID_STATUS'
+    ]);
 });
 
 test('unknown, stale-only, cross-date, and unknown-date sources never format-retry', async () => {
@@ -1231,6 +1307,67 @@ test('shadow CLI defaults to metrics only and rejects partial model switches', a
         generateShadowCandidate({ agentName: 'fixture-agent', delta: makeDelta([event(68, '2026-08-21 10:00:00')]), formatRetries: 4 }),
         error => error.code === 'MEMO_V2_FORMAT_RETRIES_INVALID'
     );
+});
+
+test('shadow CLI failure emits recoverable safe metadata and keeps the original error code', async () => {
+    const delta = makeDelta([event('68', '2026-08-21 10:00:00', 'Lucy', '正文不应出现在失败元数据')]);
+    const invalid = { ...validReduction(), threadUpdates: [{ ...validReduction().threadUpdates[0], status: 'invalid' }] };
+    let calls = 0;
+    let writes = 0;
+    let stdout = '';
+    const originalWrite = process.stdout.write;
+    process.stdout.write = chunk => { stdout += String(chunk); return true; };
+    try {
+        const result = await shadowMain([
+            '--agent', 'fixture-agent', '--call-model', '--write-candidate', '--model', 'offline'
+        ], {
+            buildDelta: () => delta,
+            store: { writeCandidate: () => { writes++; } },
+            modelClient: {
+                complete: async () => {
+                    calls++;
+                    return toolResponse(invalid);
+                }
+            }
+        });
+        assert.equal(result.ok, false);
+    } finally {
+        process.stdout.write = originalWrite;
+    }
+    const lastLine = stdout.trim().split(/\r?\n/u).at(-1);
+    const metrics = JSON.parse(lastLine);
+    const allowedKeys = new Set([
+        'ok', 'errorCode', 'failedBatchIndex', 'failedBatchNumber', 'plannedBatchCount',
+        'processedBatchCount', 'modelCallCount', 'formatRetryCount', 'candidateWritten',
+        'totalCanonicalEventCount', 'coveredCanonicalEventCount', 'droppedCanonicalEventCount',
+        'duplicateCoverageCount', 'mixedDateBatchCount', 'requestBudgetChars', 'maxPromptChars',
+        'estimatedPromptChars', 'promptChars', 'batchPromptChars', 'promptWireTokenCount',
+        'promptNewThreadTokenCount', 'promptNoAssigneeTokenCount', 'batchPromptWireTokenCounts',
+        'batchPromptNewThreadTokenCounts', 'batchPromptNoAssigneeTokenCounts',
+        'formatRetriesConfigured', 'formatFailureCodes', 'batchFormatAttempts',
+        'batchToolCallAttempts', 'attemptsTotal', 'genericInvalidRequestRetryCount',
+        'toolCallRetryCount', 'totalPromptSanitizedEventCount', 'totalPromptRedactionPlaceholderCount',
+        'totalPromptSanitizationRemovedChars', 'projectionRequiredSegmentFailures',
+        'sourceMessageCount', 'sourceIdsCount'
+    ]);
+    assert.equal(metrics.ok, false);
+    assert.equal(metrics.errorCode, 'MEMO_V2_INVALID_STATUS');
+    assert.equal(metrics.failedBatchIndex, 0);
+    assert.equal(metrics.failedBatchNumber, 1);
+    assert.equal(metrics.plannedBatchCount, 1);
+    assert.equal(metrics.processedBatchCount, 0);
+    assert.equal(metrics.modelCallCount, 3);
+    assert.equal(metrics.formatRetryCount, 2);
+    assert.equal(metrics.candidateWritten, false);
+    assert.deepEqual(metrics.formatFailureCodes, [
+        'MEMO_V2_INVALID_STATUS',
+        'MEMO_V2_INVALID_STATUS',
+        'MEMO_V2_INVALID_STATUS'
+    ]);
+    assert.ok(Object.keys(metrics).every(key => allowedKeys.has(key)));
+    assert.doesNotMatch(stdout, /正文不应|CURRENT_CANONICAL_EVENTS|ARCHIVED_STATE|SERVER_VALIDATION_CONTRACT|stack|https?:\/\/|api[_-]?key|sourceMessageIds|uid-68/iu);
+    assert.equal(calls, 3);
+    assert.equal(writes, 0);
 });
 
 function promptEvents(request) {

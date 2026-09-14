@@ -459,6 +459,82 @@ function initialize(httpServer, config) {
                                 }
                             });
                         }
+                    } else if (parsedMessage.type === 'query_worker_job') {
+                        const jobId = typeof parsedMessage.jobId === 'string'
+                            ? parsedMessage.jobId.trim()
+                            : '';
+                        const traceMode = ['summary', 'events', 'raw'].includes(parsedMessage.traceMode)
+                            ? parsedMessage.traceMode
+                            : 'summary';
+                        if (!/^job_[A-Za-z0-9_-]+$/.test(jobId)) {
+                            ws.send(JSON.stringify({
+                                type: 'worker_panel_action_result',
+                                data: {
+                                    action: 'query',
+                                    jobId,
+                                    success: false,
+                                    error: 'Invalid jobId.'
+                                }
+                            }));
+                        } else {
+                            if (!ws.workerPanelQueryCache) ws.workerPanelQueryCache = new Map();
+                            const cacheKey = `${jobId}:${traceMode}`;
+                            const cached = ws.workerPanelQueryCache.get(cacheKey);
+                            const sendQueryResult = data => {
+                                if (ws.readyState === WebSocket.OPEN) {
+                                    ws.send(JSON.stringify({
+                                        type: 'worker_panel_action_result',
+                                        data
+                                    }));
+                                }
+                            };
+                            if (cached?.response && cached.expiresAt > Date.now()) {
+                                sendQueryResult(cached.response);
+                            } else if (cached?.promise) {
+                                cached.promise.then(sendQueryResult);
+                            } else {
+                                const queryPromise = Promise.resolve(pluginManager.processToolCall(
+                                    'AICodeWorker',
+                                    { command: 'query', jobId, wait: false, responseMode: 'full', traceMode },
+                                    ws.clientIp,
+                                    'worker-panel'
+                                )).then(result => {
+                                    const normalizedResult = result && result.result ? result.result : result;
+                                    const terminal = ['completed', 'failed', 'cancelled', 'timeout']
+                                        .includes(String(normalizedResult?.state || '').toLowerCase());
+                                    const response = {
+                                        action: 'query',
+                                        jobId,
+                                        traceMode,
+                                        success: true,
+                                        result: normalizedResult
+                                    };
+                                    ws.workerPanelQueryCache.set(cacheKey, {
+                                        response,
+                                        expiresAt: Date.now() + (terminal ? 60000 : 2000)
+                                    });
+                                    while (ws.workerPanelQueryCache.size > 100) {
+                                        ws.workerPanelQueryCache.delete(ws.workerPanelQueryCache.keys().next().value);
+                                    }
+                                    return response;
+                                }).catch(error => {
+                                    const response = {
+                                            action: 'query',
+                                            jobId,
+                                            traceMode,
+                                            success: false,
+                                            error: error.message
+                                    };
+                                    ws.workerPanelQueryCache.set(cacheKey, {
+                                        response,
+                                        expiresAt: Date.now() + 2000
+                                    });
+                                    return response;
+                                });
+                                ws.workerPanelQueryCache.set(cacheKey, { promise: queryPromise });
+                                queryPromise.then(sendQueryResult);
+                            }
+                        }
                     }
                     return;
                 }

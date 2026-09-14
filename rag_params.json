@@ -1,15 +1,19 @@
 {
   "ContextFoldingV2": {
-    "thresholdBase": 0.5,
+    "thresholdBase": 0.55,
     "thresholdRange": [
-      0.4,
-      0.6
+      0.45,
+      0.68
     ],
-    "lWeight": 0.05,
+    "lWeight": 0.04,
     "sWeight": 0.05,
+    "contextWeights": [
+      0.7,
+      0.3
+    ],
     "fuzzyEmbedding": {
-      "threshold": 0.975,
-      "minLength": 80,
+      "threshold": 0.985,
+      "minLength": 100,
       "maxScan": 200,
       "maxLengthDiffRatio": 0.02,
       "maxLengthDiffAbs": 80
@@ -87,7 +91,7 @@
       "hubSmoothingRatio": 0.1
     },
     "riverMemo": {
-      "enabled": false,
+      "enabled": true,
       "sourceObservation": {
         "mode": "v9_epa_pyramid_spike",
         "baseTagBoost": 0.6,

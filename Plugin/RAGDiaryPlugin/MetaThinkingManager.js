@@ -148,6 +148,11 @@ class MetaThinkingManager {
 
         // 获取思维链配置
         const chainConfig = this.metaThinkingChains.chains[finalChainName];
+        // 空回落策略：default 主题未配置或簇为空时，静默跳过元思考注入（省 token 设计，非故障）
+        if (finalChainName === 'default' && (!chainConfig || !Array.isArray(chainConfig.clusters) || chainConfig.clusters.length === 0)) {
+            console.log('[MetaThinkingManager] default 主题为空，按空回落策略跳过元思考注入。');
+            return '';
+        }
         if (!chainConfig || !chainConfig.clusters || !chainConfig.kSequence) {
             console.error(`[MetaThinkingManager] 未找到完整的思维链配置: ${finalChainName}`);
             return `[错误: 未找到"${finalChainName}"思维链配置]`;

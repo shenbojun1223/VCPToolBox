@@ -608,21 +608,11 @@ async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, de
               console.log(`[VCP Refresh] 正在刷新区块 (${metadata.dbName})...`);
             }
 
-            // V4.0: Find the last *true* user message to use as the original query
-            let originalUserQuery = '';
-            // Search backwards from the message *before* the one containing the RAG block
-            for (let j = i - 1; j >= 0; j--) {
-              const prevMsg = newMessages[j];
-              if (prevMsg.role === 'user' && typeof prevMsg.content === 'string' &&
-                !prevMsg.content.startsWith('<!-- VCP_TOOL_PAYLOAD -->') &&
-                !prevMsg.content.startsWith('[系统提示:]') &&
-                !prevMsg.content.startsWith('[系统邀请指令:]')
-              ) {
-                originalUserQuery = prevMsg.content;
-                if (debugMode) console.log(`[VCP Refresh] Found original user query for refresh at index ${j}.`);
-                break; // Found it, stop searching
-              }
-            }
+            // The RAG carrier's position does not identify the current user turn.
+            // Select from this request's complete history using the shared selector.
+            // Pass raw text: refreshRagBlock owns embedding sanitization.
+            const selectedUser = messageProcessor.findLastRealUserMessage(messages);
+            const originalUserQuery = selectedUser.rawContent || '';
             if (!originalUserQuery && debugMode) {
               console.warn(`[VCP Refresh] Could not find a true user query for the RAG block at index ${i}. Refresh may be inaccurate.`);
             }

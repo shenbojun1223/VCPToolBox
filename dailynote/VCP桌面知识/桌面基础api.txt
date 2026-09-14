@@ -39,3 +39,4 @@ vcpAPI.post() 参数说明：
 - options.temperature: 温度参数（0-2）
 - options.max_tokens: 最大输出 token 数
 - 返回: {success, content, usage, raw, error}
+Tag: VCPdesktop Widget沙箱API, DESKTOP_PUSH, Shadow DOM代理document, vcpAPI后端访问, musicAPI播放器控制, Agent灵魂占位符

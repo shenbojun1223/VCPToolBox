@@ -20,6 +20,7 @@ const TextSanitizer = require('./TextSanitizer.js');
 const VectorMathUtils = require('./VectorMathUtils.js');
 const AttachmentMemoUtils = require('./AttachmentMemoUtils.js');
 const RAGResultFormatter = require('./RAGResultFormatter.js');
+const GroupPresentationOrder = require('./GroupPresentationOrder.js');
 const BM25QueryOptimizer = require('./BM25QueryOptimizer.js');
 const { chunkText } = require('../../TextChunker.js');
 const { getEmbeddingsBatch } = require('../../EmbeddingUtils.js');
@@ -51,6 +52,7 @@ const GLOBAL_SIMILARITY_THRESHOLD = 0.6; // 全局默认余弦相似度阈值
 class RAGDiaryPlugin {
     constructor() {
         this.name = 'RAGDiaryPlugin';
+        this.groupPresentationOrder = new GroupPresentationOrder();
         this.vectorDBManager = null;
         this.ragConfig = {};
         this.rerankConfig = {};
@@ -1321,6 +1323,9 @@ class RAGDiaryPlugin {
     // processMessages 是 messagePreprocessor 的标准接口
     async processMessages(messages, pluginConfig) {
         try {
+            const groupOrderRequest = this.groupPresentationOrder.begin(
+                pluginConfig?.vcpchatExtensions?.requestContext
+            );
             // 📝 纯文本快速路径：
             // 当虚拟 system 消息仅包含 {{xx日记本}} / {{xx日记本::LastN}} / {{xx日记本::BM25}} 直接引入占位符时，
             // 直接由底层纯文本处理器接管，避免进入上下文向量更新、查询向量化、EPA/TagMemo 等语义管线。
@@ -1569,6 +1574,10 @@ class RAGDiaryPlugin {
             await Promise.all(targetSystemMessageIndices.map(async (index) => {
                 console.log(`[RAGDiaryPlugin] Processing system message at index: ${index}`);
                 const systemMessage = newMessages[index];
+                // Share existing request caches, but isolate presentation state by carrier.
+                const systemRequestCache = { ...requestCache };
+                systemRequestCache.groupOrderRequest = groupOrderRequest
+                    ? { ...groupOrderRequest, carrier: index } : null;
 
                 // 调用新的辅助函数处理单个消息
                 const processedContent = await this._processSingleSystemMessage(
@@ -1590,7 +1599,7 @@ class RAGDiaryPlugin {
                     ghostTags, // 🌟 V6: 传递幽灵节点
                     collectedAttachments, // 🌟 V7: 传递附件收集器
                     isFreshTimeConversationStart, // 🌟 Time 新对话补充召回开关
-                    requestCache // 🌟 单轮请求级缓存
+                    systemRequestCache // Shared data caches plus carrier-local presentation context
                 );
 
                 newMessages[index].content = this._replaceTextInContent(
@@ -2704,12 +2713,32 @@ class RAGDiaryPlugin {
 
         const sanitizedToolContent = this._stripEmoji(this._stripHtml(toolContentForVector));
 
-        // 2. 并行获取所有向量
-        const [userVector, aiVector, toolVector] = await Promise.all([
-            sanitizedUserContent ? this.getSingleEmbeddingCached(sanitizedUserContent) : null,
-            sanitizedAiContent ? this.getSingleEmbeddingCached(sanitizedAiContent) : null,
-            sanitizedToolContent ? this.getSingleEmbeddingCached(sanitizedToolContent) : null
-        ]);
+        // 2. Reuse the same three vector requests. Source descriptions belong
+        // only to this refresh invocation, never to the plugin singleton.
+        const gravitySources = { goal:null, payload:null };
+        let sourceCaptureOpen = true;
+        let captureSources = false;
+        try { captureSources = typeof contextData.onGravityVectors === 'function'; }
+        catch { /* Optional handoff cannot prevent RAG refresh. */ }
+        const sourceOptions = key => captureSources ? {
+            onResultMetadata: record => {
+                if (!sourceCaptureOpen) return;
+                try { gravitySources[key] = structuredClone(record); }
+                catch { gravitySources[key] = null; }
+            }
+        } : undefined;
+        let userVector, aiVector, toolVector;
+        try {
+            [userVector, aiVector, toolVector] = await Promise.all([
+                sanitizedUserContent
+                    ? this.getSingleEmbeddingCached(sanitizedUserContent, sourceOptions('goal')) : null,
+                sanitizedAiContent ? this.getSingleEmbeddingCached(sanitizedAiContent) : null,
+                sanitizedToolContent
+                    ? this.getSingleEmbeddingCached(sanitizedToolContent, sourceOptions('payload')) : null
+            ]);
+        } finally {
+            sourceCaptureOpen = false;
+        }
 
         // 3. 按动态权重合并向量
         const config = this.ragParams?.RAGDiaryPlugin || {};
@@ -2744,6 +2773,95 @@ class RAGDiaryPlugin {
             dynamicK: metadata.k || 5,
             timeRanges: this.timeParser.parse(combinedSanitizedContext), // ✅ 基于组合后的上下文重新解析时间
         });
+
+        // Optional request-local handoff. Never store on the plugin singleton,
+        // attach to messages, or make another embedding request for this purpose.
+        // Existing getSingleEmbeddingCached may use fuzzy aliases: provenance
+        // remains UNKNOWN until a separately verified source contract exists.
+        try {
+            if (typeof contextData.onGravityVectors === 'function' &&
+                typeof refreshedContent === 'string' && refreshedContent.trim() &&
+                typeof originalUserQuery === 'string' &&
+                typeof toolResultsText === 'string') {
+                const copyVector = vector => {
+                    if (!Array.isArray(vector) && !(vector instanceof Float32Array) &&
+                        !(vector instanceof Float64Array)) return null;
+                    if (!vector.length || vector.length > 4096) return null;
+                    let energy = 0;
+                    for (const value of vector) {
+                        if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+                        energy += value * value;
+                    }
+                    if (!Number.isFinite(energy) || energy <= 1e-20) return null;
+                    return Array.from(vector);
+                };
+                const hash = text => crypto.createHash('sha256').update(text).digest('hex');
+                const goal = copyVector(userVector);
+                const payload = copyVector(toolVector);
+                // Whitelist descriptions and recheck against the actual vectors
+                // exported AFTER retrieval. Mutation since generation loses provenance.
+                const describeSource = (record, text, vector) => {
+                    const unknown = { source:'unknown', spaceVerified:false, foldEligible:false };
+                    try {
+                        const generation = record?.generation;
+                        if (!vector || record?.schema !== 'embedding-cache-result-v1' ||
+                            !['cache','pending','generated','fuzzy'].includes(record.route) ||
+                            generation?.schema !== 'embedding-generation-metadata-v1' ||
+                            !['generated-single','generated-chunk-merge','fuzzy-reuse'].includes(generation.source) ||
+                            record.source !== generation.source ||
+                            generation.textHash !== hash(text.trim()) ||
+                            generation.vectorHash !== hash(JSON.stringify(vector)))
+                            return unknown;
+                        const modelName = value => typeof value === 'string' &&
+                            value.length > 0 && value.length <= 256 ? value : null;
+                        const count = value => Number.isSafeInteger(value) &&
+                            value >= 0 && value <= 1000000 ? value : null;
+                        const fuzzy = generation.source === 'fuzzy-reuse';
+                        return {
+                            source:generation.source,
+                            route:record.route,
+                            textHash:generation.textHash,
+                            vectorHash:generation.vectorHash,
+                            dimension:vector.length,
+                            chunkCount:count(generation.chunkCount),
+                            usableChunks:count(generation.usableChunks),
+                            fullCoverage:!fuzzy && generation.fullCoverage === true,
+                            modelDeclarationsConsistent:!fuzzy &&
+                                generation.modelDeclarationsConsistent === true,
+                            requestedModel:fuzzy ? null : modelName(generation.requestedModel),
+                            responseModel:fuzzy ? null : modelName(generation.responseModel),
+                            spaceVerified:false,
+                            foldEligible:false
+                        };
+                    } catch { return unknown; }
+                };
+                const goalSource = describeSource(gravitySources.goal, sanitizedUserContent, goal);
+                const payloadSource = describeSource(gravitySources.payload, sanitizedToolContent, payload);
+                const pending = contextData.onGravityVectors({
+                    version: 'rag-refresh-vectors-v1',
+                    source: 'current-refresh',
+                    provenance: 'unknown',
+                    foldEligible: false,
+                    bindings: {
+                        userRawHash: hash(originalUserQuery),
+                        toolResultsRawHash: hash(toolResultsText)
+                    },
+                    goal: {
+                        vector: goal,
+                        textHash: hash(sanitizedUserContent),
+                        transform: 'sanitizeForEmbedding:user',
+                        provenance: goalSource
+                    },
+                    payload: {
+                        vector: payload,
+                        textHash: hash(sanitizedToolContent),
+                        transform: 'refreshRagBlock:tool-cleanup',
+                        provenance: payloadSource
+                    }
+                });
+                if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+            }
+        } catch { /* Optional handoff must not change RAG success or continuation. */ }
 
         // 6. 返回完整的、带有新元数据的新区块文本
         return refreshedContent;
@@ -2811,7 +2929,9 @@ class RAGDiaryPlugin {
                     console.error('[RAGDiaryPlugin] Cache hit broadcast failed:', e.message || e);
                 }
             }
-            return cachedResult.content;
+            return returnRawResults ? cachedResult.content : this.groupPresentationOrder.render(
+                cachedResult.content, cachedResult.groupPresentation, requestCache?.groupOrderRequest
+            );
         }
 
         // 3️⃣ 缓存未命中，执行原有逻辑
@@ -3527,6 +3647,13 @@ class RAGDiaryPlugin {
             return finalResultsForBroadcast || [];
         }
 
+        // Capture only the actual Group formatter path, after all selection/filtering.
+        // Keep cached content in retrieval order; presentation is session-local.
+        const groupPresentation = useGroup && !(useTime && timeRanges && timeRanges.length > 0)
+            ? this.groupPresentationOrder.capture(
+                finalResultsForBroadcast, displayName, activatedGroups, metadata
+            ) : null;
+
         // 🌟 V7: Base64Memo 附件提取逻辑
         if (modifiers.includes('::Base64Memo') && retrievedContent) {
             const attachments = this._extractAttachments(retrievedContent);
@@ -3622,10 +3749,13 @@ class RAGDiaryPlugin {
         // 4️⃣ 保存到缓存
         this._setCachedResult(cacheKey, {
             content: retrievedContent,
-            vcpInfo: vcpInfoData
+            vcpInfo: vcpInfoData,
+            groupPresentation
         });
 
-        return retrievedContent;
+        return this.groupPresentationOrder.render(
+            retrievedContent, groupPresentation, requestCache?.groupOrderRequest
+        );
     }
 
     /**
@@ -4750,7 +4880,7 @@ class RAGDiaryPlugin {
         return RAGResultFormatter.aggregateTagStats(results);
     }
 
-    async getSingleEmbedding(text) {
+    async getSingleEmbedding(text, options = {}) {
         if (!text) {
             console.error('[RAGDiaryPlugin] getSingleEmbedding was called with no text.');
             return null;
@@ -4758,11 +4888,17 @@ class RAGDiaryPlugin {
 
         const apiKey = process.env.API_Key;
         const apiUrl = process.env.API_URL;
-
         if (!apiKey || !apiUrl) {
             console.error('[RAGDiaryPlugin] Embedding API credentials not configured (API_Key / API_URL).');
             return null;
         }
+
+        // Optional provenance must not alter generation or legacy return values.
+        let observer = null;
+        try {
+            if (typeof options?.onResultMetadata === 'function')
+                observer = options.onResultMetadata;
+        } catch { /* Invalid optional observer means no metadata. */ }
 
         try {
             const normalizedText = String(text).trim();
@@ -4771,7 +4907,6 @@ class RAGDiaryPlugin {
                 console.error('[RAGDiaryPlugin] getSingleEmbedding: text became empty after chunking.');
                 return null;
             }
-
             if (chunks.length > 1) {
                 console.warn(
                     `[RAGDiaryPlugin] getSingleEmbedding: input exceeds safe embedding window; ` +
@@ -4779,16 +4914,75 @@ class RAGDiaryPlugin {
                 );
             }
 
-            // 🌟 统一调用 EmbeddingUtils：自动享受模型容灾链、并发批量、token 精确切分、429 退避。
-            // 对超长用户/AI 上下文，先按 TextChunker 的 safeMaxTokens 切分，再对各 chunk 向量做 token 加权平均，
-            // 避免单条 6800+ token 文本被 EmbeddingUtils 直接跳过导致 RAG 查询向量为 null。
-            const results = await getEmbeddingsBatch(chunks, { apiUrl, apiKey });
+            let chunkMetadata = null;
+            const results = await getEmbeddingsBatch(chunks, {
+                apiUrl, apiKey,
+                ...(observer ? { onResultMetadata: records => { chunkMetadata = records; } } : {})
+            });
             const weights = chunks.map(chunk => Math.max(1, this._estimateTokens(chunk)));
             const vector = this._getWeightedAverageVector(results, weights);
 
             if (!vector) {
                 console.error('[RAGDiaryPlugin] getSingleEmbedding: EmbeddingUtils returned no usable vectors for the input text/chunks.');
             }
+
+            // Report what was actually merged, never certify semantic completeness
+            // or embedding-space identity from a model name or dimension alone.
+            try {
+                if (observer && vector) {
+                    const valid = value => (Array.isArray(value) ||
+                        value instanceof Float32Array || value instanceof Float64Array) &&
+                        value.length > 0 && value.length <= 4096 &&
+                        Array.from(value).every(n => typeof n === 'number' && Number.isFinite(n)) &&
+                        Array.from(value).some(n => n !== 0);
+                    if (valid(vector)) {
+                        const dimension = vector.length;
+                        let usableChunks = 0, describedChunks = 0;
+                        let requestedModel = null, responseModel = null;
+                        let consistentModels = true;
+                        for (let i = 0; i < chunks.length; i++) {
+                            const chunkVector = results[i];
+                            if (!valid(chunkVector) || chunkVector.length !== dimension) continue;
+                            usableChunks++;
+                            const item = chunkMetadata?.[i];
+                            const validName = name => typeof name === 'string' &&
+                                name.trim().length > 0 && name.length <= 256;
+                            if (item?.schema !== 'embedding-result-metadata-v1' ||
+                                item.source !== 'api-response' ||
+                                item.indexBinding !== 'explicit-unique' ||
+                                item.dimension !== dimension ||
+                                !validName(item.requestedModel) || !validName(item.responseModel))
+                                continue;
+                            describedChunks++;
+                            if (describedChunks === 1) {
+                                requestedModel = item.requestedModel;
+                                responseModel = item.responseModel;
+                            } else if (requestedModel !== item.requestedModel ||
+                                responseModel !== item.responseModel) consistentModels = false;
+                        }
+                        const fullCoverage = results.length === chunks.length &&
+                            usableChunks === chunks.length;
+                        const modelDeclarationsConsistent = fullCoverage &&
+                            describedChunks === chunks.length && consistentModels;
+                        const hash = value => crypto.createHash('sha256').update(value).digest('hex');
+                        const metadata = {
+                            schema: 'embedding-generation-metadata-v1',
+                            source: chunks.length === 1 ? 'generated-single' : 'generated-chunk-merge',
+                            textHash: hash(normalizedText),
+                            vectorHash: hash(JSON.stringify(Array.from(vector))),
+                            dimension, chunkCount: chunks.length, usableChunks,
+                            describedChunks, fullCoverage,
+                            modelDeclarationsConsistent,
+                            requestedModel: modelDeclarationsConsistent ? requestedModel : null,
+                            responseModel: modelDeclarationsConsistent ? responseModel : null,
+                            spaceVerified: false,
+                            foldEligible: false
+                        };
+                        const pending = observer(metadata);
+                        if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+                    }
+                }
+            } catch { /* Metadata failure must not discard a generated vector. */ }
             return vector || null;
         } catch (error) {
             console.error('[RAGDiaryPlugin] getSingleEmbedding failed via EmbeddingUtils:', error.message);
@@ -4926,19 +5120,54 @@ class RAGDiaryPlugin {
         return results;
     }
 
-    async getSingleEmbeddingCached(text) {
+    async getSingleEmbeddingCached(text, options = {}) {
         if (!text || !text.trim()) return null;
 
         const normalizedText = text.trim();
         const cacheKey = this.cacheManager.generateKey({ text: normalizedText });
-        const cached = this.cacheManager.get('embedding', cacheKey);
-        if (cached) {
+        const hash = value => crypto.createHash('sha256').update(value).digest('hex');
+        const describe = (vector, metadata, route) => {
+            try {
+                if (typeof options?.onResultMetadata !== 'function') return;
+                let generation = null;
+                if (metadata?.schema === 'embedding-generation-metadata-v1' && vector &&
+                    metadata.textHash === hash(normalizedText) &&
+                    metadata.vectorHash === hash(JSON.stringify(Array.from(vector))) &&
+                    ['generated-single','generated-chunk-merge','fuzzy-reuse'].includes(metadata.source)) {
+                    generation = structuredClone(metadata);
+                }
+                const pending = options.onResultMetadata({
+                    schema:'embedding-cache-result-v1',
+                    route,
+                    source:generation?.source || 'unknown',
+                    generation,
+                    spaceVerified:false,
+                    foldEligible:false
+                });
+                if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+            } catch { /* Optional descriptions cannot change vector return values. */ }
+        };
+        const readEntry = () => typeof this.cacheManager.getWithMetadata === 'function'
+            ? this.cacheManager.getWithMetadata('embedding', cacheKey)
+            : {value:this.cacheManager.get('embedding', cacheKey), metadata:null};
+        const entry = readEntry();
+        if (entry?.value) {
             this._rememberEmbeddingText(cacheKey, normalizedText);
-            return cached;
+            describe(entry.value, entry.metadata, 'cache');
+            return entry.value;
         }
 
         if (this.pendingEmbeddingRequests.has(cacheKey)) {
-            return await this.pendingEmbeddingRequests.get(cacheKey);
+            // Keep Promise<vector> compatibility. Reuse only metadata attached
+            // to the same still-live value; eviction never triggers regeneration.
+            const vector = await this.pendingEmbeddingRequests.get(cacheKey);
+            let metadata = null;
+            try {
+                const completed = readEntry();
+                if (completed?.value === vector) metadata = completed.metadata;
+            } catch { /* Unknown provenance on failed metadata lookup. */ }
+            describe(vector, metadata, 'pending');
+            return vector;
         }
 
         // 🌟 最小修复：精确缓存未命中时，在 API 前尝试高阈值 fuzzy 复用。
@@ -4946,30 +5175,56 @@ class RAGDiaryPlugin {
         // 避免 RAG 主链路与 DynamicFold 对同一段 AI 发言重复向量化。
         const fuzzyMatch = this._findFuzzyEmbeddingFromCache(normalizedText);
         if (fuzzyMatch && fuzzyMatch.vector) {
-            this.cacheManager.set('embedding', cacheKey, fuzzyMatch.vector);
+            let metadata = null;
+            try {
+                metadata = {
+                    schema:'embedding-generation-metadata-v1',
+                    source:'fuzzy-reuse',
+                    textHash:hash(normalizedText),
+                    vectorHash:hash(JSON.stringify(Array.from(fuzzyMatch.vector))),
+                    fullCoverage:false, spaceVerified:false, foldEligible:false
+                };
+            } catch { /* Preserve legacy reuse if optional metadata is unavailable. */ }
+            this.cacheManager.set('embedding', cacheKey, fuzzyMatch.vector, metadata);
             this._rememberEmbeddingText(cacheKey, normalizedText);
             console.log(
                 `[RAGDiaryPlugin] Fuzzy embedding cache hit: ` +
                 `sim=${fuzzyMatch.similarity.toFixed(4)}, len=${normalizedText.length}/${fuzzyMatch.length}`
             );
+            describe(fuzzyMatch.vector, metadata, 'fuzzy');
             return fuzzyMatch.vector;
         }
 
-        const requestPromise = (async () => {
+        let generatedMetadata = null;
+        let captureOpen = true;
+        // Register the pending promise before invoking the producer, including
+        // synchronous fixture failures. Keep the public Promise<vector> shape.
+        const requestPromise = Promise.resolve().then(async () => {
             try {
-                const vector = await this.getSingleEmbedding(normalizedText);
+                const vector = await this.getSingleEmbedding(normalizedText, {
+                    onResultMetadata: metadata => {
+                        if (!captureOpen) return;
+                        try { generatedMetadata = structuredClone(metadata); }
+                        catch { generatedMetadata = null; }
+                    }
+                });
+                captureOpen = false;
                 if (vector) {
-                    this.cacheManager.set('embedding', cacheKey, vector);
+                    this.cacheManager.set('embedding', cacheKey, vector, generatedMetadata);
                     this._rememberEmbeddingText(cacheKey, normalizedText);
                 }
                 return vector;
             } finally {
-                this.pendingEmbeddingRequests.delete(cacheKey);
+                captureOpen = false;
+                if (this.pendingEmbeddingRequests.get(cacheKey) === requestPromise)
+                    this.pendingEmbeddingRequests.delete(cacheKey);
             }
-        })();
+        });
 
         this.pendingEmbeddingRequests.set(cacheKey, requestPromise);
-        return await requestPromise;
+        const vector = await requestPromise;
+        describe(vector, generatedMetadata, 'generated');
+        return vector;
     }
 
     _rememberEmbeddingText(cacheKey, normalizedText) {
@@ -5391,6 +5646,15 @@ class RAGDiaryPlugin {
             getEmbeddingFromCache(text) {
                 if (!text || typeof text !== 'string') return null;
                 return self._getEmbeddingFromCacheOnly(text);
+            },
+
+            // Exact live entry with detached provenance; never generates embeddings.
+            // Optional module loading stays inside the fail-open method boundary.
+            getEmbeddingRecordFromCache(text) {
+                try {
+                    return require('../../modules/vcpLoop/gravityCacheRecord')
+                        .readGravityCacheRecord(self.cacheManager, text);
+                } catch { return null; }
             },
 
             /**

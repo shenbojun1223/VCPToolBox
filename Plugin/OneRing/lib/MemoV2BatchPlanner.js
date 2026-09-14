@@ -21,6 +21,11 @@ function eventId(event) {
     return value;
 }
 
+function finiteCount(value) {
+    const count = Number(value);
+    return Number.isFinite(count) ? count : 0;
+}
+
 function promptFor(events, previousState, maxInputChars, eventTextCapChars, formatAttempt = 0, previousValidationCode = null) {
     return buildReductionPrompt({
         canonicalEvents: events,
@@ -174,9 +179,15 @@ function planMemoV2Batches(options = {}) {
         batchPromptSanitizedEventCounts: batchPromptStats.map(stats => stats?.promptSanitizedEventCount || 0),
         batchPromptRedactionPlaceholderCounts: batchPromptStats.map(stats => stats?.promptRedactionPlaceholderCount || 0),
         batchPromptSanitizationRemovedChars: batchPromptStats.map(stats => stats?.promptSanitizationRemovedChars || 0),
-        totalPromptSanitizedEventCount: batchPromptStats.reduce((sum, stats) => sum + Number(stats?.promptSanitizedEventCount || 0), 0),
-        totalPromptRedactionPlaceholderCount: batchPromptStats.reduce((sum, stats) => sum + Number(stats?.promptRedactionPlaceholderCount || 0), 0),
-        totalPromptSanitizationRemovedChars: batchPromptStats.reduce((sum, stats) => sum + Number(stats?.promptSanitizationRemovedChars || 0), 0),
+        totalPromptSanitizedEventCount: batchPromptStats.reduce((sum, stats) => sum + finiteCount(stats?.promptSanitizedEventCount), 0),
+        totalPromptRedactionPlaceholderCount: batchPromptStats.reduce((sum, stats) => sum + finiteCount(stats?.promptRedactionPlaceholderCount), 0),
+        totalPromptSanitizationRemovedChars: batchPromptStats.reduce((sum, stats) => sum + finiteCount(stats?.promptSanitizationRemovedChars), 0),
+        batchPromptWireTokenCounts: batchPromptStats.map(stats => finiteCount(stats?.promptWireTokenCount)),
+        batchPromptNewThreadTokenCounts: batchPromptStats.map(stats => finiteCount(stats?.promptNewThreadTokenCount)),
+        batchPromptNoAssigneeTokenCounts: batchPromptStats.map(stats => finiteCount(stats?.promptNoAssigneeTokenCount)),
+        totalPromptWireTokenCount: batchPromptStats.reduce((sum, stats) => sum + finiteCount(stats?.promptWireTokenCount), 0),
+        totalPromptNewThreadTokenCount: batchPromptStats.reduce((sum, stats) => sum + finiteCount(stats?.promptNewThreadTokenCount), 0),
+        totalPromptNoAssigneeTokenCount: batchPromptStats.reduce((sum, stats) => sum + finiteCount(stats?.promptNoAssigneeTokenCount), 0),
         estimatedPromptChars: batchPromptChars.reduce((sum, chars) => sum + chars, 0),
         maxPromptChars: maxInputChars,
         requestBudgetChars: maxInputChars,

@@ -13,6 +13,7 @@ const {
 const { WIRE_CONTRACT_VERSION } = require('../lib/MemoV2ToolContract.js');
 const {
     generateShadowCandidate,
+    buildSafeFailureMetadata,
     DEFAULT_FORMAT_RETRIES
 } = require('../lib/MemoV2Orchestrator.js');
 
@@ -93,6 +94,13 @@ function parseArgs(argv) {
 }
 
 function metricsFromDelta(delta, requestStats, candidate) {
+    if (candidate && candidate.ok === false) {
+        return buildSafeFailureMetadata({
+            error: candidate.error,
+            stats: candidate.stats || requestStats,
+            errorCode: candidate.error?.code
+        });
+    }
     const candidateStats = candidate?.stats || {};
     const plannedBatchCount = candidateStats.plannedBatchCount ?? requestStats?.plannedBatchCount ?? 0;
     const totalCanonicalEventCount = candidateStats.totalCanonicalEventCount
@@ -151,6 +159,20 @@ function metricsFromDelta(delta, requestStats, candidate) {
     const batchPromptSanitizationRemovedChars = candidateStats.batchPromptSanitizationRemovedChars
         || requestStats?.batchPromptSanitizationRemovedChars
         || [];
+    const finiteCount = value => {
+        const count = Number(value);
+        return Number.isFinite(count) ? count : 0;
+    };
+    const normalizeBatchCounts = value => {
+        const source = Array.isArray(value) ? value : [];
+        return Array.from({ length: Number(plannedBatchCount) || 0 }, (_, index) => finiteCount(source[index]));
+    };
+    const batchPromptWireTokenCounts = normalizeBatchCounts(candidateStats.batchPromptWireTokenCounts
+        || requestStats?.batchPromptWireTokenCounts);
+    const batchPromptNewThreadTokenCounts = normalizeBatchCounts(candidateStats.batchPromptNewThreadTokenCounts
+        || requestStats?.batchPromptNewThreadTokenCounts);
+    const batchPromptNoAssigneeTokenCounts = normalizeBatchCounts(candidateStats.batchPromptNoAssigneeTokenCounts
+        || requestStats?.batchPromptNoAssigneeTokenCounts);
     const estimatedPromptChars = batchPromptChars.reduce((sum, chars) => sum + Number(chars || 0), 0)
         || requestStats?.estimatedPromptChars
         || requestStats?.totalRequestChars
@@ -220,6 +242,12 @@ function metricsFromDelta(delta, requestStats, candidate) {
         batchPromptSanitizedEventCounts,
         batchPromptRedactionPlaceholderCounts,
         batchPromptSanitizationRemovedChars,
+        totalPromptWireTokenCount: batchPromptWireTokenCounts.reduce((sum, count) => sum + finiteCount(count), 0),
+        totalPromptNewThreadTokenCount: batchPromptNewThreadTokenCounts.reduce((sum, count) => sum + finiteCount(count), 0),
+        totalPromptNoAssigneeTokenCount: batchPromptNoAssigneeTokenCounts.reduce((sum, count) => sum + finiteCount(count), 0),
+        batchPromptWireTokenCounts,
+        batchPromptNewThreadTokenCounts,
+        batchPromptNoAssigneeTokenCounts,
         projectionRequiredSegmentFailures: Number(candidateStats.projectionRequiredSegmentFailures
             ?? requestStats?.projectionRequiredSegmentFailures
             ?? 0),
@@ -336,6 +364,12 @@ async function main(argv = process.argv.slice(2), dependencies = {}) {
                 batchPromptSanitizedEventCounts: [],
                 batchPromptRedactionPlaceholderCounts: [],
                 batchPromptSanitizationRemovedChars: [],
+                totalPromptWireTokenCount: 0,
+                totalPromptNewThreadTokenCount: 0,
+                totalPromptNoAssigneeTokenCount: 0,
+                batchPromptWireTokenCounts: [],
+                batchPromptNewThreadTokenCounts: [],
+                batchPromptNoAssigneeTokenCounts: [],
                 projectionRequiredSegmentFailures: 0,
                 formatAttempt: options.formatRetries > 0 ? 1 : 0,
                 formatRetriesConfigured: options.formatRetries,
@@ -345,8 +379,9 @@ async function main(argv = process.argv.slice(2), dependencies = {}) {
                 processedBatchCount: 0
             };
         if (plan.formatRetriesConfigured == null) plan.formatRetriesConfigured = options.formatRetries;
-        process.stdout.write(`${JSON.stringify(metricsFromDelta(delta, plan, null))}\n`);
-        return;
+        const metrics = metricsFromDelta(delta, plan, null);
+        process.stdout.write(`${JSON.stringify(metrics)}\n`);
+        return { ok: true, metrics };
     }
     const modelClient = dependencies.modelClient || buildModelClient();
     const candidate = await generateShadowCandidate({
@@ -361,12 +396,18 @@ async function main(argv = process.argv.slice(2), dependencies = {}) {
         formatRetries: options.formatRetries,
         writeCandidate: true
     });
-    process.stdout.write(`${JSON.stringify(metricsFromDelta(delta, candidate.promptStats, candidate))}\n`);
+    const metrics = metricsFromDelta(delta, candidate.promptStats, candidate);
+    process.stdout.write(`${JSON.stringify(metrics)}\n`);
+    return candidate;
 }
 
 if (require.main === module) {
-    main().catch(error => {
-        process.stderr.write(`memo-v2-shadow-candidate failed: ${error.code || 'ERROR'}\n`);
+    main().then(result => {
+        if (result?.ok === false) process.exitCode = 1;
+    }).catch(error => {
+        const errorCode = String(error?.code || 'MEMO_V2_SHADOW_FAILED');
+        process.stdout.write(`${JSON.stringify(buildSafeFailureMetadata({ errorCode }))}\n`);
+        process.stderr.write(`${errorCode}\n`);
         process.exitCode = 1;
     });
 }

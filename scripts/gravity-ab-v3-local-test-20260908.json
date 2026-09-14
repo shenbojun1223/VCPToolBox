@@ -1,0 +1,6 @@
+{
+  "passed": 16,
+  "failed": 0,
+  "modelCalls": 0,
+  "scope": "protocol validation and projection; not model quality or runtime HTTP"
+}

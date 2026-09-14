@@ -132,4 +132,22 @@ node Plugin/OneRing/scripts/memo-v2-shadow-candidate.js --agent 微明 --request
 
 ## 下一阶段
 
-Phase 3 才会讨论 feature flag、stale injection、调度和 promote；本阶段不做任何生产接入。
+Phase 3 才会讨论 feature flag、stale injection、调度和生产接入；本阶段不做任何生产接入。
+
+## P0 Promotion Control Plane（本地显式入口）
+
+Promotion 与 Production Integration 严格解耦。P0 只提供本地 CLI 和可注入控制器；不会加载 `OneRing.js`/`OneRingMemo.js`，不会调用模型，不会修改 V1 Memo、活动 DB、failure/cursor 或生产配置。
+
+默认命令是只读 inspect，只输出安全 JSON 元数据（路径、Candidate size/mtime/hash、cursor、DB max、pending 数以及 active/Candidate/lock 布尔值和稳定 reason code）：
+
+```powershell
+node Plugin/OneRing/scripts/memo-v2-promote-candidate.js --agent 微明
+```
+
+只有显式 `--promote` 且同时提供以下 pin 才允许状态变更：`--agent`、`--expected-candidate-sha256 <64hex>`、`--expected-snapshot-db-max-id <n>`、`--expected-active-state absent|<64hex>` 和 `--expected-db-max-id <n>`。数据库 max id 大于 Candidate cursor 时，还必须提供与实际 pending 数完全相等的 `--allow-pending-events <n>`；pending 默认拒绝。正式 promotion 会在全局 `Plugin/OneRing/tmp/memo-v2-shadow.lock` 下使用 Node `wx` 排他锁，锁内复读 Candidate/DB/active，写入前后复核 Candidate hash，并保持 Candidate 原文件不变。
+
+active 写入使用同目录临时文件、文件 fsync 和 atomic rename；更新已有 active 时会在 `memo-v2/promotion-backups/` 以不可覆盖文件保存并校验旧 bytes。成功回执写入 `memo-v2/promotion-receipts/`，包含 cursor、promotion 时 DB max、pending 数、active/candidate hash、备份相对路径、lock token hash、平台目录 fsync 结果以及固定的 `productionIntegrated: false`。active 写入、后验验证或回执失败会从已验证备份恢复，首次 promotion 则保证新 active 不残留；历史备份和回执不会被清理或覆盖。
+
+控制器的稳定错误码包括：`MEMO_V2_CLI_UNKNOWN_ARGUMENT`、`MEMO_V2_CLI_MISSING_PROMOTION_ARGUMENT`、`MEMO_V2_INVALID_AGENT`、`MEMO_V2_INVALID_EXPECTED_HASH`、`MEMO_V2_SCHEMA_MISMATCH`、`MEMO_V2_AGENT_MISMATCH`、`MEMO_V2_CURSOR_MISMATCH`、`MEMO_V2_CANDIDATE_HASH_MISMATCH`、`MEMO_V2_CANDIDATE_CHANGED_DURING_PROMOTION`、`MEMO_V2_CANDIDATE_CHANGED_AFTER_PROMOTION`、`MEMO_V2_DB_DRIFT`、`MEMO_V2_PENDING_EVENTS`、`MEMO_V2_PROMOTION_LOCKED`、`MEMO_V2_ACTIVE_MISMATCH`、`MEMO_V2_ACTIVE_WRITE_FAILED`、`MEMO_V2_ACTIVE_VERIFY_FAILED`、`MEMO_V2_BACKUP_FAILED`、`MEMO_V2_RECEIPT_WRITE_FAILED`、`MEMO_V2_ROLLBACK_FAILED`、`MEMO_V2_LOCK_OWNERSHIP_LOST`。
+
+离线测试位于 `Plugin/OneRing/tests/memo-v2-promotion.test.js`，只使用系统临时目录、临时 SQLite 和依赖注入，不触碰正式 Candidate/DB/state，也不执行真实 promotion。生产接入仍是后续工作，至少还需要独立的审批/权限门禁、运维调用链、审计与告警、失败恢复策略以及明确的 V1/V2 读取切换与回滚方案。

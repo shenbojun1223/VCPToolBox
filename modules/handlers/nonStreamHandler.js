@@ -364,7 +364,11 @@ class NonStreamHandler {
           currentMessagesForNonStreamLoop.push(...assistantMessages);
 
           const errorPayload = `<!-- VCP_TOOL_PAYLOAD -->\n${JSON.stringify(archeryErrorContents)}`;
-          currentMessagesForNonStreamLoop.push({ role: 'user', content: errorPayload });
+          const { truncateToolPayload: truncateErrPayload } = require('../vcpLoop/toolPayloadTruncator.js');
+          currentMessagesForNonStreamLoop.push({ role: 'user', content: truncateErrPayload(errorPayload, {
+            toolNames: archeryCalls.map(call => call.name),
+            exempt: archeryCalls.some(call => call.markHistory)
+          }) });
 
           if (archeryStatusSummaryItems.length > 0) {
             if (enableRoleDivider) {
@@ -493,11 +497,31 @@ class NonStreamHandler {
           (k === 'url' || k === 'image_url') && typeof v === 'string' && v.startsWith('data:') ? "[Omitted]" : v
         );
 
+        // Request-local, round-local handoff; never append vectors to messages.
+        let gravityHandoff = null;
         if (RAGMemoRefresh) {
-          currentMessagesForNonStreamLoop = await _refreshRagBlocksIfNeeded(currentMessagesForNonStreamLoop, {
-            lastAiMessage: currentAIContentForLoop,
-            toolResultsText: toolResultsTextForRAG
-          }, pluginManager, DEBUG_MODE);
+          let gravityReceiver = null;
+          try {
+            if (process.env.VCP_GRAVITY_SHADOW === 'true' ||
+                process.env.VCP_GRAVITY_ENABLED === 'true') {
+              const { createGravityVectorReceiver } = require('../vcpLoop/gravityVectorReceiver.js');
+              const { findLastRealUserMessage } = require('../messageProcessor.js');
+              gravityReceiver = createGravityVectorReceiver({
+                userText: findLastRealUserMessage(currentMessagesForNonStreamLoop).rawContent,
+                toolResultsText: toolResultsTextForRAG
+              });
+            }
+          } catch { /* Optional receiver initialization cannot stop refresh. */ }
+          try {
+            currentMessagesForNonStreamLoop = await _refreshRagBlocksIfNeeded(currentMessagesForNonStreamLoop, {
+              lastAiMessage: currentAIContentForLoop,
+              toolResultsText: toolResultsTextForRAG,
+              ...(gravityReceiver ? { onGravityVectors: gravityReceiver.accept } : {})
+            }, pluginManager, DEBUG_MODE);
+          } finally {
+            try { gravityHandoff = gravityReceiver ? gravityReceiver.finish() : null; }
+            catch { gravityHandoff = null; }
+          }
         }
 
         const hasImage = combinedToolResultsForAI.some(item => item.type === 'image_url');
@@ -511,9 +535,37 @@ class NonStreamHandler {
           ? translatedToolResultsForAI
           : `<!-- VCP_TOOL_PAYLOAD -->\n${toolResultsTextForRAG}`;
 
-        currentMessagesForNonStreamLoop.push({ role: 'user', content: finalToolPayloadForAI });
+        // 超大回执循环内截断：完整原文异步落盘 DebugLog/toolPayloads，ink:mark_history 豁免
+        const { truncateToolPayload } = require('../vcpLoop/toolPayloadTruncator.js');
+        const payloadForLoop = truncateToolPayload(finalToolPayloadForAI, {
+          toolNames: normalCalls.map(call => call.name),
+          exempt: normalCalls.some(call => call.markHistory)
+        });
+        currentMessagesForNonStreamLoop.push({ role: 'user', content: payloadForLoop });
 
-        const recursionBody = { ...originalBody, messages: currentMessagesForNonStreamLoop, stream: false };
+        // 🌟 GravityStub V2：组装期语义引力场可逆投影（纯内存切片，零磁盘污染）
+        // GRAVITY_SAFETY_BEGIN
+        let messagesForUpstream = currentMessagesForNonStreamLoop;
+        try {
+          const { safeGravityProjection } = require('../vcpLoop/safeGravityProjection.js');
+          messagesForUpstream = await safeGravityProjection(currentMessagesForNonStreamLoop, {
+            pluginManager, latestPayload: payloadForLoop, recursionDepth,
+            gravityHandoff,
+            gravityRawToolResults: toolResultsTextForRAG,
+            debugMode: DEBUG_MODE, signal: abortController?.signal
+          });
+        } catch {
+          // Even failure to load the safety module must not break tool continuation.
+          messagesForUpstream = currentMessagesForNonStreamLoop;
+        }
+        // GRAVITY_SAFETY_END
+
+        // Recheck cancellation after awaited tool execution and projection.
+        if (abortController?.signal.aborted || res.writableEnded || res.destroyed) {
+          break;
+        }
+
+        const recursionBody = { ...originalBody, messages: messagesForUpstream, stream: false };
         const recursionReadResult = await readNonStreamResponseWithSemanticRetry({
           fetchResponse: () => fetchNonStreamCompletion(recursionBody, `tool_loop_depth_${recursionDepth}`),
           retries: apiRetries,

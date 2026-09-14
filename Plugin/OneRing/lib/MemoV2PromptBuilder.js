@@ -333,7 +333,16 @@ function buildReductionPrompt(options = {}) {
             projectionRequiredSegmentFailures: projectionStats.projectionRequiredSegmentFailures,
             promptSanitizedEventCount: projectionStats.promptSanitizedEventCount,
             promptRedactionPlaceholderCount: projectionStats.promptRedactionPlaceholderCount,
-            promptSanitizationRemovedChars: projectionStats.promptSanitizationRemovedChars
+            promptSanitizationRemovedChars: projectionStats.promptSanitizationRemovedChars,
+            promptWireTokenCount: Number.isFinite(Number(projectionStats.promptWireTokenCount))
+                ? Number(projectionStats.promptWireTokenCount)
+                : 0,
+            promptNewThreadTokenCount: Number.isFinite(Number(projectionStats.promptNewThreadTokenCount))
+                ? Number(projectionStats.promptNewThreadTokenCount)
+                : 0,
+            promptNoAssigneeTokenCount: Number.isFinite(Number(projectionStats.promptNoAssigneeTokenCount))
+                ? Number(projectionStats.promptNoAssigneeTokenCount)
+                : 0
         }
     };
 }

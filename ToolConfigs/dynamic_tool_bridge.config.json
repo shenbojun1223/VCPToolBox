@@ -16,9 +16,9 @@
     "descriptionOverrides": {}
   },
   "smallModel": {
-    "enabled": false,
+    "enabled": true,
     "useMainConfig": true,
     "endpoint": "",
-    "model": ""
+    "model": "gemini-3.8-flash"
   }
 }

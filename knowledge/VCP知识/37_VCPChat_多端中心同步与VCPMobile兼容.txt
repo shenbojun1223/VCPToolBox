@@ -1,0 +1,202 @@
+[2026-08-12；2026-08-13；2026-08-14 更新] - Codex
+[VCP知识] VCPChat 多端中心同步与 VCPMobile 兼容指南
+
+最后核对版本：VCPChatSyncHub 1.1.0、Mobile Sync 协议 1.1、VCPToolBox personal/main 282fd551、VCPChat personal/main b0373686。
+
+一、问题与架构
+
+VCPChat 的 Agent、群组、话题和聊天记录默认保存在各客户端自己的 AppData 中。多台电脑分别运行 VCPChat 时，这些本地数据不会仅因为它们连接了同一台 VCPToolBox 而自动一致。
+
+VCPChatSyncHub 将 VCPToolBox 服务器变成中心同步节点：
+
+VCPChat 桌面端 A ─┐
+VCPChat 桌面端 B ─┼─ HTTP + WebSocket ─ VCPChatSyncHub ─ 中央 AppData
+VCPMobile        ─┘
+
+客户端之间不直接复制目录。每个客户端都向中心节点上传本地新增或较新的数据，并从中心节点拉取自己缺少或较新的数据。该方案继承 Mobile Sync V2 数据模型与路由约定，当前协议版本为 1.1，同时为桌面客户端增加完整 Agent/群组配置同步接口。
+
+二、服务端配置
+
+插件目录：`Plugin/VCPChatSyncHub/`
+
+私有配置文件：`Plugin/VCPChatSyncHub/config.env`
+
+配置字段：
+
+- `MobileSyncToken`：必填。服务器、所有 VCPChat 客户端和 VCPMobile 必须使用同一个强随机 Token。不能使用示例占位值。
+- `MobileSyncPort`：Mobile Sync WebSocket 端口，默认 `5975`。
+- `SyncHubAppDataPath`：可选的中央数据目录。留空时使用 `Plugin/VCPChatSyncHub/data/AppData`。
+
+默认服务地址：
+
+- HTTP：`http(s)://<VCPToolBox主机>:<VCPToolBox端口>/api/mobile-sync`
+- WebSocket：`ws(s)://<VCPToolBox主机>:5975/ws-sync`
+
+HTTP 和 WebSocket 使用同一个同步 Token。HTTP 接受 `x-sync-token`、`Authorization: Bearer <token>` 或查询参数；WebSocket 使用 `?token=<token>`。主 VCP API Key 与同步 Token 是两套独立凭据，不能混用。
+
+Token、中央同步数据、附件和同步状态数据库都不应提交到 Git。中央数据目录及相邻的 `sync_state.db` 应纳入服务器备份。
+
+三、VCPChat 桌面端配置
+
+客户端必须使用包含 `modules/services/desktopSync/index.js` 的新版 VCPChat。打开：
+
+`全局设置 -> 数据同步`
+
+填写：
+
+1. 开启“启用 VCPToolBox 中心同步”。
+2. “同步 HTTP URL”填写 VCPToolBox 基础地址，例如 `https://vcp.example.com` 或 `http://服务器IP:6005`。桌面端会自动补全 `/api/mobile-sync`，已经填写该路径也能正常归一化。
+3. “同步 WebSocket URL”填写 `wss://vcp.example.com/ws-sync`，或者直连时填写 `ws://服务器IP:5975/ws-sync`。如果只填 `ws(s)://主机:端口`，客户端会补全 `/ws-sync`。
+4. “同步 Token”填写服务端 `MobileSyncToken` 的值。
+5. 自动同步间隔最低 30 秒，初次使用建议 60 秒。
+6. 保存设置后点击“立即同步”，状态显示“同步完成”才算连接成功。
+
+启用后，客户端启动约 2.5 秒会进行一次同步，之后按配置周期同步。它不是逐字实时协同编辑器；在一次同步完成前，不建议在多端同时修改同一个 Agent、群组或话题。
+
+四、VCPMobile 配置
+
+在 VCPMobile 的同步设置中填写：
+
+- HTTP 服务 URL：VCPToolBox 基础地址，例如 `https://vcp.example.com` 或 `http://服务器IP:6005`。VCPMobile 会自行拼接 `/api/mobile-sync`，不要重复填写该前缀。
+- WebSocket 服务 URL：`wss://vcp.example.com/ws-sync`，或者 `ws://服务器IP:5975/ws-sync`。
+- Mobile Sync Token：与服务器和桌面客户端相同的 `MobileSyncToken`。
+
+保存后，打开“全量神经同步”面板并启动同步。VCPMobile 使用标准 Mobile Sync V2 DTO 和 1.1 协议；桌面客户端额外同步的完整 UI、模型和 Agent/群组配置字段不会全部进入移动端 DTO。
+
+五、同步范围与边界
+
+当前同步内容：
+
+- Agent 和群组的标准实体信息。
+- 桌面端 Agent/群组的可迁移完整配置。
+- Agent 与群组的话题。
+- 聊天消息。
+- 用户、Agent、群组头像。
+- 消息附件。
+- Mobile Sync V2 支持的墓碑和变更记录。
+- 协议 1.1 的附件完整性检查与跨设备补传请求。
+
+主动排除的内容：
+
+- API Key、Token、Secret、Password、Credential 等敏感字段。
+- 以 path、dir、directory、executable 等结尾的本机路径字段。
+- `file://` 地址和 Windows 盘符绝对路径。
+- VCPChat 全局 `settings.json`。
+- 仅属于某台设备的运行环境配置。
+
+重要限制：
+
+- 服务器协议支持删除墓碑，但当前桌面同步客户端尚未为桌面端删除操作完整生成和传播墓碑。不能依赖“在一台桌面端删除后其他桌面端自动删除”；旧内容可能重新被拉回。
+- 多端同时编辑同一个对象时，系统根据 manifest、时间戳和内容哈希决定拉取或推送，不进行字段级人工合并。应先让一端同步完成，再在另一端编辑。
+- 消息正文与附件文件是两个独立层次。某台设备缺少本地附件时，消息同步仍可完成并明确报告“等待其他设备补传”；这不等于附件文件已恢复。
+- Git 只保存源码，不是聊天数据库备份方案。
+
+六、首次迁移的推荐顺序
+
+1. 备份每台 VCPChat 的 AppData。
+2. 选聊天记录和 Agent 配置最完整的一台作为主设备。
+3. 先只在主设备启用同步并点击“立即同步”，让它初始化中央数据。
+4. 检查服务器日志没有鉴权、索引或附件错误。
+5. 再逐台配置其他 VCPChat，每增加一台先手动同步并抽查 Agent、话题、消息、头像和附件。
+6. 最后配置 VCPMobile 并执行全量同步。
+
+初次迁移时不要同时启动所有客户端，也不要在确认中央数据完整前批量删除本地内容。
+
+七、公网与反向代理
+
+聊天记录、Agent 配置和附件都属于敏感数据。公网部署应使用 TLS：
+
+- VCPToolBox HTTP 路径通过 HTTPS 暴露，并转发 `/api/mobile-sync`。
+- 同步 WebSocket 使用 WSS，并正确转发 `/ws-sync` 与 Upgrade/Connection 头。
+- 不建议在不可信网络直接暴露明文 `5975`。
+- 防火墙只开放实际需要的来源或由反向代理统一接入。
+
+八、故障排查
+
+“同步 Token 未配置”或插件不启动：检查插件级 `config.env` 是否存在，`MobileSyncToken` 是否为空或仍是示例值，然后重启 VCPToolBox。
+
+HTTP 返回 401：客户端 Token 与服务端不一致，或反向代理没有转发认证 Header。
+
+HTTP 可用但 WebSocket 失败：检查 `5975` 监听、防火墙、`/ws-sync` 路径、WSS 证书和反向代理 Upgrade 配置。
+
+客户端提示缺少 HTTP/WS URL：全局设置没有保存成功，或使用的仍是未包含桌面同步功能的旧客户端。
+
+同步完成但数据不全：先检查客户端 AppData 是否确实存在对应 Agent、群组和话题，再查 VCPChat 的 `[DesktopSync]` 日志以及服务器 `VCPChatSyncHub` 日志。
+
+附件不同步：先看同步结果是否包含 `missingAttachmentHashes`，以及日志是否出现“等待其他设备补传”。服务器会持续要求持有原文件的设备上传；应让最可能保存原附件的电脑或手机再执行一次同步。若所有设备都已丢失原文件，服务器只有文件名、大小和哈希时无法反向还原文件内容。
+
+客户端因远端附件下载返回 HTTP 404 而整体失败：应更新到包含“远端附件缺失占位”修复的 VCPChat。404 表示中央附件库暂时缺文件，客户端会保留消息和附件元数据并等待补传；401、网络中断、响应损坏等其他错误仍应判定为同步失败。
+
+服务器反复要求上传附件，而当前电脑也没有该文件：这是允许的部分成功状态。当前设备应记录缺失哈希并继续完成其余数据同步，不能伪造空文件，也不能把该哈希永久标记为已完成。
+
+九、附件完整性与补传语义（协议 1.1）
+
+附件同步必须同时满足两个条件：消息中存在附件引用，中央 `attachment_index` 中也存在可读取的物理文件。只有元数据、哈希或历史消息引用，不代表附件已经进入中央附件库。
+
+协议流程：
+
+1. 客户端上传消息和附件元数据。
+2. 服务端根据哈希检查中央附件索引与物理文件。
+3. 中央缺文件时，服务端在差异结果中保持 `toPush=true`，并通过 `neededAttachmentHashes` 要求客户端补传。
+4. 当前设备有文件时立即上传；没有文件时返回部分成功，报告缺失哈希，但不阻断 Agent、话题和消息同步。
+5. 其他仍持有原文件的设备后续同步时会收到相同补传请求，上传成功后中央索引恢复，其他客户端即可再次拉取。
+
+旧实现的缺陷是：消息哈希一致时直接走快速路径并返回 `toPush=false`，即使附件索引和物理文件缺失也不会再次请求上传。1.1 修复在快速路径之前增加附件完整性检查，使补传请求具有持续性。
+
+桌面端下载中央缺失附件得到 HTTP 404 时，会把附件保留为 `missing` 状态占位，不让主同步失败。桌面端被要求上传但本机也缺文件时，同步结果显示：`同步完成（N 个附件在当前设备缺失，等待其他设备补传）`，并暴露 `missingAttachmentHashes` 供排查。
+
+该机制只解决“至少一台设备仍有原文件”的恢复问题。若所有设备都没有原文件，哈希是单向摘要，中央元数据无法重建原始附件。
+
+十、2026-08-13 附件事件溯源与验证
+
+事件样本：附件哈希 `5645a85d96958d364d8649b4e86ea8f73f2667c5d6df1f19b0116443ed1b4af5`，文件名 `88664aec95e6e1fa208939a6592e41d4_3427696814219848349_m.md`，记录大小 173534 字节。中央消息库中有两个引用，但 `message_attachments=2`、`attachment_index=0`、物理附件文件数为 0，且历史记录未保存 `extractedText`，因此服务端不能自行恢复内容。
+
+同步日志能确认中央服务在 2026-08-13 03:48 首次从桌面同步客户端 `vcpchat-desktop-sync-1.1` 收到附件元数据，随后没有对应附件上传。因为中心投影会重写原路径，且移动端与桌面端使用相同 ID 形式，只能判断该数据可能更早由 VCPMobile 进入那台电脑，不能仅凭中央日志证明最初来源一定是手机。
+
+本次修复包括：
+
+- SyncHub 和 VCPChat 内置 Mobile Sync 服务的差异算法，在消息哈希一致时仍检查被引用附件的索引与物理文件，缺失时继续返回 `toPush=true`。
+- VCPChat 桌面同步在拉取远端缺失附件时生成缺失占位；当前设备无法补传时改为明确的部分成功，不再让整轮同步失败。
+- 修复 SyncHub 与内置 Mobile Sync 在已有历史数据启动扫描时遗漏 `readHistoryStrict` 导入的问题。
+
+验证结果：SyncHub 专项测试 24/24 通过，启动回归测试 14/14 通过；VCPChat/Mobile Sync 测试 49 通过、1 跳过。隔离端到端场景确认“消息 1 条、附件引用 1 条、附件文件 0 个”时客户端仍成功并报告 1 个待补传附件。线上验证确认主服务 HTTP 6005 正常、WebSocket 5975 返回协议 1.1、真实缺失话题持续得到 `toPush=true`，PM2 服务在线。
+
+对应提交：
+
+- VCPToolBox：`d45096b0 Retry missing sync attachments`、`80e9d49f Fix SyncHub startup with existing history`。
+- VCPChat：`c65bd4e Retry missing sync attachments`、`94304e0 Fix Mobile Sync startup with existing history`、`b0373686 Do not block sync on missing local attachments`。
+- VCPChat 在最终附件修复前已合并上游至 `f561faa`，最终代码推送到自己的 `origin/personal/main`，不是官方仓库。
+
+十一、2026-08-14 VCPMobile 1.1.3 协议兼容修复
+
+VCPMobile 1.1.3 仍使用 Mobile Sync 协议 1.1，但它的实际线上帧比 SyncHub 后续扩展出的复合 Owner 协议更精简。服务端最初把桌面增强字段误当成移动端必填字段，导致手机同步依次暴露多个兼容断点。修复原则是：手机省略只读请求中的冗余身份时，由服务端根据中央索引解析；客户端一旦显式提供身份，仍必须与中央索引严格一致。
+
+实际兼容差异与修复：
+
+- `VERSION_CHECK`：官方 1.1.x 可能只发送 `mobileVersion`，不发送 `protocolVersion`。`VERSION_ACK.version` 必须保留移动端包版本门禁所期望的 `1.0.0`，同时通过 `pluginVersion=1.1.0` 和 `protocolVersion=1.1` 暴露服务端真实版本。对应提交 `c163b0c4`。
+- Topic Manifest：1.1.3 的 Topic 项省略 `ownerId`。已有 Topic 从全局索引解析 Owner；新 Topic 不猜测具体 Owner，等待后续完整 Topic DTO 提供归属。显式空、越界或冲突身份仍拒绝。对应提交 `e39c9dd8`。
+- Topic Manifest 在应用 Pull 后可能暂时出现空 `hash`/`configHash`。服务端只把 Topic 的空值视为“未知、需要继续比对”，Agent/Group 空哈希以及任何非空畸形哈希仍拒绝。对应提交 `a8f68a55`。
+- Phase 2.5：官方 `SYNC_TOPIC_HASH_BATCH_V2` 只发送 `hashes`，没有桌面扩展的 `topics` 复合身份数组。服务端使用索引中的 Topic Owner 完成只读双哈希比较。对应提交 `e6a3dbca`。
+- Phase 3 差异帧：官方 `SYNC_MESSAGE_DIFF_BATCH` 中每个 Topic 只有 `topicHash` 和 `messages`，没有 `ownerType`/`ownerId`。服务端同样从索引解析 Owner；若新客户端显式提供复合身份则继续严格校验。对应提交 `e6a3dbca`。
+- Phase 3 HTTP 消息 Pull：官方请求固定为 `{topicId, msgIds}`，不包含 Owner。服务端 `/download-messages-stream` 现在从 Topic 中央索引解析实际 Owner 并写入响应；只提供一半 Owner 字段、身份格式错误或显式身份与索引冲突时仍返回错误。对应提交 `282fd551`。
+
+2026-08-14 03:07 的真实手机会话已通过版本验证、Owner Metadata、Topic Metadata、Phase 2.5 和 Phase 3 差异计算；当时 5 个 Topic 在 HTTP 消息 Pull 阶段因旧服务端强制要求 Owner 而失败。修复上线后，全套 SyncHub 测试 27/27 通过，公网只读验证确认空 Topic 哈希清单可处理，且省略 Owner 的真实消息 Pull 返回 HTTP 200 并正确拉取一条中央索引消息。
+
+状态边界：用户补充确认，2026-08-13 的修复完成后曾实际使用手机同步，之后暂未发现问题，说明当时的主同步链路可以正常使用。2026-08-14 针对后续暴露的精简协议帧和 HTTP 消息 Pull 又完成了兼容修复及公网只读验证；当前按“暂时可用、后续继续观察”记录，不把短期正常等同于所有数据形态和长期运行均已验证。后续若再次使用，应同时参考手机端最终提示和服务端完整会话日志。
+
+十二、源码事实入口
+
+- 服务端入口：`Plugin/VCPChatSyncHub/index.js`
+- HTTP 认证与数据路由：`Plugin/VCPChatSyncHub/transport/routes.js`
+- WebSocket 鉴权与协议：`Plugin/VCPChatSyncHub/transport/websocket.js`
+- 消息差异与附件完整性：`Plugin/VCPChatSyncHub/sync/diff.js`
+- 桌面完整配置过滤：`Plugin/VCPChatSyncHub/sync/desktop-config.js`
+- 服务端说明：`Plugin/VCPChatSyncHub/README.md`
+- 桌面同步服务：VCPChat `modules/services/desktopSync/index.js`
+- VCPChat 内置移动同步差异算法：`VCPDistributedServer/Plugin/VCPMobileSync/sync/diff.js`
+- 桌面设置界面：VCPChat `main.html` 的“数据同步”区域
+- VCPMobile 协议：Mobile Sync V2 数据模型，协议版本 1.1
+
+修改同步行为或更新文档时，应先核对这些源码，不要只依赖历史说明。
+
+Tag: VCPChatSyncHub, VCPChat多端同步, VCPMobile, VCPMobile1.1.3, Mobile Sync V2, 协议1.1, VERSION_ACK, Topic Manifest, SYNC_TOPIC_HASH_BATCH_V2, SYNC_MESSAGE_DIFF_BATCH, download-messages-stream, Owner索引解析, 中心同步, 聊天记录同步, Agent配置同步, 群组同步, 话题同步, 头像同步, 附件同步, 附件补传, 部分成功, missingAttachmentHashes, 同步Token, 数据迁移, 同步安全, VCPToolBox

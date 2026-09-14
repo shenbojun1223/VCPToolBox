@@ -285,6 +285,48 @@ function buildSummary(body) {
   };
 }
 
+// --- 快照 summary 持久化（审计用，默认开启，VCP_FINALCONTEXT_PERSIST=false 可关闭） ---
+// 落盘 DebugLog/finalContext/<日期>/，仅存带 token 统计的瘦身 summary（正文截前 200 字符），
+// 完整请求体原文已由 DebugLog/chat/<日期>/ 落盘，此处不重复存储。
+const PERSIST_ENABLED = String(process.env.VCP_FINALCONTEXT_PERSIST || 'true').toLowerCase() !== 'false';
+const PERSIST_TEXT_PREVIEW_CHARS = 200;
+
+function persistSnapshotToDisk(snapshot) {
+  if (!PERSIST_ENABLED) return;
+  try {
+    const fs = require('fs').promises;
+    const path = require('path');
+    const capturedAt = snapshot.capturedAt || new Date().toISOString();
+    const date = capturedAt.slice(0, 10);
+    const timePart = capturedAt.slice(11, 23).replace(/[:.]/g, '-');
+    const dir = path.resolve(process.cwd(), 'DebugLog', 'finalContext', date);
+    const filePath = path.join(dir, `ctx-${date}_${timePart}_id${snapshot.id}_pid${process.pid}.json`);
+
+    const slimBlocks = (snapshot.summary?.blocks || []).map(block => {
+      const { parts, text, ...rest } = block;
+      return {
+        ...rest,
+        textPreview: typeof text === 'string' ? text.slice(0, PERSIST_TEXT_PREVIEW_CHARS) : '',
+        textTruncated: typeof text === 'string' && text.length > PERSIST_TEXT_PREVIEW_CHARS
+      };
+    });
+
+    const record = {
+      id: snapshot.id,
+      capturedAt,
+      metadata: snapshot.metadata,
+      summary: { ...snapshot.summary, blocks: slimBlocks },
+      note: '正文仅保留前200字符预览；完整请求体见 DebugLog/chat/<日期>/ 对应时间的 chat-msg 文件。'
+    };
+
+    fs.mkdir(dir, { recursive: true })
+      .then(() => fs.writeFile(filePath, JSON.stringify(record, null, 2), 'utf8'))
+      .catch(error => console.warn(`[FinalContextStore] Snapshot persist failed: ${error.message}`));
+  } catch (error) {
+    console.warn(`[FinalContextStore] Snapshot persist skipped: ${error.message}`);
+  }
+}
+
 function setLastFinalContext(body, metadata = {}) {
   const clonedBody = safeClone(body);
   const snapshot = {
@@ -298,6 +340,7 @@ function setLastFinalContext(body, metadata = {}) {
   while (snapshots.length > MAX_SNAPSHOTS) {
     snapshots.pop();
   }
+  persistSnapshotToDisk(snapshot);
 }
 
 function getLastFinalContext() {

@@ -1,7 +1,7 @@
 {
-  "enabled": true,
-  "timeoutMinutes": 5,
+  "enabled": false,
   "approveAll": false,
+  "timeoutMinutes": 5,
   "fuzzyToolMatching": false,
   "privacyProtection": {
     "enabled": false

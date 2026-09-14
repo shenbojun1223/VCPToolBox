@@ -52,3 +52,4 @@ saveName:「始」画布挂件「末」
 阅读widget日志可以了解所有当前widget运行时
 H:\MCP\VCPChat\AppData\DesktopWidgets\CATALOG.md
 然后使用本地版本的FileOperator进行对应操作
+Tag: VCPdesktop挂件创建, DesktopRemote CreateWidget, Shadow DOM沙箱, vcpAPI与musicAPI, scriptFiles外部脚本, 挂件收藏持久化

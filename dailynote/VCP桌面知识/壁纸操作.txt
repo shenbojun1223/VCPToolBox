@@ -24,3 +24,4 @@ tool_name:「始」DesktopRemote「末」,
 command:「始」SetWallpaper「末」,
 wallpaperSource:「始」<!DOCTYPE html><html><head><style>body{margin:0;overflow:hidden;background:#000}canvas{display:block}</style></head><body><canvas id="c"></canvas><script>/* 粒子动画代码 */</script></body></html>「末」
 <<<[END_TOOL_REQUEST]>>>
+Tag: VCPdesktop壁纸操作, DesktopRemote SetWallpaper, 网络壁纸URL, 本地file URL, HTML动态壁纸, 图片视频类型识别

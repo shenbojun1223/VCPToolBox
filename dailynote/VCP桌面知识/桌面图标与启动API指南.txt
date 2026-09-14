@@ -152,3 +152,4 @@ shortcuts.forEach(function(item) {
 - Dock 列表是动态的，应实时读取 `state.dock.items`
 - `VCHAT_APPS` 和 `SYSTEM_TOOLS` 是代码硬编码的，始终可用
 - 支持拖拽到桌面：`e.dataTransfer.setData('application/x-desktop-dock-item', JSON.stringify(item))`
+Tag: VCPdesktop图标与启动API, VCPDesktop.dock.launch, VChat子应用注册表, Windows系统工具, 内置桌面挂件, Widget图标文件夹, 图标渲染优先级

@@ -56,3 +56,4 @@ setInterval(async function(){
 }, 2000);
 </script>
 <<<[DESKTOP_PUSH_END]>>>
+Tag: VCPdesktop挂件示例, DESKTOP_PUSH, AI翻译挂件, vcpAPI天气挂件, musicAPI音乐控制, Widget交互脚本

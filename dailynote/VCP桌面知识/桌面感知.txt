@@ -24,3 +24,4 @@ tool_name:「始」DesktopRemote「末」,
 command:「始」ViewWidgetSource「末」,
 widgetId:「始」widget-abc123「末」
 <<<[END_TOOL_REQUEST]>>>
+Tag: VCPdesktop桌面感知, DesktopRemote QueryDesktop, 活跃挂件列表, 快捷图标列表, ViewWidgetSource, Widget源码调试

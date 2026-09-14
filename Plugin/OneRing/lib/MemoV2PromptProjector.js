@@ -241,7 +241,10 @@ function summarizePromptSanitization(events, sanitizedEvents) {
     const stats = {
         promptSanitizedEventCount: 0,
         promptRedactionPlaceholderCount: 0,
-        promptSanitizationRemovedChars: 0
+        promptSanitizationRemovedChars: 0,
+        promptWireTokenCount: 0,
+        promptNewThreadTokenCount: 0,
+        promptNoAssigneeTokenCount: 0
     };
     for (let index = 0; index < events.length; index++) {
         const metadata = sanitizedEvents[index]?.promptSanitization;
@@ -249,6 +252,9 @@ function summarizePromptSanitization(events, sanitizedEvents) {
         stats.promptSanitizedEventCount += 1;
         stats.promptRedactionPlaceholderCount += Number(metadata.placeholderCount) || 0;
         stats.promptSanitizationRemovedChars += Number(metadata.removedChars) || 0;
+        stats.promptWireTokenCount += Number(metadata.wireTokenCount) || 0;
+        stats.promptNewThreadTokenCount += Number(metadata.newThreadTokenCount) || 0;
+        stats.promptNoAssigneeTokenCount += Number(metadata.noAssigneeTokenCount) || 0;
     }
     return stats;
 }

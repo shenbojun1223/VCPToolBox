@@ -1,7 +1,14 @@
 'use strict';
 
+const {
+    NEW_THREAD_WIRE_TOKEN,
+    NO_ASSIGNEE_WIRE_TOKEN
+} = require('./MemoV2WireTokens.js');
+
 const REDACTION_PLACEHOLDER = '\\[REDACTED\\]';
 const REDACTION_PLACEHOLDER_PATTERN = /\[REDACTED\]/giu;
+const NEW_THREAD_ARCHIVE_LABEL = '新线程归档';
+const NO_ASSIGNEE_ARCHIVE_LABEL = '未指定负责人';
 const WRAPPER_CHARS = `"'“”‘’「」『』（()）【】〔〕［］《》<>`;
 const WRAPPED_REDACTION_SOURCE = `(?:[${WRAPPER_CHARS}])*[^\\S\\r\\n]*${REDACTION_PLACEHOLDER}[^\\S\\r\\n]*(?:[${WRAPPER_CHARS}])*`;
 const ENGLISH_CREDENTIAL_PLACEHOLDER_PATTERN = new RegExp(
@@ -68,22 +75,40 @@ function normalizeSanitizedWhitespace(text) {
         .trim();
 }
 
+function escapeRegExp(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+function countWireTokenOccurrences(text, token) {
+    const pattern = new RegExp(escapeRegExp(token), 'gu');
+    return (String(text).match(pattern) || []).length;
+}
+
+function replaceWireTokens(text) {
+    const originalText = String(text ?? '');
+    const newThreadTokenCount = countWireTokenOccurrences(originalText, NEW_THREAD_WIRE_TOKEN);
+    const noAssigneeTokenCount = countWireTokenOccurrences(originalText, NO_ASSIGNEE_WIRE_TOKEN);
+    const replacedText = originalText
+        .replace(new RegExp(escapeRegExp(NEW_THREAD_WIRE_TOKEN), 'gu'), NEW_THREAD_ARCHIVE_LABEL)
+        .replace(new RegExp(escapeRegExp(NO_ASSIGNEE_WIRE_TOKEN), 'gu'), NO_ASSIGNEE_ARCHIVE_LABEL);
+    return {
+        text: replacedText,
+        wireTokenCount: newThreadTokenCount + noAssigneeTokenCount,
+        newThreadTokenCount,
+        noAssigneeTokenCount
+    };
+}
+
 function sanitizeTextDetails(text) {
     const originalText = String(text ?? '');
-    if (!hasPromptRedactionPlaceholder(originalText)) {
-        return {
-            text: originalText,
-            originalChars: originalText.length,
-            sanitizedChars: originalText.length,
-            removedChars: 0,
-            placeholderCount: 0
-        };
-    }
     let placeholderCount = 0;
-    let sanitizedText = removeRedactionMatches(originalText, match => {
-        placeholderCount += countRedactionPlaceholders(match);
-    });
-    sanitizedText = normalizeSanitizedWhitespace(sanitizedText);
+    let sanitizedText = originalText;
+    if (hasPromptRedactionPlaceholder(originalText)) {
+        sanitizedText = removeRedactionMatches(originalText, match => {
+            placeholderCount += countRedactionPlaceholders(match);
+        });
+        sanitizedText = normalizeSanitizedWhitespace(sanitizedText);
+    }
 
     if (originalText.length > 0 && sanitizedText.length === 0) {
         throw sanitizationError(
@@ -92,12 +117,17 @@ function sanitizeTextDetails(text) {
         );
     }
 
+    const wireDetails = replaceWireTokens(sanitizedText);
+    sanitizedText = wireDetails.text;
     return {
         text: sanitizedText,
         originalChars: originalText.length,
         sanitizedChars: sanitizedText.length,
         removedChars: Math.max(0, originalText.length - sanitizedText.length),
-        placeholderCount
+        placeholderCount,
+        wireTokenCount: wireDetails.wireTokenCount,
+        newThreadTokenCount: wireDetails.newThreadTokenCount,
+        noAssigneeTokenCount: wireDetails.noAssigneeTokenCount
     };
 }
 
@@ -120,11 +150,18 @@ function sanitizeCanonicalEventForPrompt(event) {
     if (details.text !== String(event.text ?? '')) {
         clone.promptSanitization = {
             applied: true,
-            strategy: 'remove-canonical-redaction-placeholders',
+            strategy: details.wireTokenCount > 0
+                ? (details.placeholderCount > 0
+                    ? 'remove-canonical-redaction-placeholders-and-replace-wire-tokens'
+                    : 'replace-canonical-wire-tokens')
+                : 'remove-canonical-redaction-placeholders',
             originalChars: details.originalChars,
             sanitizedChars: details.sanitizedChars,
             removedChars: details.removedChars,
-            placeholderCount: details.placeholderCount
+            placeholderCount: details.placeholderCount,
+            wireTokenCount: details.wireTokenCount,
+            newThreadTokenCount: details.newThreadTokenCount,
+            noAssigneeTokenCount: details.noAssigneeTokenCount
         };
     }
     return clone;

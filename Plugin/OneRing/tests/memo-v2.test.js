@@ -398,6 +398,90 @@ test('InternalModelClient classifies timeout and external abort', async () => {
     await assert.rejects(request, error => error.code === 'INTERNAL_MODEL_ABORTED');
 });
 
+test('InternalModelClient bounds a response body that never resolves even when abort is ignored', async () => {
+    let calls = 0;
+    let aborts = 0;
+    const client = new InternalModelClient({
+        baseUrl: 'https://model.invalid',
+        apiKey: 'unit-key',
+        timeoutMs: 10,
+        retries: 0,
+        fetchImpl: async (_url, options) => {
+            calls += 1;
+            options.signal.addEventListener('abort', () => { aborts += 1; }, { once: true });
+            return { ok: true, status: 200, text: () => new Promise(() => {}) };
+        }
+    });
+    const startedAt = Date.now();
+    await assert.rejects(client.complete(modelRequest()), error => error.code === 'INTERNAL_MODEL_TIMEOUT' && error.attempts === 1);
+    assert.ok(Date.now() - startedAt < 500);
+    assert.equal(calls, 1);
+    assert.equal(aborts, 1);
+});
+
+test('InternalModelClient returns a body completed before the deadline and clears its timer', async () => {
+    let aborts = 0;
+    const client = new InternalModelClient({
+        baseUrl: 'https://model.invalid',
+        apiKey: 'unit-key',
+        timeoutMs: 100,
+        retries: 0,
+        fetchImpl: async (_url, options) => {
+            options.signal.addEventListener('abort', () => { aborts += 1; }, { once: true });
+            return {
+                ok: true,
+                status: 200,
+                text: async () => {
+                    await new Promise(resolve => setTimeout(resolve, 5));
+                    return JSON.stringify({ choices: [{ message: { content: 'body complete' }, finish_reason: 'stop' }] });
+                }
+            };
+        }
+    });
+    const result = await client.complete(modelRequest());
+    assert.equal(result.content, 'body complete');
+    await new Promise(resolve => setTimeout(resolve, 130));
+    assert.equal(aborts, 0);
+});
+
+test('InternalModelClient applies bounded retries to response body timeouts without late unhandled rejection', async () => {
+    let calls = 0;
+    let aborts = 0;
+    const unhandled = [];
+    const onUnhandledRejection = reason => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandledRejection);
+    try {
+        const client = new InternalModelClient({
+            baseUrl: 'https://model.invalid',
+            apiKey: 'unit-key',
+            timeoutMs: 10,
+            retries: 2,
+            backoffMs: 0,
+            sleepImpl: async () => {},
+            fetchImpl: async (_url, options) => {
+                calls += 1;
+                return {
+                    ok: true,
+                    status: 200,
+                    text: () => new Promise((resolve, reject) => {
+                        options.signal.addEventListener('abort', () => {
+                            aborts += 1;
+                            setTimeout(() => reject(new Error('late body failure')), 0);
+                        }, { once: true });
+                    })
+                };
+            }
+        });
+        await assert.rejects(client.complete(modelRequest()), error => error.code === 'INTERNAL_MODEL_TIMEOUT' && error.attempts === 3);
+        assert.equal(calls, 3);
+        assert.equal(aborts, 3);
+        await new Promise(resolve => setTimeout(resolve, 30));
+        assert.deepEqual(unhandled, []);
+    } finally {
+        process.removeListener('unhandledRejection', onUnhandledRejection);
+    }
+});
+
 test('InternalModelClient classifies empty choices, invalid JSON, truncation, and safety stop', async () => {
     for (const [payload, code] of [
         [{ choices: [] }, 'INTERNAL_MODEL_EMPTY_CHOICES'],

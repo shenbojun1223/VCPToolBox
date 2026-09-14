@@ -61,9 +61,17 @@ class CacheManager {
      * @param {string} key - 缓存键
      * @param {any} value - 要缓存的值
      */
-    set(cacheName, key, value) {
+    set(cacheName, key, value, metadata = null) {
         const cache = this.caches.get(cacheName);
         if (!cache) return;
+
+        // Optional metadata must never prevent an existing cache write.
+        // Store a detached copy with this exact entry, not in a side registry.
+        let storedMetadata = null;
+        try {
+            if (metadata !== null && metadata !== undefined)
+                storedMetadata = structuredClone(metadata);
+        } catch { /* Unavailable metadata means unknown provenance. */ }
 
         // LRU策略: 超过容量时删除最早的条目
         if (cache.data.size >= cache.maxSize) {
@@ -73,8 +81,27 @@ class CacheManager {
 
         cache.data.set(key, {
             value,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            metadata: storedMetadata
         });
+    }
+
+    /**
+     * Read value and optional metadata from the same live cache entry.
+     * Uses the existing expiry/statistics path exactly once. Legacy get()
+     * remains unchanged. Metadata is descriptive, NOT a trust certificate:
+     * producers/consumers must separately verify text, vector and model bindings.
+     */
+    getWithMetadata(cacheName, key) {
+        const value = this.get(cacheName, key);
+        const entry = this.caches.get(cacheName)?.data.get(key);
+        if (!entry || entry.value !== value) return null;
+        let metadata = null;
+        try {
+            if (entry.metadata !== null && entry.metadata !== undefined)
+                metadata = structuredClone(entry.metadata);
+        } catch { /* Return the value with unknown provenance. */ }
+        return { value, metadata };
     }
 
     /**

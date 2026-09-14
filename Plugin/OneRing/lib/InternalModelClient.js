@@ -289,6 +289,7 @@ class InternalModelClient {
             let controller;
             let timeoutId;
             let timedOut = false;
+            let timeoutReject;
             let removeExternalAbortListener = () => {};
             try {
                 controller = new AbortController();
@@ -303,79 +304,88 @@ class InternalModelClient {
                 timeoutId = setTimeout(() => {
                     timedOut = true;
                     controller.abort();
+                    timeoutReject(new Error('Internal model request timed out'));
                 }, this.timeoutMs);
                 this.log({ event: 'internal-model-attempt', attempt });
-                const response = await this.fetchImpl(completionUrl(this.baseUrl), {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        Accept: 'application/json',
-                        Authorization: `Bearer ${this.apiKey}`
-                    },
-                    body: JSON.stringify(body),
-                    signal: controller.signal
-                });
-                const status = responseStatus(response);
-                const responseBody = await readResponseBody(response);
-                if (!response || response.ok !== true) {
-                    const providerError = parseProviderErrorBody(responseBody);
-                    const genericInvalidRequest = isGenericInvalidRequest(status, request, providerError);
-                    const retryable = genericInvalidRequest || isRetryableStatus(status);
-                    const code = genericInvalidRequest ? GENERIC_INVALID_REQUEST_CODE : httpErrorCode(status);
-                    if (genericInvalidRequest && attempt < attemptsAllowed) genericInvalidRequestRetryCount += 1;
-                    lastError = new InternalModelError(code, `Internal model request failed with HTTP ${status || 'unknown'}`, {
-                        status,
-                        attempts: attempt,
-                        retryable,
-                        genericInvalidRequestRetryCount
+                const attemptPromise = (async () => {
+                    const response = await this.fetchImpl(completionUrl(this.baseUrl), {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Accept: 'application/json',
+                            Authorization: `Bearer ${this.apiKey}`
+                        },
+                        body: JSON.stringify(body),
+                        signal: controller.signal
                     });
-                    this.log({ event: 'internal-model-response-error', attempt, status, code });
-                    if (retryable && attempt < attemptsAllowed) {
-                        await this.sleepImpl(this.backoffMs * Math.pow(2, attempt - 1));
-                        continue;
+                    const status = responseStatus(response);
+                    const responseBody = await readResponseBody(response);
+                    if (!response || response.ok !== true) {
+                        const providerError = parseProviderErrorBody(responseBody);
+                        const genericInvalidRequest = isGenericInvalidRequest(status, request, providerError);
+                        const retryable = genericInvalidRequest || isRetryableStatus(status);
+                        const code = genericInvalidRequest ? GENERIC_INVALID_REQUEST_CODE : httpErrorCode(status);
+                        if (genericInvalidRequest && attempt < attemptsAllowed) genericInvalidRequestRetryCount += 1;
+                        lastError = new InternalModelError(code, `Internal model request failed with HTTP ${status || 'unknown'}`, {
+                            status,
+                            attempts: attempt,
+                            retryable,
+                            genericInvalidRequestRetryCount
+                        });
+                        this.log({ event: 'internal-model-response-error', attempt, status, code });
+                        if (retryable && attempt < attemptsAllowed) {
+                            await this.sleepImpl(this.backoffMs * Math.pow(2, attempt - 1));
+                            return null;
+                        }
+                        throw lastError;
                     }
-                    throw lastError;
-                }
 
-                const payload = parseJsonBody(responseBody);
-                const choice = payload?.choices?.[0];
-                if (!choice || typeof choice !== 'object') {
-                    throw new InternalModelError('INTERNAL_MODEL_EMPTY_CHOICES', 'Internal model returned no choices', { attempts: attempt });
-                }
-                const finishReason = choice.finish_reason == null ? null : String(choice.finish_reason);
-                if (/content_filter|safety|blocked/i.test(finishReason || '')) {
-                    throw new InternalModelError('INTERNAL_MODEL_SAFETY_BLOCKED', 'Internal model stopped for safety policy', {
+                    const payload = parseJsonBody(responseBody);
+                    const choice = payload?.choices?.[0];
+                    if (!choice || typeof choice !== 'object') {
+                        throw new InternalModelError('INTERNAL_MODEL_EMPTY_CHOICES', 'Internal model returned no choices', { attempts: attempt });
+                    }
+                    const finishReason = choice.finish_reason == null ? null : String(choice.finish_reason);
+                    if (/content_filter|safety|blocked/i.test(finishReason || '')) {
+                        throw new InternalModelError('INTERNAL_MODEL_SAFETY_BLOCKED', 'Internal model stopped for safety policy', {
+                            attempts: attempt,
+                            finishReason
+                        });
+                    }
+                    if (/^length$/i.test(finishReason || '')) {
+                        throw new InternalModelError('INTERNAL_MODEL_TRUNCATED', 'Internal model output was truncated', {
+                            attempts: attempt,
+                            finishReason
+                        });
+                    }
+                    const content = typeof choice.message?.content === 'string' && choice.message.content.trim()
+                        ? choice.message.content
+                        : null;
+                    const toolCalls = normalizeToolCalls(choice.message?.tool_calls);
+                    if (content == null && toolCalls.length === 0) {
+                        throw new InternalModelError('INTERNAL_MODEL_EMPTY_RESULT', 'Internal model returned no content or tool calls', {
+                            attempts: attempt,
+                            finishReason
+                        });
+                    }
+                    const result = {
+                        content,
+                        toolCalls,
+                        finishReason,
+                        usage: payload.usage && typeof payload.usage === 'object' ? payload.usage : null,
                         attempts: attempt,
-                        finishReason
-                    });
-                }
-                if (/^length$/i.test(finishReason || '')) {
-                    throw new InternalModelError('INTERNAL_MODEL_TRUNCATED', 'Internal model output was truncated', {
-                        attempts: attempt,
-                        finishReason
-                    });
-                }
-                const content = typeof choice.message?.content === 'string' && choice.message.content.trim()
-                    ? choice.message.content
-                    : null;
-                const toolCalls = normalizeToolCalls(choice.message?.tool_calls);
-                if (content == null && toolCalls.length === 0) {
-                    throw new InternalModelError('INTERNAL_MODEL_EMPTY_RESULT', 'Internal model returned no content or tool calls', {
-                        attempts: attempt,
-                        finishReason
-                    });
-                }
-                const result = {
-                    content,
-                    toolCalls,
-                    finishReason,
-                    usage: payload.usage && typeof payload.usage === 'object' ? payload.usage : null,
-                    attempts: attempt,
-                    requestId: payload.id == null ? null : String(payload.id)
-                };
-                if (genericInvalidRequestRetryCount > 0) {
-                    result.genericInvalidRequestRetryCount = genericInvalidRequestRetryCount;
-                }
+                        requestId: payload.id == null ? null : String(payload.id)
+                    };
+                    if (genericInvalidRequestRetryCount > 0) {
+                        result.genericInvalidRequestRetryCount = genericInvalidRequestRetryCount;
+                    }
+                    return result;
+                })();
+                const timeoutPromise = new Promise((_, reject) => {
+                    timeoutReject = reject;
+                });
+                const result = await Promise.race([attemptPromise, timeoutPromise]);
+                if (result === null) continue;
                 return result;
             } catch (error) {
                 if (error instanceof InternalModelError) {

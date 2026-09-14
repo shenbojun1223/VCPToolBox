@@ -256,7 +256,10 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
         }
         case "SYNC_ENTITY_DELETE": {
           if (["1.4", "1.5"].includes(connection.protocolVersion)) {
-            return handleDelete14(payload, appDataPath);
+            const response = await handleDelete14(payload, appDataPath);
+            // Wire 1.5 deletion is a notification: the mobile receiver rejects SYNC_ACK.
+            // Await the durable operation and preserve errors; Wire 1.4 keeps its ACK.
+            return connection.protocolVersion === "1.5" ? null : response;
           }
           const { id: rawId, dataType, topicId } = payload;
           let safeId = "";

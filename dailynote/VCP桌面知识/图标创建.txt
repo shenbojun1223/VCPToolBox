@@ -20,3 +20,4 @@ command:「始」QueryDock「末」
    - `.icon-wrap` 80x80 容器
    - 内部用 SVG 绘制复杂形状（如盾牌、Logo），用 CSS 做发光/呼吸/粒子等动效
    - `drop-shadow` 实现外发光，`@keyframes` 控制脉冲节奏
+Tag: VCPdesktop应用图标创建, AICreator图标目录, DesktopRemote QueryDock, HTML CSS SVG图标, 透明背景, GPU动画属性

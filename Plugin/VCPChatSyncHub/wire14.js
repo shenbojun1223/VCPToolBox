@@ -1135,7 +1135,7 @@ async function pullMessages14(topic, appDataPath, { ownerDto = false } = {}) {
   };
 }
 
-async function pushMessages14(frame, appDataPath) {
+async function pushMessages14(frame, appDataPath, { ownerDto = true } = {}) {
   const physical = await readPhysicalTopic(
     appDataPath,
     frame.ownerType,
@@ -1209,7 +1209,8 @@ async function pushMessages14(frame, appDataPath) {
       ownerType: frame.ownerType,
       ownerId: frame.ownerId,
       ok: true,
-      neededAttachmentHashes: projected.neededAttachmentHashes,
+      // Mobile rejects unknown fields; retain the established desktop response.
+      ...(ownerDto ? {} : { neededAttachmentHashes: projected.neededAttachmentHashes }),
     };
   } finally {
     release();
@@ -1356,11 +1357,14 @@ function registerWire14Routes(router, { appDataPath }) {
   });
 
   router.post("/messages/push", async (req, res) => {
+    let contract;
     try {
+      // Validate representation before accepting any writes from this stream.
+      contract = resolveHttpOwnerContract(req);
       res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
       for await (const frame of validatedMessagePush(req)) {
         try {
-          res.write(`${JSON.stringify(await pushMessages14(frame, appDataPath))}\n`);
+          res.write(`${JSON.stringify(await pushMessages14(frame, appDataPath, contract))}\n`);
         } catch (error) {
           res.write(`${JSON.stringify({
             kind: "topic",
@@ -1380,7 +1384,7 @@ function registerWire14Routes(router, { appDataPath }) {
     } catch (error) {
       if (res.headersSent) {
         res.write(`${JSON.stringify({
-          kind: "error",
+          kind: contract.ownerDto ? "streamError" : "error",
           error: resultError(error, {
             code: error.code || "SYNC_MESSAGE_WRITE_FAILED",
             stage: "messages",
@@ -1388,7 +1392,8 @@ function registerWire14Routes(router, { appDataPath }) {
         })}\n`);
         return res.end();
       }
-      sendRouteError(res, error.code === "SYNC_REQUEST_INVALID" || error.code === "SYNC_PROTOCOL_INVALID" ? 400 : 500, error, {
+      const badRequest = ["SYNC_REQUEST_INVALID", "SYNC_PROTOCOL_INVALID", "PROTOCOL_INVALID"].includes(error.code);
+      sendRouteError(res, badRequest ? 400 : 500, error, {
         code: error.code || "SYNC_MESSAGE_WRITE_FAILED",
         stage: "messages",
       });

@@ -486,7 +486,11 @@ class StreamHandler {
       // 处理纯 Archery 且有错误的情况
       if (normalCalls.length === 0 && archeryErrorContents.length > 0) {
         const errorPayload = `<!-- VCP_TOOL_PAYLOAD -->\n${JSON.stringify(archeryErrorContents)}`;
-        currentMessagesForLoop.push({ role: 'user', content: errorPayload });
+        const { truncateToolPayload: truncateErrPayload } = require('../vcpLoop/toolPayloadTruncator.js');
+        currentMessagesForLoop.push({ role: 'user', content: truncateErrPayload(errorPayload, {
+          toolNames: archeryCalls.map(call => call.name),
+          exempt: archeryCalls.some(call => call.markHistory)
+        }) });
 
         if (!res.writableEnded && !res.destroyed) {
           try {
@@ -661,11 +665,31 @@ class StreamHandler {
         (k === 'url' || k === 'image_url') && typeof v === 'string' && v.startsWith('data:') ? "[Omitted]" : v
       );
 
+      // Request-local, round-local handoff; never append vectors to messages.
+      let gravityHandoff = null;
       if (RAGMemoRefresh) {
-        currentMessagesForLoop = await _refreshRagBlocksIfNeeded(currentMessagesForLoop, {
-          lastAiMessage: currentAIContentForLoop,
-          toolResultsText: toolResultsTextForRAG
-        }, pluginManager, DEBUG_MODE);
+        let gravityReceiver = null;
+        try {
+          if (process.env.VCP_GRAVITY_SHADOW === 'true' ||
+              process.env.VCP_GRAVITY_ENABLED === 'true') {
+            const { createGravityVectorReceiver } = require('../vcpLoop/gravityVectorReceiver.js');
+            const { findLastRealUserMessage } = require('../messageProcessor.js');
+            gravityReceiver = createGravityVectorReceiver({
+              userText: findLastRealUserMessage(currentMessagesForLoop).rawContent,
+              toolResultsText: toolResultsTextForRAG
+            });
+          }
+        } catch { /* Optional receiver initialization cannot stop refresh. */ }
+        try {
+          currentMessagesForLoop = await _refreshRagBlocksIfNeeded(currentMessagesForLoop, {
+            lastAiMessage: currentAIContentForLoop,
+            toolResultsText: toolResultsTextForRAG,
+            ...(gravityReceiver ? { onGravityVectors: gravityReceiver.accept } : {})
+          }, pluginManager, DEBUG_MODE);
+        } finally {
+          try { gravityHandoff = gravityReceiver ? gravityReceiver.finish() : null; }
+          catch { gravityHandoff = null; }
+        }
       }
 
       const hasImage = combinedToolResultsForAI.some(item => item.type === 'image_url');
@@ -679,7 +703,13 @@ class StreamHandler {
         ? translatedToolResultsForAI
         : `<!-- VCP_TOOL_PAYLOAD -->\n${toolResultsTextForRAG}`;
 
-      currentMessagesForLoop.push({ role: 'user', content: finalToolPayloadForAI });
+      // 超大回执循环内截断：完整原文异步落盘 DebugLog/toolPayloads，ink:mark_history 豁免
+      const { truncateToolPayload } = require('../vcpLoop/toolPayloadTruncator.js');
+      const payloadForLoop = truncateToolPayload(finalToolPayloadForAI, {
+        toolNames: normalCalls.map(call => call.name),
+        exempt: normalCalls.some(call => call.markHistory)
+      });
+      currentMessagesForLoop.push({ role: 'user', content: payloadForLoop });
 
       if (!res.writableEnded && !res.destroyed) {
         try {
@@ -691,6 +721,30 @@ class StreamHandler {
         } catch (e) { }
       }
 
+      // 🌟 GravityStub V2：组装期语义引力场可逆投影（纯内存切片，零磁盘污染）
+      // GRAVITY_SAFETY_BEGIN
+      let messagesForUpstream = currentMessagesForLoop;
+      try {
+        const { safeGravityProjection } = require('../vcpLoop/safeGravityProjection.js');
+        messagesForUpstream = await safeGravityProjection(currentMessagesForLoop, {
+          pluginManager, latestPayload: payloadForLoop, recursionDepth,
+          gravityHandoff,
+          gravityRawToolResults: toolResultsTextForRAG,
+          debugMode: DEBUG_MODE, signal: abortController?.signal
+        });
+      } catch {
+        // Even failure to load the safety module must not break tool continuation.
+        messagesForUpstream = currentMessagesForLoop;
+      }
+      // GRAVITY_SAFETY_END
+
+      // Tool execution and projection may yield while the user cancels.
+      // Do not invoke another upstream request after cancellation or disconnect.
+      if (abortController?.signal.aborted || res.writableEnded || res.destroyed) {
+        if (!res.writableEnded && !res.destroyed) res.end();
+        break;
+      }
+
       const nextAiAPIResponse = await fetchWithRetry(
         `${apiUrl}/v1/chat/completions`,
         {
@@ -700,7 +754,7 @@ class StreamHandler {
             Authorization: `Bearer ${apiKey}`,
             Accept: 'text/event-stream',
           },
-          body: JSON.stringify({ ...originalBody, messages: currentMessagesForLoop, stream: true }),
+          body: JSON.stringify({ ...originalBody, messages: messagesForUpstream, stream: true }),
           signal: abortController.signal,
         },
         { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates }

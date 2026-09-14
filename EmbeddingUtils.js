@@ -146,17 +146,58 @@ async function _sendBatch(batchTexts, config, batchNumber) {
                 console.warn(`[Embedding] Warning: Batch ${batchNumber} returned empty embeddings array`);
             }
 
-            const sortedData = data.data.sort((a, b) => a.index - b.index);
-            const successfullyVectorizedTexts = sortedData
-                .filter(item => item && item.embedding && Number.isInteger(item.index) && item.index >= 0 && item.index < batchTexts.length)
-                .map(item => batchTexts[item.index]);
-
+            // Preserve explicit response indices. Sorting then discarding indices
+            // shifts later vectors into missing text slots and mislabels provenance.
+            const alignedVectors = new Array(batchTexts.length).fill(null);
+            const seenIndices = new Set();
+            for (const item of data.data) {
+                if (!item || !Number.isInteger(item.index) ||
+                    item.index < 0 || item.index >= batchTexts.length) continue;
+                const index = item.index;
+                if (seenIndices.has(index)) {
+                    // Ambiguous duplicate: never choose first/last writer.
+                    alignedVectors[index] = null;
+                    continue;
+                }
+                seenIndices.add(index);
+                const vector = item.embedding;
+                if (!Array.isArray(vector) || vector.length === 0 ||
+                    !vector.every(value => typeof value === 'number' && Number.isFinite(value)))
+                    continue;
+                alignedVectors[index] = vector;
+            }
+            const successfullyVectorizedTexts = batchTexts.filter(
+                (_, index) => alignedVectors[index] !== null
+            );
             await _writeEmbeddingAuditLog(successfullyVectorizedTexts);
 
-            // 简单的 Log，证明并发正在跑
-            // console.log(`[Embedding] ✅ Batch ${batchNumber} completed (${batchTexts.length} items) via ${model}.`);
+            // Optional batch-local metadata; aligned exactly like the vectors.
+            // Model declarations alone do not certify embedding-space identity.
+            // Do not expose vector references to the observer.
+            try {
+                if (typeof config.onBatchResultMetadata === 'function') {
+                    const boundedModel = value => typeof value === 'string' &&
+                        value.trim().length > 0 && value.length <= 256
+                        ? value.trim() : null;
+                    const requestedModel = boundedModel(model);
+                    const responseModel = boundedModel(data.model);
+                    const records = alignedVectors.map(vector => vector === null ? null : {
+                        schema: 'embedding-result-metadata-v1',
+                        source: 'api-response',
+                        indexBinding: 'explicit-unique',
+                        requestedModel,
+                        responseModel,
+                        dimension: vector.length,
+                        spaceVerified: false
+                    });
+                    const pending = config.onBatchResultMetadata(records);
+                    if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+                }
+            } catch { /* Metadata failure must not cause retry or lose vectors. */ }
 
-            return sortedData.map(item => item.embedding);
+            // Keep the existing retry/model policy. Missing or ambiguous slots
+            // remain null; response validation does not generate extra requests.
+            return alignedVectors;
 
         } catch (e) {
             console.warn(`[Embedding] Batch ${batchNumber}, Model "${model}" failed (${attempt}/${modelCandidates.length}): ${e.message}`);
@@ -226,9 +267,20 @@ async function getEmbeddingsBatch(texts, config) {
 
             const batch = batches[batchIndex];
             try {
-                // 执行请求 (Batch ID 从 1 开始显示)
+                // Each worker owns its metadata buffer. Never share a mutable
+                // observer slot between concurrently completing batches.
+                let batchMetadata = null;
+                const wantsMetadata = typeof config.onResultMetadata === 'function';
+                const batchConfig = {
+                    ...config,
+                    onBatchResultMetadata: wantsMetadata ? records => {
+                        batchMetadata = records;
+                    } : undefined
+                };
+                const vectors = await _sendBatch(batch.texts, batchConfig, batchIndex + 1);
                 batchResults[batchIndex] = {
-                    vectors: await _sendBatch(batch.texts, config, batchIndex + 1),
+                    vectors,
+                    metadata: batchMetadata,
                     originalIndices: batch.originalIndices
                 };
             } catch (e) {
@@ -276,6 +328,36 @@ async function getEmbeddingsBatch(texts, config) {
     if (failCount > 0) {
         console.warn(`[Embedding] ⚠️ Results: ${successCount} succeeded, ${failCount} failed/skipped out of ${texts.length} total.`);
     }
+
+    // Optional call-local metadata has exactly the original input shape.
+    // Do not expose batch buffers or vector references to the caller.
+    try {
+        if (typeof config.onResultMetadata === 'function') {
+            const finalMetadata = new Array(texts.length).fill(null);
+            for (const batch of batchResults) {
+                if (!batch || !Array.isArray(batch.metadata)) continue;
+                batch.originalIndices.forEach((originalIndex, localIndex) => {
+                    const record = batch.metadata[localIndex];
+                    const vector = finalResults[originalIndex];
+                    if (!vector || !record ||
+                        record.schema !== 'embedding-result-metadata-v1' ||
+                        record.indexBinding !== 'explicit-unique' ||
+                        record.dimension !== vector.length) return;
+                    finalMetadata[originalIndex] = {
+                        schema: 'embedding-result-metadata-v1',
+                        source: 'api-response',
+                        indexBinding: 'explicit-unique',
+                        requestedModel: record.requestedModel,
+                        responseModel: record.responseModel,
+                        dimension: record.dimension,
+                        spaceVerified: false
+                    };
+                });
+            }
+            const pending = config.onResultMetadata(finalMetadata);
+            if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+        }
+    } catch { /* Observer failure cannot change vectors or trigger retry. */ }
 
     return finalResults; // 🛡️ 长度严格等于 texts.length，失败位置为 null
 }

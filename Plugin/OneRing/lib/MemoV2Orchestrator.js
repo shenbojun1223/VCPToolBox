@@ -43,7 +43,8 @@ const FORMAT_RETRY_CODES = new Set([
     'MEMO_V2_TOOL_ARGUMENTS_MISSING',
     'MEMO_V2_LIMIT_EXCEEDED',
     'MEMO_V2_INVALID_SOURCES',
-    'MEMO_V2_INVALID_SOURCE_ID'
+    'MEMO_V2_INVALID_SOURCE_ID',
+    'MEMO_V2_INVALID_STATUS'
 ]);
 
 function orchestrationError(code, message) {
@@ -206,8 +207,91 @@ function safeFailure(error, batchIndex = null, batchCount = 0, formatMeta = {}) 
     };
 }
 
+function safeMetric(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+function safeMetricArray(value) {
+    return Array.isArray(value) ? value.map(safeMetric) : [];
+}
+
+function safeCode(value) {
+    const code = String(value || 'MEMO_V2_SHADOW_FAILED').slice(0, 64);
+    return /^[A-Z0-9_]+$/u.test(code) ? code : 'MEMO_V2_SHADOW_FAILED';
+}
+
+function buildSafeFailureMetadata(options = {}) {
+    const stats = options.stats && typeof options.stats === 'object' ? options.stats : {};
+    const error = options.error && typeof options.error === 'object' ? options.error : {};
+    const failedBatchIndex = Number.isSafeInteger(Number(error.batchIndex)) && Number(error.batchIndex) >= 0
+        ? Number(error.batchIndex)
+        : null;
+    const plannedBatchCount = safeMetric(stats.plannedBatchCount);
+    const batchPromptChars = safeMetricArray(stats.batchPromptChars);
+    const batchPromptWireTokenCounts = safeMetricArray(stats.batchPromptWireTokenCounts);
+    const batchPromptNewThreadTokenCounts = safeMetricArray(stats.batchPromptNewThreadTokenCounts);
+    const batchPromptNoAssigneeTokenCounts = safeMetricArray(stats.batchPromptNoAssigneeTokenCounts);
+    return {
+        ok: false,
+        errorCode: safeCode(options.errorCode || error.code),
+        failedBatchIndex,
+        failedBatchNumber: failedBatchIndex == null ? null : failedBatchIndex + 1,
+        plannedBatchCount,
+        processedBatchCount: safeMetric(stats.processedBatchCount),
+        modelCallCount: safeMetric(stats.modelCallCount),
+        formatRetryCount: safeMetric(stats.formatRetryCount),
+        candidateWritten: false,
+        totalCanonicalEventCount: safeMetric(stats.totalCanonicalEventCount),
+        coveredCanonicalEventCount: safeMetric(stats.coveredCanonicalEventCount),
+        droppedCanonicalEventCount: safeMetric(stats.droppedCanonicalEventCount),
+        duplicateCoverageCount: safeMetric(stats.duplicateCoverageCount),
+        mixedDateBatchCount: safeMetric(stats.mixedDateBatchCount),
+        requestBudgetChars: safeMetric(stats.requestBudgetChars),
+        maxPromptChars: safeMetric(stats.maxPromptChars),
+        estimatedPromptChars: safeMetric(stats.estimatedPromptChars),
+        promptChars: batchPromptChars.reduce((sum, value) => sum + value, 0),
+        batchPromptChars,
+        promptWireTokenCount: safeMetric(stats.promptWireTokenCount),
+        promptNewThreadTokenCount: safeMetric(stats.promptNewThreadTokenCount),
+        promptNoAssigneeTokenCount: safeMetric(stats.promptNoAssigneeTokenCount),
+        batchPromptWireTokenCounts,
+        batchPromptNewThreadTokenCounts,
+        batchPromptNoAssigneeTokenCounts,
+        formatRetriesConfigured: safeMetric(stats.formatRetriesConfigured),
+        formatFailureCodes: Array.isArray(stats.formatFailureCodes)
+            ? stats.formatFailureCodes.map(safeCode)
+            : [],
+        batchFormatAttempts: safeMetricArray(stats.batchFormatAttempts),
+        batchToolCallAttempts: safeMetricArray(stats.batchToolCallAttempts),
+        attemptsTotal: safeMetric(stats.attemptsTotal),
+        genericInvalidRequestRetryCount: safeMetric(stats.genericInvalidRequestRetryCount),
+        toolCallRetryCount: safeMetric(stats.toolCallRetryCount),
+        totalPromptSanitizedEventCount: safeMetric(stats.promptSanitizedEventCount),
+        totalPromptRedactionPlaceholderCount: safeMetric(stats.promptRedactionPlaceholderCount),
+        totalPromptSanitizationRemovedChars: safeMetric(stats.promptSanitizationRemovedChars),
+        projectionRequiredSegmentFailures: safeMetric(stats.projectionRequiredSegmentFailures),
+        sourceMessageCount: safeMetric(stats.sourceMessageCount),
+        sourceIdsCount: safeMetric(stats.sourceIdsCount)
+    };
+}
+
 function emptyUsage() {
     return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+}
+
+function finiteCount(value) {
+    const count = Number(value);
+    return Number.isFinite(count) ? count : 0;
+}
+
+function normalizedBatchCounts(value, length) {
+    const source = Array.isArray(value) ? value : [];
+    return Array.from({ length }, (_, index) => finiteCount(source[index]));
+}
+
+function sumCounts(values) {
+    return values.reduce((sum, value) => sum + finiteCount(value), 0);
 }
 
 function createStats(
@@ -245,11 +329,17 @@ function createStats(
         promptSanitizedEventCount: 0,
         promptRedactionPlaceholderCount: 0,
         promptSanitizationRemovedChars: 0,
+        promptWireTokenCount: 0,
+        promptNewThreadTokenCount: 0,
+        promptNoAssigneeTokenCount: 0,
         batchProjectedEventCounts: [],
         batchProjectionRemovedChars: [],
         batchPromptSanitizedEventCounts: [],
         batchPromptRedactionPlaceholderCounts: [],
         batchPromptSanitizationRemovedChars: [],
+        batchPromptWireTokenCounts: [],
+        batchPromptNewThreadTokenCounts: [],
+        batchPromptNoAssigneeTokenCounts: [],
         attemptsTotal: 0,
         genericInvalidRequestRetryCount: 0,
         modelCallCount: 0,
@@ -407,6 +497,27 @@ function aggregatePromptStats(plan, events, executedStats = null) {
         && executedStats.batchPromptSanitizationRemovedChars.length === plan.batches.length
         ? executedStats.batchPromptSanitizationRemovedChars
         : plan.batchPromptSanitizationRemovedChars || [];
+    const batchPromptWireTokenCounts = normalizedBatchCounts(
+        Array.isArray(executedStats?.batchPromptWireTokenCounts)
+            && executedStats.batchPromptWireTokenCounts.length === plan.batches.length
+            ? executedStats.batchPromptWireTokenCounts
+            : plan.batchPromptWireTokenCounts,
+        plan.batches.length
+    );
+    const batchPromptNewThreadTokenCounts = normalizedBatchCounts(
+        Array.isArray(executedStats?.batchPromptNewThreadTokenCounts)
+            && executedStats.batchPromptNewThreadTokenCounts.length === plan.batches.length
+            ? executedStats.batchPromptNewThreadTokenCounts
+            : plan.batchPromptNewThreadTokenCounts,
+        plan.batches.length
+    );
+    const batchPromptNoAssigneeTokenCounts = normalizedBatchCounts(
+        Array.isArray(executedStats?.batchPromptNoAssigneeTokenCounts)
+            && executedStats.batchPromptNoAssigneeTokenCounts.length === plan.batches.length
+            ? executedStats.batchPromptNoAssigneeTokenCounts
+            : plan.batchPromptNoAssigneeTokenCounts,
+        plan.batches.length
+    );
     return {
         totalRequestChars: batchPromptChars.reduce((sum, chars) => sum + Number(chars || 0), 0),
         toolSchemaChars: batchToolSchemaChars.reduce((sum, chars) => sum + Number(chars || 0), 0),
@@ -438,7 +549,13 @@ function aggregatePromptStats(plan, events, executedStats = null) {
         promptSanitizationRemovedChars: batchPromptSanitizationRemovedChars.reduce((sum, count) => sum + Number(count || 0), 0),
         batchPromptSanitizedEventCounts: batchPromptSanitizedEventCounts.slice(),
         batchPromptRedactionPlaceholderCounts: batchPromptRedactionPlaceholderCounts.slice(),
-        batchPromptSanitizationRemovedChars: batchPromptSanitizationRemovedChars.slice()
+        batchPromptSanitizationRemovedChars: batchPromptSanitizationRemovedChars.slice(),
+        promptWireTokenCount: sumCounts(batchPromptWireTokenCounts),
+        promptNewThreadTokenCount: sumCounts(batchPromptNewThreadTokenCounts),
+        promptNoAssigneeTokenCount: sumCounts(batchPromptNoAssigneeTokenCounts),
+        batchPromptWireTokenCounts,
+        batchPromptNewThreadTokenCounts,
+        batchPromptNoAssigneeTokenCounts
     };
 }
 
@@ -514,6 +631,12 @@ async function generateShadowCandidate(options = {}) {
         stats.promptSanitizedEventCount = Number(plan.totalPromptSanitizedEventCount || 0);
         stats.promptRedactionPlaceholderCount = Number(plan.totalPromptRedactionPlaceholderCount || 0);
         stats.promptSanitizationRemovedChars = Number(plan.totalPromptSanitizationRemovedChars || 0);
+        stats.batchPromptWireTokenCounts = normalizedBatchCounts(plan.batchPromptWireTokenCounts, batchCount);
+        stats.batchPromptNewThreadTokenCounts = normalizedBatchCounts(plan.batchPromptNewThreadTokenCounts, batchCount);
+        stats.batchPromptNoAssigneeTokenCounts = normalizedBatchCounts(plan.batchPromptNoAssigneeTokenCounts, batchCount);
+        stats.promptWireTokenCount = sumCounts(stats.batchPromptWireTokenCounts);
+        stats.promptNewThreadTokenCount = sumCounts(stats.batchPromptNewThreadTokenCounts);
+        stats.promptNoAssigneeTokenCount = sumCounts(stats.batchPromptNoAssigneeTokenCounts);
         stats.estimatedPromptChars = plan.estimatedPromptChars;
         stats.maxPromptChars = plan.maxPromptChars;
 
@@ -540,7 +663,9 @@ async function generateShadowCandidate(options = {}) {
                     maxInputChars: options.maxInputChars,
                     eventTextCapChars,
                     formatAttempt,
-                    previousValidationCode
+                    previousValidationCode: previousValidationCode === 'MEMO_V2_INVALID_STATUS'
+                        ? null
+                        : previousValidationCode
                 });
                 assertBatchPromptCoverage(prompt, batch);
                 stats.batchPromptChars[index] = prompt.stats.totalRequestChars;
@@ -551,6 +676,12 @@ async function generateShadowCandidate(options = {}) {
                 stats.batchPromptSanitizedEventCounts[index] = prompt.stats.promptSanitizedEventCount;
                 stats.batchPromptRedactionPlaceholderCounts[index] = prompt.stats.promptRedactionPlaceholderCount;
                 stats.batchPromptSanitizationRemovedChars[index] = prompt.stats.promptSanitizationRemovedChars;
+                stats.batchPromptWireTokenCounts[index] = finiteCount(prompt.stats.promptWireTokenCount);
+                stats.batchPromptNewThreadTokenCounts[index] = finiteCount(prompt.stats.promptNewThreadTokenCount);
+                stats.batchPromptNoAssigneeTokenCounts[index] = finiteCount(prompt.stats.promptNoAssigneeTokenCount);
+                stats.promptWireTokenCount = sumCounts(stats.batchPromptWireTokenCounts);
+                stats.promptNewThreadTokenCount = sumCounts(stats.batchPromptNewThreadTokenCounts);
+                stats.promptNoAssigneeTokenCount = sumCounts(stats.batchPromptNoAssigneeTokenCounts);
                 stats.modelCallCount += 1;
                 stats.batchToolCallAttempts[index] += 1;
                 let response;
@@ -685,6 +816,7 @@ module.exports = {
     buildCandidateState,
     generateShadowCandidate,
     orchestrationError,
+    buildSafeFailureMetadata,
     normalizeFormatRetries,
     DEFAULT_FORMAT_RETRIES,
     DEFAULT_MAX_TOKENS

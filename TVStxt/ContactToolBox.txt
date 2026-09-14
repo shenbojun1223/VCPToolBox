@@ -9,7 +9,9 @@ prompt:「始」(必需) 您想对该女仆传达的内容，任务，信息，�
 temporary_contact:「始」true「末」 // 可选，发起一个临时聊天，不会产生持久化上下文。
 timely_contact:「始」(可选) 设置一个未来时间点发送此通讯，格式为 YYYY-MM-DD-HH:mm (例如 2025-07-05-14:00)。「末」,
 task_delegation:「始」(可选) 设为 true 时启用异步委托模式。委托任务将在后台异步运行，您会立即收到一个进度占位符以追踪进度。「末」, 
-query_delegation:「始」(可选) 传入一个正在执行的 delegationId，以查询该异步委托任务的实时进度与状态。「末」
+,
+river:「始」last:5「末」, // (推荐) 上下文透传：让接收方直接拥有最近N条上下文视野，无需在prompt里大段复述背景。
+vref:「始」2「末」 // (可选) 记忆透传：直接打包当前命中审计的Top-N条日记知识给接收方，避免目标Agent检索漏召。
 
 ## 2. 主人通讯器 (AgentMessage)
 tool_name:「始」AgentMessage「末」,

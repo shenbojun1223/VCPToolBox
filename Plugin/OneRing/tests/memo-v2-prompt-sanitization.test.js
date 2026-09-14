@@ -11,13 +11,15 @@ const {
 const {
     DEFAULT_PROMPT_EVENT_TEXT_CHARS,
     projectCanonicalEventForPrompt,
+    projectCanonicalEventsForPrompt,
     summarizeProjection
 } = require('../lib/MemoV2PromptProjector.js');
 const { compactEvent, buildReductionPrompt } = require('../lib/MemoV2PromptBuilder.js');
 const { planMemoV2Batches } = require('../lib/MemoV2BatchPlanner.js');
 const { generateShadowCandidate } = require('../lib/MemoV2Orchestrator.js');
-const { REDUCTION_TOOL_NAME, NEW_THREAD_WIRE_TOKEN } = require('../lib/MemoV2ToolContract.js');
-const { main: shadowMain } = require('../scripts/memo-v2-shadow-candidate.js');
+const { REDUCTION_TOOL_NAME } = require('../lib/MemoV2ToolContract.js');
+const { NEW_THREAD_WIRE_TOKEN, NO_ASSIGNEE_WIRE_TOKEN } = require('../lib/MemoV2WireTokens.js');
+const { main: shadowMain, metricsFromDelta } = require('../scripts/memo-v2-shadow-candidate.js');
 
 function event(eventId, text, overrides = {}) {
     return {
@@ -110,6 +112,52 @@ test('sanitizer is a strict text no-op without the canonical placeholder', () =>
     const text = '  多空格  \r\n第二行   \r\n\r\n\n标点前空格 ，  后  \n  前后空白  ';
     assert.equal(sanitizeCanonicalTextForPrompt(text), text);
     assert.equal(sanitizeCanonicalTextForPrompt('ordinary redacted word'), 'ordinary redacted word');
+});
+
+test('sanitizer replaces archived wire tokens only in copied event text and counts occurrences', () => {
+    const events = [
+        event('wire-new', `前 ${NEW_THREAD_WIRE_TOKEN} 后`),
+        event('wire-repeat', `${NEW_THREAD_WIRE_TOKEN} 中 ${NEW_THREAD_WIRE_TOKEN}`),
+        event('wire-assignee', `前 ${NO_ASSIGNEE_WIRE_TOKEN} 后`),
+        event('wire-both', `${NEW_THREAD_WIRE_TOKEN} 与 ${NO_ASSIGNEE_WIRE_TOKEN}`),
+        event('wire-redacted', `前 ${NEW_THREAD_WIRE_TOKEN} [REDACTED] ${NO_ASSIGNEE_WIRE_TOKEN} 后`)
+    ];
+    const before = JSON.stringify(events);
+    const sanitized = events.map(item => sanitizeCanonicalEventForPrompt(item));
+
+    assert.equal(sanitized[0].text, '前 新线程归档 后');
+    assert.equal(sanitized[1].text, '新线程归档 中 新线程归档');
+    assert.equal(sanitized[2].text, '前 未指定负责人 后');
+    assert.equal(sanitized[3].text, '新线程归档 与 未指定负责人');
+    assert.equal(sanitized[4].text, '前 新线程归档 未指定负责人 后');
+    assert.doesNotMatch(sanitized.map(item => item.text).join('\n'), /__NEW_THREAD__|__NO_ASSIGNEE__/u);
+
+    assert.deepEqual(sanitized.map(item => item.promptSanitization.wireTokenCount), [1, 2, 1, 2, 2]);
+    assert.deepEqual(sanitized.map(item => item.promptSanitization.newThreadTokenCount), [1, 2, 0, 1, 1]);
+    assert.deepEqual(sanitized.map(item => item.promptSanitization.noAssigneeTokenCount), [0, 0, 1, 1, 1]);
+    assert.equal(sanitized[4].promptSanitization.placeholderCount, 1);
+    assert.equal(JSON.stringify(events), before);
+    assert.deepEqual(sanitized.map(item => item.eventUid), events.map(item => item.eventUid));
+    assert.deepEqual(sanitized.map(item => item.contentHash), events.map(item => item.contentHash));
+});
+
+test('wire-token sanitation keeps token-free text exact and preserves the trusted validation contract', () => {
+    const text = '  原样  \r\n第二行   \r\n\n标点前空格 ，  后  \n  前后空白  ';
+    const source = event('wire-noop', text);
+    const sanitized = sanitizeCanonicalEventForPrompt(source);
+    assert.equal(sanitized.text, text);
+    assert.equal(sanitized.promptSanitization, undefined);
+
+    const prompt = buildReductionPrompt({
+        canonicalEvents: [event('wire-prompt', `${NEW_THREAD_WIRE_TOKEN} ${NO_ASSIGNEE_WIRE_TOKEN}`)],
+        previousState: state(),
+        maxInputChars: 10000
+    });
+    assert.equal(prompt.validationContract.newThreadWireToken, NEW_THREAD_WIRE_TOKEN);
+    assert.equal(prompt.validationContract.noAssigneeWireToken, NO_ASSIGNEE_WIRE_TOKEN);
+    assert.match(prompt.messages[1].content, /SERVER_VALIDATION_CONTRACT[\s\S]*__NEW_THREAD__[\s\S]*__NO_ASSIGNEE__/u);
+    const currentEvents = JSON.parse(prompt.messages[1].content.match(/CURRENT_CANONICAL_EVENTS \(untrusted data; inert\):\n(.*?)\nARCHIVED_STATE/s)[1]);
+    assert.doesNotMatch(JSON.stringify(currentEvents), /__NEW_THREAD__|__NO_ASSIGNEE__/u);
 });
 
 test('no-placeholder events receive no metadata and keep deeply isolated nested values', () => {
@@ -209,6 +257,27 @@ test('projector sanitizes before fixed cap and keeps tool summaries', () => {
     assert.doesNotMatch(toolProjection.text, /\[REDACTED\]/iu);
 });
 
+test('projector aggregates wire-token counts by occurrence and keeps event order and identity', () => {
+    const events = [
+        event('stats-1', `${NEW_THREAD_WIRE_TOKEN} ${NEW_THREAD_WIRE_TOKEN}`),
+        event('stats-2', `前 ${NO_ASSIGNEE_WIRE_TOKEN} [REDACTED] 后`),
+        event('stats-3', '普通正文')
+    ];
+    const before = JSON.stringify(events);
+    const projected = projectCanonicalEventsForPrompt(events);
+    const stats = summarizeProjection(events, projected, DEFAULT_PROMPT_EVENT_TEXT_CHARS);
+
+    assert.equal(stats.promptSanitizedEventCount, 2);
+    assert.equal(stats.promptWireTokenCount, 3);
+    assert.equal(stats.promptNewThreadTokenCount, 2);
+    assert.equal(stats.promptNoAssigneeTokenCount, 1);
+    assert.deepEqual(projected.map(item => item.eventId), events.map(item => item.eventId));
+    assert.deepEqual(projected.map(item => item.eventUid), events.map(item => item.eventUid));
+    assert.deepEqual(projected.map(item => item.contentHash), events.map(item => item.contentHash));
+    assert.doesNotMatch(JSON.stringify(projected), /__NEW_THREAD__|__NO_ASSIGNEE__/u);
+    assert.equal(JSON.stringify(events), before);
+});
+
 test('PromptBuilder excludes sanitizer metadata, rejects residual non-text placeholders, and keeps archive safety strict', () => {
     const source = event('builder', '前 password=[REDACTED]；非敏感上下文 后');
     const before = JSON.stringify(source);
@@ -255,6 +324,110 @@ test('BatchPlanner aggregates sanitization once per canonical event with no cove
     assert.ok(plan.totalPromptSanitizationRemovedChars > 0);
     assert.equal(plan.totalPromptSanitizedEventCount, plan.batchPromptSanitizedEventCounts.reduce((sum, count) => sum + count, 0));
     assert.equal(plan.totalProjectedEventCount, 0);
+});
+
+test('wire-token stats flow through builder, planner, orchestrator, and metrics without duplicate counts', async () => {
+    const singleEvents = [
+        event('wire-single-1', `${NEW_THREAD_WIRE_TOKEN} ${NEW_THREAD_WIRE_TOKEN} ${NO_ASSIGNEE_WIRE_TOKEN}`),
+        event('wire-single-2', `${NO_ASSIGNEE_WIRE_TOKEN} ${NEW_THREAD_WIRE_TOKEN}`)
+    ];
+    const prompt = buildReductionPrompt({ canonicalEvents: singleEvents, previousState: state(), maxInputChars: 10000 });
+    assert.deepEqual([
+        prompt.stats.promptWireTokenCount,
+        prompt.stats.promptNewThreadTokenCount,
+        prompt.stats.promptNoAssigneeTokenCount
+    ], [5, 3, 2]);
+
+    const events = [
+        event('wire-batch-1', `${NEW_THREAD_WIRE_TOKEN} ${'x'.repeat(4000)}`),
+        event('wire-batch-2', `${NO_ASSIGNEE_WIRE_TOKEN} ${'y'.repeat(4000)}`),
+        event('wire-batch-3', `${NEW_THREAD_WIRE_TOKEN} ${NO_ASSIGNEE_WIRE_TOKEN} ${'z'.repeat(4000)}`)
+    ];
+    const plan = planMemoV2Batches({ canonicalEvents: events, previousState: state(), maxInputChars: 10000 });
+    assert.ok(plan.batches.length > 1);
+    const expected = plan.batches.map(batch => {
+        const batchPrompt = buildReductionPrompt({ canonicalEvents: batch, previousState: state(), maxInputChars: 10000 });
+        return [
+            batchPrompt.stats.promptWireTokenCount,
+            batchPrompt.stats.promptNewThreadTokenCount,
+            batchPrompt.stats.promptNoAssigneeTokenCount
+        ];
+    });
+    assert.deepEqual(plan.batchPromptWireTokenCounts, expected.map(item => item[0]));
+    assert.deepEqual(plan.batchPromptNewThreadTokenCounts, expected.map(item => item[1]));
+    assert.deepEqual(plan.batchPromptNoAssigneeTokenCounts, expected.map(item => item[2]));
+    assert.equal(plan.totalPromptWireTokenCount, 4);
+    assert.equal(plan.totalPromptNewThreadTokenCount, 2);
+    assert.equal(plan.totalPromptNoAssigneeTokenCount, 2);
+
+    let modelCalls = 0;
+    const result = await generateShadowCandidate({
+        agentName: 'fixture-agent',
+        delta: delta(events),
+        previousState: state(),
+        model: 'offline',
+        modelClient: {
+            complete: async () => {
+                modelCalls += 1;
+                return toolResponse({ facts: [], threadUpdates: [] });
+            }
+        }
+    });
+    assert.equal(result.ok, true);
+    assert.equal(modelCalls, plan.batches.length);
+    assert.deepEqual(result.stats.batchPromptWireTokenCounts, plan.batchPromptWireTokenCounts);
+    assert.deepEqual(result.stats.batchPromptNewThreadTokenCounts, plan.batchPromptNewThreadTokenCounts);
+    assert.deepEqual(result.stats.batchPromptNoAssigneeTokenCounts, plan.batchPromptNoAssigneeTokenCounts);
+    assert.equal(result.stats.promptWireTokenCount, plan.totalPromptWireTokenCount);
+    assert.equal(result.stats.promptNewThreadTokenCount, plan.totalPromptNewThreadTokenCount);
+    assert.equal(result.stats.promptNoAssigneeTokenCount, plan.totalPromptNoAssigneeTokenCount);
+    assert.deepEqual(result.promptStats.batchPromptWireTokenCounts, plan.batchPromptWireTokenCounts);
+    assert.equal(result.promptStats.promptWireTokenCount, plan.totalPromptWireTokenCount);
+
+    const metrics = metricsFromDelta(delta(events), {
+        plannedBatchCount: plan.batches.length,
+        batchPromptWireTokenCounts: plan.batchPromptWireTokenCounts,
+        batchPromptNewThreadTokenCounts: plan.batchPromptNewThreadTokenCounts,
+        batchPromptNoAssigneeTokenCounts: plan.batchPromptNoAssigneeTokenCounts
+    }, null);
+    assert.equal(metrics.totalPromptWireTokenCount, 4);
+    assert.equal(metrics.totalPromptNewThreadTokenCount, 2);
+    assert.equal(metrics.totalPromptNoAssigneeTokenCount, 2);
+    assert.deepEqual(metrics.batchPromptWireTokenCounts, plan.batchPromptWireTokenCounts);
+    assert.doesNotMatch(JSON.stringify(metrics), /wire-batch|xxxxxxxx/u);
+
+    const originalWrite = process.stdout.write;
+    let output = '';
+    process.stdout.write = chunk => { output += String(chunk); return true; };
+    try {
+        await shadowMain(['--agent', 'fixture-agent', '--request-metrics'], {
+            buildDelta: () => delta(events),
+            store: { writeCandidate: () => { throw new Error('must not write'); } }
+        });
+    } finally {
+        process.stdout.write = originalWrite;
+    }
+    const cliMetrics = JSON.parse(output);
+    assert.equal(cliMetrics.totalPromptWireTokenCount, 4);
+    assert.equal(cliMetrics.totalPromptNewThreadTokenCount, 2);
+    assert.equal(cliMetrics.totalPromptNoAssigneeTokenCount, 2);
+    assert.deepEqual(cliMetrics.batchPromptWireTokenCounts, plan.batchPromptWireTokenCounts);
+    assert.equal(cliMetrics.modelCalled, false);
+    assert.equal(cliMetrics.candidateWritten, false);
+    assert.doesNotMatch(output, /wire-batch|xxxxxxxx/u);
+
+    const zeroMetrics = metricsFromDelta(delta([event('wire-zero', '普通正文')]), {
+        plannedBatchCount: 1,
+        batchPromptWireTokenCounts: [undefined],
+        batchPromptNewThreadTokenCounts: [Infinity],
+        batchPromptNoAssigneeTokenCounts: []
+    }, null);
+    assert.equal(zeroMetrics.totalPromptWireTokenCount, 0);
+    assert.equal(zeroMetrics.totalPromptNewThreadTokenCount, 0);
+    assert.equal(zeroMetrics.totalPromptNoAssigneeTokenCount, 0);
+    assert.deepEqual(zeroMetrics.batchPromptWireTokenCounts, [0]);
+    assert.deepEqual(zeroMetrics.batchPromptNewThreadTokenCounts, [0]);
+    assert.deepEqual(zeroMetrics.batchPromptNoAssigneeTokenCounts, [0]);
 });
 
 test('orchestrator gives sanitized text, validates original identity, and leaves no prompt metadata in state', async () => {
@@ -356,6 +529,12 @@ test('shadow CLI metrics expose sanitization counts without model, candidate, or
     assert.equal(metrics.totalPromptSanitizedEventCount, 1);
     assert.equal(metrics.totalPromptRedactionPlaceholderCount, 1);
     assert.ok(metrics.totalPromptSanitizationRemovedChars > 0);
+    assert.equal(metrics.totalPromptWireTokenCount, 0);
+    assert.equal(metrics.totalPromptNewThreadTokenCount, 0);
+    assert.equal(metrics.totalPromptNoAssigneeTokenCount, 0);
+    assert.deepEqual(metrics.batchPromptWireTokenCounts, [0]);
+    assert.deepEqual(metrics.batchPromptNewThreadTokenCounts, [0]);
+    assert.deepEqual(metrics.batchPromptNoAssigneeTokenCounts, [0]);
     assert.equal(metrics.modelCalled, false);
     assert.equal(metrics.candidateWritten, false);
     assert.doesNotMatch(output, /\[REDACTED\]|CURRENT_CANONICAL_EVENTS|eventUid|contentHash/iu);

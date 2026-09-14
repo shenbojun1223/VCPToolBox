@@ -356,3 +356,5 @@ body.light-theme .message-item.streaming.assistant .md-content {
 
 
 Tag: VCP, Vchat, CSS主题设计, 官方默认主题, 毛玻璃效果, 颜色系统, UI设计, 深色模式, 浅色模式, 前端开发, 变量定义, 视觉设计, 可读性优化, 流式输出动画, 背景壁纸系统
+
+Tag: VChat黑白简约主题, 主题CSS变量, 深色浅色主题, 聊天气泡配色, 磨砂面板背景, 流式闪烁配色

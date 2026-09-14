@@ -815,6 +815,28 @@ class PluginManager extends EventEmitter {
         return this.pluginLoadPromise;
     }
 
+    _collectHotReloadShutdownModules() {
+        // Express routes cannot be unmounted and re-registered safely during
+        // the generic manifest hot-reload. Resident service modules therefore
+        // keep their runtime resources until a full process restart. Shutting
+        // them down here would leave their already-mounted routes pointing at
+        // closed databases, sockets or timers.
+        const residentServiceModules = new Set();
+        for (const serviceData of this.serviceModules.values()) {
+            if (serviceData?.module) residentServiceModules.add(serviceData.module);
+        }
+
+        const modulesToShutdown = new Set();
+        for (const [name, manifest] of this.plugins.entries()) {
+            if (manifest.isDistributed) continue;
+            const preprocessor = this.messagePreprocessors.get(name);
+            if (preprocessor && !residentServiceModules.has(preprocessor)) {
+                modulesToShutdown.add(preprocessor);
+            }
+        }
+        return modulesToShutdown;
+    }
+
     async _loadPluginsOnce() {
         console.log('[PluginManager] Starting plugin discovery...');
 
@@ -823,24 +845,19 @@ class PluginManager extends EventEmitter {
         await this._validateLocalPluginManifestsBeforeReload();
 
         // 1. 清理现有插件状态
-        // 1.1 识别并关闭本地插件，保留分布式插件
+        // 1.1 识别并关闭可安全重建的本地预处理器，保留分布式插件。
+        // 常驻 service/hybridservice 已挂载 Express 路由，必须继续存活到
+        // 进程级重启；通用热重载无法原子卸载并重挂这些路由。
         const distributedPlugins = new Map();
-        const localModulesToShutdown = new Set();
+        const localModulesToShutdown = this._collectHotReloadShutdownModules();
 
         for (const [name, manifest] of this.plugins.entries()) {
             if (manifest.isDistributed) {
                 distributedPlugins.set(name, manifest);
-            } else {
-                // 收集本地插件模块以进行清理
-                const preprocessor = this.messagePreprocessors.get(name);
-                if (preprocessor) localModulesToShutdown.add(preprocessor);
-
-                const service = this.serviceModules.get(name)?.module;
-                if (service) localModulesToShutdown.add(service);
             }
         }
 
-        // 执行清理：在重新加载前关闭旧的本地插件实例，释放资源
+        // 执行清理：只关闭不承担常驻 service 的本地模块。
         for (const module of localModulesToShutdown) {
             if (typeof module.shutdown === 'function') {
                 try {
