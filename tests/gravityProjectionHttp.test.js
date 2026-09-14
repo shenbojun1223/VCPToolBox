@@ -5,6 +5,8 @@ const http = require('node:http');
 const fs = require('node:fs');
 const Module = require('node:module');
 const path = require('node:path');
+const vm = require('node:vm');
+const { createSoftContextBudget } = require('../modules/softContextBudget');
 const { safeGravityProjection } = require('../modules/vcpLoop/safeGravityProjection');
 
 const CALL = 'ISOLATED_FAKE_TOOL_REQUEST';
@@ -115,6 +117,13 @@ async function scenario(mode, abortDuringTool = false, streaming = true) {
       for await (const chunk of req) body += chunk;
       const parsed = JSON.parse(body);
       observed.upstream++;
+      if (mode === 'soft-budget') {
+        const notices = parsed.messages.filter(m =>
+          typeof m.content === 'string' && m.content.startsWith('[系统上下文预算预警]'));
+        assert.equal(notices.length, observed.upstream === 1 ? 1 : 0,
+          'advisory belongs only to the initial outbound body, not the tool loop');
+        observed.budgetNoticeCounts = [...(observed.budgetNoticeCounts || []), notices.length];
+      }
       if (observed.upstream > 1) {
         if (mode === 'real-shadow') {
           assert.deepEqual(parsed.messages, observed.shadowInput,
@@ -171,8 +180,44 @@ async function scenario(mode, abortDuringTool = false, streaming = true) {
             return request(url,options);
           }
         };
+        let firstBody = context.originalBody;
+        if (mode === 'soft-budget') {
+          // Actual production first-send assembly with a synthetic count and
+          // process-local identity. No production snapshots, plugins or model API.
+          const source = fs.readFileSync(
+            path.resolve(__dirname, '../modules/chatCompletionHandler.js'), 'utf8');
+          const start = source.indexOf('      const finalUpstreamBody =');
+          const end = source.indexOf("      await writeDebugLog('LogOutputAfterProcessing'", start);
+          assert(start >= 0 && end > start);
+          const sandbox = {
+            originalBody: context.originalBody, willStreamResponse: streaming,
+            finalContextStore: { setLastFinalContext(body, metadata) {
+              observed.snapshotCalls = (observed.snapshotCalls || 0) + 1;
+              observed.snapshotBody = structuredClone(body);
+              assert.equal(metadata.budgetNoticeExcluded, true);
+              return 100000;
+            } },
+            appendBudgetNotice: createSoftContextBudget(),
+            vcpchatExtensions: { schemaVersion: 1, requestContext: {
+              ownerType: 'agent', agentId: 'fixture-agent', topicId: 'fixture-budget-topic'
+            } },
+            req: { body: {} }, clientIp: '', forceShowVCP: false, console
+          };
+          const previous = process.env.VCP_CONTEXT_SOFT_BUDGET;
+          try {
+            process.env.VCP_CONTEXT_SOFT_BUDGET = '100000';
+            vm.runInNewContext(source.slice(start, end) +
+              '\nthis.outgoing = finalUpstreamBody;', sandbox);
+          } finally {
+            if (previous === undefined) delete process.env.VCP_CONTEXT_SOFT_BUDGET;
+            else process.env.VCP_CONTEXT_SOFT_BUDGET = previous;
+          }
+          firstBody = sandbox.outgoing;
+          assert.strictEqual(context.originalBody.messages, original);
+          assert.equal(JSON.stringify(context.originalBody.messages), originalSnapshot);
+        }
         const first = await request(upstreamUrl+'/v1/chat/completions',{
-          method:'POST',body:JSON.stringify(context.originalBody)
+          method:'POST',body:JSON.stringify(firstBody)
         });
         await new Handler(context).handle(req,res,first);
       } catch (err) {
@@ -257,4 +302,19 @@ test('nonstream abort during tool prevents subsequent fetch invocation',{timeout
   assert.equal(result.upstream,1);
   assert.equal(result.fetchAttempts,0);
   assert(!result.received.includes(ANSWER));
-});
+});for (const streaming of [true, false]) {
+  test('soft budget first-send + full HTTP tool loop: ' + (streaming ? 'stream' : 'nonstream'),
+    {timeout:8000}, async () => {
+      const result = await scenario('soft-budget', false, streaming);
+      assert.deepEqual(result.errors, []);
+      assert.deepEqual(result.budgetNoticeCounts, [1, 0]);
+      assert.equal(result.snapshotCalls, 1);
+      assert(!JSON.stringify(result.snapshotBody).includes('[系统上下文预算预警]'));
+      assert.equal(result.tools, 1, 'tool must not be replayed');
+      assert.equal(result.upstream, 2);
+      assert.equal(result.fetchAttempts, 1);
+      assert(result.received.includes(ANSWER), 'continuation must reach client');
+      if (streaming) assert.equal((result.received.match(/data: \[DONE\]/g) || []).length, 1);
+      else assert.equal(JSON.parse(result.received).choices[0].finish_reason, 'stop');
+    });
+}

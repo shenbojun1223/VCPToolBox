@@ -341,6 +341,7 @@ function setLastFinalContext(body, metadata = {}) {
     snapshots.pop();
   }
   persistSnapshotToDisk(snapshot);
+  return snapshot.summary.totalTokenCount;
 }
 
 function getLastFinalContext() {

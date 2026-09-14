@@ -8,6 +8,7 @@ const path = require('path');
 const http = require('http');
 const https = require('https');
 const finalContextStore = require('./finalContextStore.js');
+const { appendBudgetNotice } = require('./softContextBudget.js');
 
 // 多模态配置真相源（JSON 优先 + 热更新），用于在请求时动态拉取 MultiModalForceTranslateModels
 let multiModalConfigStore = null;
@@ -1158,13 +1159,25 @@ class ChatCompletionHandler {
       const willStreamResponse = isOriginalRequestStreaming;
       const finalUpstreamBody = { ...originalBody, stream: willStreamResponse };
 
-      finalContextStore.setLastFinalContext(finalUpstreamBody, {
-        requestId: req.body.requestId || null,
-        messageId: req.body.messageId || null,
-        clientIp,
-        forceShowVCP,
-        capturedStage: 'before_upstream_fetch'
-      });
+      let budgetTokenCount;
+      try {
+        budgetTokenCount = finalContextStore.setLastFinalContext(finalUpstreamBody, {
+          requestId: req.body.requestId || null,
+          messageId: req.body.messageId || null,
+          clientIp,
+          forceShowVCP,
+          capturedStage: 'before_upstream_fetch',
+          budgetNoticeExcluded: true
+        });
+      } catch {
+        console.warn('[FinalContextStore] Snapshot/count failed; continuing chat.');
+      }
+
+      // Outbound-only copy: originalBody remains the unmodified input to tool
+      // loops/RAG. Check growth again on the next external request, not each loop.
+      finalUpstreamBody.messages = appendBudgetNotice(
+        finalUpstreamBody.messages, vcpchatExtensions, budgetTokenCount
+      );
 
       await writeDebugLog('LogOutputAfterProcessing', finalUpstreamBody);
 
