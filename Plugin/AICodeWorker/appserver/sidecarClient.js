@@ -395,8 +395,31 @@ class SidecarClient {
     }
 
     async shutdown() {
-        const state = await this._requireExisting();
-        return this._callWithState(state, "shutdown", {});
+        const observed = this._readState();
+        if (observed?.status !== "degraded") {
+            const state = await this._requireExisting();
+            return this._callWithState(state, "shutdown", {});
+        }
+        // Degraded blocks new work, not authenticated shutdown of the same owned instance.
+        const verifyOwner = state => {
+            const proof = this._inspectStateProcess(state);
+            if (!proof.alive || !proof.confirmed || proof.mismatch || proof.unknown) {
+                throw new SidecarError("SIDECAR_STATE_PROCESS_UNVERIFIED", "Shutdown target process identity is unverified");
+            }
+        };
+        verifyOwner(observed);
+        await this._assertCompatibleConcurrency(observed);
+        const current = this._readState();
+        if (!this._sameStateIdentity(observed, current) ||
+            current?.endpoint !== observed.endpoint ||
+            !sameProcessIdentity(observed.processIdentity, current?.processIdentity) ||
+            !["ready", "degraded"].includes(current?.status)) {
+            throw new SidecarError("SIDECAR_INSTANCE_MISMATCH", "Shutdown target changed during verification");
+        }
+        verifyOwner(current);
+        // The existing IPC method still attaches the control token and validates the reply.
+        // Its accepted response is NOT a proof that processes have exited.
+        return this._callWithState(current, "shutdown", {});
     }
 
     _inspectionError(error, state = null) {

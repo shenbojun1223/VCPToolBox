@@ -203,6 +203,9 @@ class SidecarServer extends EventEmitter {
         this.codex = null;
         this.state = null;
         this.shutdownPromise = null;
+        this.stopPromise = null;
+        this.stopGate = null;
+        this.stopConfirmed = false;
         this.started = false;
         this.draining = false;
         this._loadSeenJobs();
@@ -224,6 +227,7 @@ class SidecarServer extends EventEmitter {
     }
 
     async start() {
+        if (this.draining) throw new SidecarError("SIDECAR_NOT_READY", "Sidecar is stopping");
         if (this.started) return this;
         const processIdentity = await getLocalProcessIdentityConfirmed({
             identityProvider: this.identityProvider || getProcessIdentitySafely,
@@ -277,6 +281,7 @@ class SidecarServer extends EventEmitter {
         this.codex.once("closed", info => this._handleCodexClosed(info));
         try {
             await this.codex.start();
+            this._assertCodexAvailable();
             this.state.codexVersion = this.codex.version;
             this.state.codexPid = this.codex.codexPid;
             this.state.codexProcessIdentity = this.codex.codexIdentity;
@@ -285,12 +290,7 @@ class SidecarServer extends EventEmitter {
         } catch (error) {
             this.state.status = "degraded";
             try { writeJsonAtomic(this.paths.statePath, this.state); } catch {}
-            await this.codex.stop({ suppressClosed: true });
-            await this._closeServer();
-            try { fs.unlinkSync(this.paths.statePath); } catch {}
-            if (process.platform !== "win32") {
-                try { removeEndpoint(this.paths.endpoint); } catch {}
-            }
+            await this.shutdown();
             throw error instanceof SidecarError
                 ? error
                 : new SidecarError("SIDECAR_START_FAILED", "Sidecar startup failed", { cause: error.code });
@@ -387,7 +387,12 @@ class SidecarServer extends EventEmitter {
         if (method === "submitWriteJob") return this._submitWriteJob(params);
         if (method === "cancel") return this._cancel(params);
         if (method === "shutdown") {
-            setImmediate(() => { this.shutdown().catch(error => this.emit("protocolError", error)); });
+            setImmediate(() => {
+                void Promise.resolve().then(() => this.shutdown()).catch(error => {
+                    const code = this._safeFaultCode(error, "SIDECAR_CLEANUP_FAILED");
+                    try { this.emit("protocolError", new SidecarError(code, "Sidecar shutdown did not converge")); } catch {}
+                });
+            });
             return { accepted: true };
         }
         throw new SidecarError("UNKNOWN_METHOD", `Unsupported Sidecar method: ${String(method || "")}`);
@@ -399,6 +404,7 @@ class SidecarServer extends EventEmitter {
             status: this.state?.status || "closed",
             pid: this.state?.pid || null,
             codexPid: this.state?.codexPid || null,
+            stopFault: this.state?.stopFault || null,
             activeJobs: [...this.activeJobs.values()].map(job => ({
                 jobId: job.jobId,
                 threadId: job.threadId,
@@ -419,6 +425,7 @@ class SidecarServer extends EventEmitter {
     }
 
     async _openWriteSession(params) {
+        this._assertCodexAvailable();
         if (!this._writeConfigured || !this._writeAdapter) {
             throw new SidecarError("AICW_WRITE_NOT_CONFIGURED", "Sidecar write sessions are not configured");
         }
@@ -515,6 +522,8 @@ class SidecarServer extends EventEmitter {
         };
         job.terminalPromise = new Promise(resolve => { job.resolveTerminal = resolve; });
         job.turnBoundPromise = new Promise(resolve => { job.resolveTurnBound = resolve; });
+        job.setupDone = new Promise(resolve => { job.resolveSetup = resolve; });
+        this._assertCodexAvailable();
         this.activeJobs.set(jobId, job);
         job.timeoutTimer = setTimeout(() => this._handleTimeout(job), timeoutSec * 1000);
         job.timeoutTimer.unref?.();
@@ -551,7 +560,8 @@ class SidecarServer extends EventEmitter {
                 metaValue.jobPhase = "running";
             });
 
-            const threadOutcome = await this._awaitStartOrTerminal(job, this.codex.startThread({
+            job.resolveSetup();
+            const threadOutcome = await this._awaitStartOrTerminal(job, this._codexRequest("startThread", {
                 projectPath: opened.handle.worktreePath,
                 model: params.model,
                 serviceTier,
@@ -564,7 +574,7 @@ class SidecarServer extends EventEmitter {
                 metaValue.threadId = job.threadId;
                 metaValue.jobPhase = "running";
             });
-            const turnOutcome = await this._awaitStartOrTerminal(job, this.codex.startTurn({
+            const turnOutcome = await this._awaitStartOrTerminal(job, this._codexRequest("startTurn", {
                 threadId: job.threadId,
                 text: params.text,
                 effort: params.effort,
@@ -591,6 +601,8 @@ class SidecarServer extends EventEmitter {
             }
             return { accepted: true, jobId, threadId: job.threadId, turnId: job.turnId };
         } catch (error) {
+            job.resolveSetup();
+            if (this.stopGate) throw new SidecarError(this.stopReason, "Sidecar is stopping");
             if (error?.code === "TURN_ID_CONFLICT") throw error;
             if (job.finalizationError) throw job.finalizationError;
             if (job.turnId || job.terminal || job.finalizing) {
@@ -662,14 +674,17 @@ class SidecarServer extends EventEmitter {
         };
         job.terminalPromise = new Promise(resolve => { job.resolveTerminal = resolve; });
         job.turnBoundPromise = new Promise(resolve => { job.resolveTurnBound = resolve; });
+        job.setupDone = new Promise(resolve => { job.resolveSetup = resolve; });
+        this._assertCodexAvailable();
         this.activeJobs.set(jobId, job);
         job.timeoutTimer = setTimeout(() => this._handleTimeout(job), timeoutSec * 1000);
         job.timeoutTimer.unref?.();
         this.seenJobs.add(jobId);
         try {
+            job.resolveSetup();
             const threadOutcome = await this._awaitStartOrTerminal(
                 job,
-                this.codex.startThread({
+                this._codexRequest("startThread", {
                     projectPath,
                     model: params.model,
                     serviceTier
@@ -692,7 +707,7 @@ class SidecarServer extends EventEmitter {
             });
             const turnOutcome = await this._awaitStartOrTerminal(
                 job,
-                this.codex.startTurn({
+                this._codexRequest("startTurn", {
                     threadId: job.threadId,
                     text: params.text,
                     effort: params.effort,
@@ -717,6 +732,8 @@ class SidecarServer extends EventEmitter {
             if (job.terminal) return { accepted: true, jobId, threadId: job.threadId, turnId: job.turnId, terminalState: job.state };
             return { accepted: true, jobId, threadId: job.threadId, turnId: job.turnId };
         } catch (error) {
+            job.resolveSetup();
+            if (this.stopGate) throw new SidecarError(this.stopReason, "Sidecar is stopping");
             if (error?.code === "TURN_ID_CONFLICT") throw error;
             if (error?.code === "META_FINALIZE_FAILED" || job.finalizationError) throw job.finalizationError || error;
             if (job.turnId || job.terminal) {
@@ -822,6 +839,8 @@ class SidecarServer extends EventEmitter {
         };
         job.terminalPromise = new Promise(resolve => { job.resolveTerminal = resolve; });
         job.turnBoundPromise = new Promise(resolve => { job.resolveTurnBound = resolve; });
+        job.setupDone = new Promise(resolve => { job.resolveSetup = resolve; });
+        this._assertCodexAvailable();
         this.activeJobs.set(jobId, job);
         job.timeoutTimer = setTimeout(() => this._handleTimeout(job), timeoutSec * 1000);
         job.timeoutTimer.unref?.();
@@ -850,6 +869,7 @@ class SidecarServer extends EventEmitter {
             }
 
             try {
+                this._assertCodexAvailable();
                 job.baseline = await captureGitBaseline(job.projectPath, { gitOptions });
             } catch (error) {
                 if (error?.details?.baseline) {
@@ -865,15 +885,17 @@ class SidecarServer extends EventEmitter {
                 Object.assign(metaValue, this._patchBaselineMeta(job.baseline));
                 metaValue.jobPhase = "running";
             });
+            this._assertCodexAvailable();
             job.baselineMonitor = startGitBaselineMonitor(job.projectPath, job.baseline, {
                 gitOptions,
                 intervalMs: this.patchMonitorIntervalMs
             });
             await job.baselineMonitor.assertStable();
 
+            job.resolveSetup();
             const threadOutcome = await this._awaitStartOrTerminal(
                 job,
-                this.codex.startThread({
+                this._codexRequest("startThread", {
                     projectPath: job.projectPath,
                     model,
                     serviceTier
@@ -886,7 +908,7 @@ class SidecarServer extends EventEmitter {
                 metaValue.threadId = job.threadId;
                 metaValue.jobPhase = "running";
             });
-            const turnOutcome = await this._awaitStartOrTerminal(job, this.codex.startTurn({
+            const turnOutcome = await this._awaitStartOrTerminal(job, this._codexRequest("startTurn", {
                 threadId: job.threadId,
                 text: params.text,
                 effort,
@@ -913,6 +935,8 @@ class SidecarServer extends EventEmitter {
             }
             return { accepted: true, jobId, threadId: job.threadId, turnId: job.turnId };
         } catch (error) {
+            job.resolveSetup();
+            if (this.stopGate) throw new SidecarError(this.stopReason, "Sidecar is stopping");
             if (error?.code === "TURN_ID_CONFLICT") throw error;
             if (job.finalizationError) throw job.finalizationError;
             if (job.turnId || job.terminal || job.finalizing) {
@@ -951,6 +975,7 @@ class SidecarServer extends EventEmitter {
     }
 
     async _cancel(params) {
+        this._assertCodexAvailable();
         const jobId = assertJobId(params.jobId);
         const job = this.activeJobs.get(jobId);
         if (!job) {
@@ -1005,6 +1030,7 @@ class SidecarServer extends EventEmitter {
     }
 
     _handleServerRequest(request) {
+        if (this.stopGate) return;
         const params = request?.params || {};
         const threadId = params.threadId || params.thread?.id;
         const turnId = params.turnId || params.turn?.id;
@@ -1028,6 +1054,7 @@ class SidecarServer extends EventEmitter {
     }
 
     _handleNotification(message) {
+        if (this.stopGate) return;
         const method = message?.method;
         const params = message?.params || {};
         if (!method) return;
@@ -1038,7 +1065,7 @@ class SidecarServer extends EventEmitter {
             return;
         }
         this._enqueueJobEvent(job, async () => {
-            if (job.terminal) return;
+            if (this.stopGate || job.terminal) return;
             if (method === "turn/started") {
                 job.state = "running";
                 this._recordJobEvent(job, method, params);
@@ -1171,6 +1198,7 @@ class SidecarServer extends EventEmitter {
     }
 
     _handleTimeout(job) {
+        if (this.stopGate) return;
         if (!job || job.terminal || job.timeoutRequested) return;
         if (job.kind === "patch" || job.kind === "write") {
             if (job.finalizing || job.terminalClaim) return;
@@ -1191,6 +1219,7 @@ class SidecarServer extends EventEmitter {
             ),
             job.terminalPromise.then(terminal => ({ terminal }))
         ]);
+        this._assertCodexAvailable();
         if (outcome.error) throw outcome.error;
         return outcome;
     }
@@ -1217,12 +1246,13 @@ class SidecarServer extends EventEmitter {
     _enqueueJobEvent(job, handler) {
         job.eventChain = job.eventChain.then(handler).catch(error => {
             if (error?.code === "META_FINALIZE_FAILED") job.finalizationError = error;
-            this._recordProtocolEvent("protocol/event-error", { jobId: job.jobId, code: error.code || "EVENT_HANDLER_FAILED" });
+            try { this._recordProtocolEvent("protocol/event-error", { jobId: job.jobId, code: "EVENT_HANDLER_FAILED" }); } catch {}
         });
         return job.eventChain;
     }
 
     _requestInterruptOnce(job) {
+        if (this.stopGate) return Promise.resolve();
         if (job.interruptPromise) return job.interruptPromise;
         if (!job.threadId || !job.turnId || job.terminal || job.finalizing) return Promise.resolve();
         job.interruptRequested = true;
@@ -1231,6 +1261,7 @@ class SidecarServer extends EventEmitter {
     }
 
     async _finalizeWrite(job) {
+        if (this.stopGate) await this.stopGate;
         try {
             await job.session.verify();
             const validationStartedAt = new Date().toISOString();
@@ -1259,6 +1290,7 @@ class SidecarServer extends EventEmitter {
                 meta.validationSteps = validationSteps;
                 meta.candidateAvailable = false;
             });
+            if (this.stopGate) await this.stopGate;
             job.candidateResult = await job.session.commitCandidate();
             await this._updateWriteMeta(job, meta => {
                 meta.state = "completed";
@@ -1275,12 +1307,7 @@ class SidecarServer extends EventEmitter {
                 delete meta.errorCode;
                 delete meta.exitReason;
             });
-            job.terminal = true;
-            job.finalizing = false;
-            job.state = "completed";
-            this._clearJobTimers(job);
-            this.activeJobs.delete(job.jobId);
-            job.resolveTerminal({ state: "completed", exitCode: 0 });
+            await this._releaseJob(job, { state: "completed", exitCode: 0 });
         } catch (error) {
             if (error?.code === "AICW_WRITE_FINALIZATION_UNCERTAIN" ||
                 UNCERTAIN_WRITE_CANDIDATE_CODES.has(error?.code) || job.candidateResult) {
@@ -1305,17 +1332,13 @@ class SidecarServer extends EventEmitter {
                 this._markWriteFinalizationIncomplete(job, metaError);
                 return job.terminalPromise;
             }
-            job.terminal = true;
-            job.finalizing = false;
-            job.state = "failed";
-            this._clearJobTimers(job);
-            this.activeJobs.delete(job.jobId);
-            job.resolveTerminal({ state: "failed", exitCode: 1, reason: code });
+            await this._releaseJob(job, { state: "failed", exitCode: 1, reason: code });
         }
         return job.terminalPromise;
     }
 
     async _finalizePatch(job) {
+        if (this.stopGate) await this.stopGate;
         let artifact = null;
         try {
             const validationStartedAt = new Date().toISOString();
@@ -1374,6 +1397,7 @@ class SidecarServer extends EventEmitter {
                 meta.patchArtifactDirectoryIdentity = job.patchArtifactDirectoryIdentity;
             }, "AICW_PATCH_META_FINALIZE_FAILED");
             await job.baselineMonitor.assertStable();
+            if (this.stopGate) await this.stopGate;
             try {
                 const published = publishCandidateNoOverwrite({
                     jobRoot: this.jobRoot,
@@ -1444,16 +1468,17 @@ class SidecarServer extends EventEmitter {
         if (!(await this._closePatchResources(job))) {
             throw new SidecarError("AICW_PATCH_ARTIFACT_CLEANUP_FAILED", "Patch candidate cleanup could not be confirmed");
         }
-        job.terminal = true;
-        job.finalizing = false;
-        job.state = "completed";
-        this._clearJobTimers(job);
-        this.activeJobs.delete(job.jobId);
-        job.resolveTerminal({ state: "completed", exitCode: 0 });
+        await this._releaseJob(job, { state: "completed", exitCode: 0 });
         return job.terminalPromise;
     }
 
     async _settleFailedPatchLease(job, error, artifact) {
+        if (this.stopGate) {
+            await this.stopGate;
+            if (!(await this._closePatchValidationResources(job, { verifyBaseline: false }))) {
+                throw new SidecarError("AICW_PATCH_ARTIFACT_CLEANUP_FAILED", "Patch validation resources remain owned");
+            }
+        }
         let cleanupConfirmed = true;
         if (job.publicPublished) {
             cleanupConfirmed = removePatchArtifactExact(job.paths.patchPath, job.patchArtifactDirectoryIdentity, {
@@ -1490,12 +1515,7 @@ class SidecarServer extends EventEmitter {
             this._markPatchFinalizationIncomplete(job, metaError);
             throw metaError;
         }
-        job.terminal = true;
-        job.finalizing = false;
-        job.state = "failed";
-        this._clearJobTimers(job);
-        this.activeJobs.delete(job.jobId);
-        job.resolveTerminal({ state: "failed", exitCode: 1, reason: error.code });
+        await this._releaseJob(job, { state: "failed", exitCode: 1, reason: error.code });
         return job.terminalPromise;
     }
 
@@ -1522,6 +1542,7 @@ class SidecarServer extends EventEmitter {
     }
 
     async _closePatchValidationResources(job, options = {}) {
+        if (this.stopGate) await this.stopGate;
         let complete = true;
         let closeError = null;
         if (job.baselineMonitor) {
@@ -1529,10 +1550,15 @@ class SidecarServer extends EventEmitter {
                 if ((await job.baselineMonitor.close({
                     verifyBaseline: options.verifyBaseline !== false
                 })) === false) complete = false;
+                else job.baselineMonitor = null;
             } catch (error) {
                 closeError = error;
             }
-            job.baselineMonitor = null;
+        }
+        // The Codex tree proof does not cover Sidecar-owned validation children.
+        if (this.stopGate && job.gitChildren?.size) {
+            if (closeError) throw closeError;
+            return false;
         }
         for (const child of job.gitChildren || []) {
             try {
@@ -1546,6 +1572,10 @@ class SidecarServer extends EventEmitter {
 
     async _closePatchResources(job, options = {}) {
         let complete = await this._closePatchValidationResources(job, options);
+        if (this.stopGate) {
+            await this.stopGate;
+            if (!complete) return false;
+        }
         if (job.candidatePath) {
             const removed = removePatchArtifactExact(job.candidatePath, job.patchArtifactDirectoryIdentity, {
                 jobRoot: this.jobRoot,
@@ -1577,7 +1607,7 @@ class SidecarServer extends EventEmitter {
                 params: safeParams
             })}\n`, "utf8");
         } catch (error) {
-            this._handleProtocolError(new SidecarError("OUTPUT_WRITE_FAILED", "Could not append job event", { cause: error.code }));
+            try { this.emit("protocolError", new SidecarError("OUTPUT_WRITE_FAILED", "Could not append job event")); } catch {}
             this._finishJob(job, "failed", 1, "SIDECAR_OUTPUT_WRITE_FAILED").catch(() => {});
         }
     }
@@ -1590,33 +1620,132 @@ class SidecarServer extends EventEmitter {
         this.emit("protocolEvent", { method, details });
     }
 
-    _handleProtocolError(error) {
-        this.emit("protocolError", error);
-        if (this.draining) return;
-        this.state && (this.state.status = "degraded");
-        try { if (this.state) writeJsonAtomic(this.paths.statePath, this.state); } catch {}
+    _assertCodexAvailable() {
+        if (this.draining || this.stopGate) throw new SidecarError("SIDECAR_NOT_READY", "Sidecar is stopping");
+    }
+
+    _codexRequest(method, params) {
+        this._assertCodexAvailable();
+        return this.codex[method](params);
+    }
+
+    _safeFaultCode(error, fallback = "CODEX_PROTOCOL_ERROR") {
+        const allowed = new Set(["CODEX_STOP_FAILED", "CODEX_STOP_UNCONFIRMED",
+            "PROTOCOL_BUFFER_OVERFLOW", "INVALID_JSON", "INVALID_MESSAGE", "UNKNOWN_RESPONSE_ID", "WRITE_FAILED",
+            "CODEX_APP_SERVER_EXITED", "CODEX_PROTOCOL_ERROR", "SIDECAR_START_FAILED",
+            "SIDECAR_SHUTDOWN", "SIDECAR_RESOURCES_UNCONFIRMED", "SIDECAR_CLEANUP_FAILED"]);
+        try { return allowed.has(error?.code) ? error.code : fallback; } catch { return fallback; }
+    }
+
+    _recordStopFault(phase, code) {
+        const safeId = value => typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : null;
+        const fault = { code, causeCode: this.stopCause, phase, at: new Date().toISOString(),
+            instanceId: safeId(this.state?.instanceId) };
+        if (this.state) {
+            this.state.status = "degraded";
+            this.state.stopFault = fault;
+            try { writeJsonAtomic(this.paths.statePath, this.state); } catch {}
+        }
         for (const job of this.activeJobs.values()) {
-            if ((job.kind === "patch" || job.kind === "write") && job.finalizing) continue;
-            this._finishJob(job, "failed", 1, "CODEX_PROTOCOL_ERROR").catch(() => {});
+            job.stopFault = { ...fault, jobId: safeId(job.jobId) };
+            try {
+                Promise.resolve(updateJobMetaLocked(this.jobRoot, job.jobId, job.paths.metaPath, meta => {
+                    if (this.state?.stopFault === fault && meta.jobId === job.jobId &&
+                        meta.sidecarInstanceId === this.state?.instanceId) meta.stopFault = { ...fault, jobId: safeId(job.jobId) };
+                    return meta;
+                })).catch(() => {});
+            } catch {}
         }
     }
 
-    _handleCodexClosed(info) {
-        if (this.draining || info?.intentional) return;
-        if (this.state) {
-            this.state.status = "degraded";
-            try { writeJsonAtomic(this.paths.statePath, this.state); } catch {}
+    _stopInstance(reason, error) {
+        if (this.stopPromise) return this.stopPromise;
+        this.draining = true;
+        if (!this.stopGate) {
+            this.stopReason = reason;
+            this.stopCause = this._safeFaultCode(error, reason);
+            this.stopGate = new Promise(resolve => { this.resolveStopGate = resolve; });
         }
-        for (const job of [...this.activeJobs.values()]) {
-            if ((job.kind === "patch" || job.kind === "write") && job.finalizing) continue;
-            this._finishJob(job, "failed", 1, "CODEX_APP_SERVER_EXITED").catch(() => {});
+        if (this.state) this.state.status = "degraded";
+        this.stopFailed = false;
+        this.stopPromise = Promise.resolve().then(async () => {
+            if (!this.stopConfirmed) {
+                if (!this.codex && (this.activeJobs.size || this.state?.codexPid || this.state?.codexProcessIdentity)) {
+                    throw new SidecarError("CODEX_STOP_UNCONFIRMED", "Codex execution ownership remains without a process handle");
+                }
+                const stopping = this.codex ? this.codex.stop({ suppressClosed: true }) : Promise.resolve({ confirmed: true });
+                this._recordStopFault("stopping", this.stopCause);
+                const result = await stopping;
+                if (result?.confirmed !== true) throw new SidecarError("CODEX_STOP_UNCONFIRMED", "Codex stop is unconfirmed");
+                this.stopConfirmed = true;
+                this.resolveStopGate();
+            }
+            this._recordStopFault("stopped", this.stopCause);
+            const pending = [...this.activeJobs.values()].map(job =>
+                job.finalizationFailed || job.terminal ? Promise.resolve() :
+                    job.finalizing ? job.eventChain : this._finishJob(job, "failed", 1, this.stopReason, this.stopReason));
+            let timer;
+            try {
+                await Promise.race([Promise.allSettled(pending),
+                    new Promise(resolve => { timer = setTimeout(resolve, this.drainTimeoutMs); })]);
+            } finally { clearTimeout(timer); }
+            if (this.activeJobs.size) throw new SidecarError("SIDECAR_RESOURCES_UNCONFIRMED", "Job resources remain owned");
+            return { confirmed: true };
+        }).catch(error => {
+            this.stopFailed = true;
+            const code = this._safeFaultCode(error, this.stopConfirmed ? "SIDECAR_RESOURCES_UNCONFIRMED" : "CODEX_STOP_FAILED");
+            this._recordStopFault(this.stopConfirmed ? "resources-unconfirmed" : "stop-unconfirmed", code);
+            const safe = new SidecarError(code, "Sidecar stop did not converge");
+            try { this.emit("protocolError", safe); } catch {}
+            throw safe;
+        });
+        this.stopPromise.catch(() => {});
+        return this.stopPromise;
+    }
+
+    _handleProtocolError(error) {
+        return this._stopInstance("CODEX_PROTOCOL_ERROR", error);
+    }
+
+    _handleCodexClosed() {
+        return this._stopInstance("CODEX_APP_SERVER_EXITED", { code: "CODEX_APP_SERVER_EXITED" });
+    }
+
+    async _guardJobMeta(job, updater, options = {}) {
+        const blocked = Symbol("stop barrier");
+        const write = options.hooks?.writeJsonAtomic || writeJsonAtomic;
+        for (;;) {
+            if (this.stopGate) await this.stopGate;
+            try {
+                return await updateJobMetaLocked(this.jobRoot, job.jobId, job.paths.metaPath, updater, {
+                    ...options, hooks: { ...options.hooks, writeJsonAtomic: (file, value) => {
+                        if (this.stopGate && !this.stopConfirmed) throw blocked;
+                        if (this.stopGate && job.kind === "write" && job.finalizing && value.state === "failed") {
+                            throw new SidecarError("AICW_WRITE_FINALIZATION_UNCERTAIN", "Write validation resources are unconfirmed");
+                        }
+                        return write(file, value);
+                    } }
+                });
+            } catch (error) { if (error !== blocked) throw error; }
         }
-        this.emit("protocolEvent", { method: "codex/closed", details: { unexpected: true } });
+    }
+
+    async _releaseJob(job, result) {
+        if (job.setupDone) await job.setupDone;
+        if (this.stopGate) await this.stopGate;
+        if (this.activeJobs.get(job.jobId) !== job) return job.terminalPromise;
+        job.terminal = true;
+        job.finalizing = false;
+        job.state = result.state;
+        this._clearJobTimers(job);
+        this.activeJobs.delete(job.jobId);
+        job.resolveTerminal(result);
+        return job.terminalPromise;
     }
 
     async _updateMeta(job, updater) {
         try {
-            await updateJobMetaLocked(this.jobRoot, job.jobId, job.paths.metaPath, meta => {
+            await this._guardJobMeta(job, meta => {
                 if (String(meta.jobId || "") !== job.jobId) throw new SidecarError("META_JOB_MISMATCH", "Job meta changed identity");
                 if (meta.executionBackend && meta.executionBackend !== "codex-app-server") {
                     throw new SidecarError("META_BACKEND_MISMATCH", "Job meta backend changed identity");
@@ -1628,14 +1757,17 @@ class SidecarServer extends EventEmitter {
                 return meta;
             });
         } catch (error) {
-            this._handleProtocolError(error instanceof SidecarError ? error : new SidecarError("META_WRITE_FAILED", "Could not update job meta", { cause: error.code }));
+            if (this.state) {
+                this.state.status = "degraded";
+                try { writeJsonAtomic(this.paths.statePath, this.state); } catch {}
+            }
             throw error instanceof SidecarError ? error : new SidecarError("META_WRITE_FAILED", "Could not update job meta");
         }
     }
 
     async _updateWriteMeta(job, updater) {
         try {
-            await updateJobMetaLocked(this.jobRoot, job.jobId, job.paths.metaPath, meta => {
+            await this._guardJobMeta(job, meta => {
                 if (String(meta.jobId || "") !== job.jobId) throw new SidecarError("META_JOB_MISMATCH", "Job meta changed identity");
                 if (meta.executionBackend && meta.executionBackend !== "codex-app-server") {
                     throw new SidecarError("META_BACKEND_MISMATCH", "Job meta backend changed identity");
@@ -1680,7 +1812,7 @@ class SidecarServer extends EventEmitter {
 
     async _updatePatchMeta(job, updater, failureCode = "META_WRITE_FAILED") {
         try {
-            await updateJobMetaLocked(this.jobRoot, job.jobId, job.paths.metaPath, meta => {
+            await this._guardJobMeta(job, meta => {
                 if (String(meta.jobId || "") !== job.jobId) throw new SidecarError("META_JOB_MISMATCH", "Job meta changed identity");
                 if (meta.executionBackend && meta.executionBackend !== "codex-app-server") {
                     throw new SidecarError("META_BACKEND_MISMATCH", "Job meta backend changed identity");
@@ -1704,12 +1836,24 @@ class SidecarServer extends EventEmitter {
         }
     }
 
-    async _finishJob(job, state, exitCode, reason, errorCode) {
+    _finishJob(job, state, exitCode, reason, errorCode) {
+        if (!job) return Promise.resolve();
+        if (job.finishPromise) return job.finishPromise;
+        job.finishPromise = this._finishJobImpl(job, state, exitCode, reason, errorCode);
+        job.finishPromise.catch(() => {});
+        return job.finishPromise;
+    }
+
+    async _finishJobImpl(job, state, exitCode, reason, errorCode) {
         if (!job || job.terminal) return job?.terminalPromise;
         if ((job.kind === "patch" || job.kind === "write") && job.finalizing) return job.terminalPromise;
-        job.terminal = true;
-        job.state = state;
-        this._clearJobTimers(job);
+        if (job.setupDone) await job.setupDone;
+        if (this.stopGate) {
+            await this.stopGate;
+            state = "failed";
+            exitCode = 1;
+            reason = errorCode = this.stopReason;
+        }
         if (job.kind === "patch" && !(await this._closePatchResources(job, {
             verifyBaseline: false
         }))) {
@@ -1766,41 +1910,29 @@ class SidecarServer extends EventEmitter {
             job.resolveTerminal({ state: job.state, errorCode: finalizeError.code });
             throw finalizeError;
         }
-        this.activeJobs.delete(job.jobId);
-        job.resolveTerminal({ state, exitCode, reason });
+        await this._releaseJob(job, { state, exitCode, reason });
         return job.terminalPromise;
     }
 
-    async shutdown() {
+    shutdown() {
         if (this.shutdownPromise) return this.shutdownPromise;
-        this.shutdownPromise = this._shutdownImpl();
+        this.shutdownPromise = Promise.resolve().then(() => {
+            if (this.stopFailed) this.stopPromise = null;
+            return this._shutdownImpl();
+        });
+        this.shutdownPromise.catch(() => { this.shutdownPromise = null; });
         return this.shutdownPromise;
     }
 
     async _shutdownImpl() {
-        this.draining = true;
-        if (this.state) {
-            this.state.status = "draining";
-            try { writeJsonAtomic(this.paths.statePath, this.state); } catch {}
-        }
-        const interrupts = [];
-        for (const job of this.activeJobs.values()) {
-            if (job.threadId && job.turnId) {
-                interrupts.push(this.codex.interruptTurn({ threadId: job.threadId, turnId: job.turnId }).catch(() => {}));
-            }
-        }
-        await Promise.race([
-            Promise.allSettled(interrupts),
-            new Promise(resolve => setTimeout(resolve, this.drainTimeoutMs))
-        ]);
-        for (const job of [...this.activeJobs.values()]) {
-            await this._finishJob(job, "failed", 1, "SIDECAR_SHUTDOWN");
-        }
-        if (this.codex) await this.codex.stop({ suppressClosed: true });
-        await this._closeServer();
-        try { fs.unlinkSync(this.paths.statePath); } catch (error) { if (error.code !== "ENOENT") this.emit("protocolError", error); }
-        if (process.platform !== "win32") {
-            try { removeEndpoint(this.paths.endpoint); } catch (error) { this.emit("protocolError", error); }
+        await this._stopInstance("SIDECAR_SHUTDOWN", { code: "SIDECAR_SHUTDOWN" });
+        try {
+            await this._closeServer();
+            if (process.platform !== "win32") removeEndpoint(this.paths.endpoint);
+            try { fs.unlinkSync(this.paths.statePath); } catch (error) { if (error.code !== "ENOENT") throw error; }
+        } catch {
+            this._recordStopFault("cleanup-unconfirmed", "SIDECAR_CLEANUP_FAILED");
+            throw new SidecarError("SIDECAR_CLEANUP_FAILED", "Sidecar runtime cleanup is unconfirmed");
         }
         if (this.state) this.state.status = "closed";
         this.started = false;

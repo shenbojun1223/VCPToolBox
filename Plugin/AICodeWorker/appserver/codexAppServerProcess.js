@@ -36,24 +36,48 @@ class CodexAppServerProcess extends EventEmitter {
         this.codexIdentity = null;
         this.started = false;
         this.stopping = false;
+        this._stopPromise = null;
+        this._stopTargets = new Map();
+        this._starting = null;
         this.closed = false;
         this._versionChild = null;
         this._versionIdentity = null;
     }
 
     async _readVersion() {
+        if (this._stopPromise || this.connection || this.child || this.codexPid || this.codexIdentity ||
+            this._versionChild || this._versionIdentity || this._stopTargets.size) {
+            throw new SidecarError("CODEX_START_BLOCKED", "Codex ownership is not clear");
+        }
         const args = [...this.codexGlobalArgs, "--version"];
         return new Promise((resolve, reject) => {
-            let settled = false;
+            let settled = false, timer, reason;
             let versionChild;
             let stdout = "";
+            const probe = { kind: "version", identity: null, pending: null, closed: false };
             const finish = (error, value) => {
-                if (settled) return;
-                settled = true;
-                if (this._versionChild === versionChild) this._versionChild = null;
-                if (error) reject(error);
-                else resolve(value);
+                if (!settled) {
+                    settled = true;
+                    clearTimeout(timer);
+                    if (error) reject(error);
+                    else resolve(value);
+                }
+                // Only this completed probe's close/termination proves its ownership ended.
+                if (!probe.pending && (probe.closed || probe.confirmed)) {
+                    probe.confirmed = true;
+                    if (this._versionChild === versionChild ||
+                        (!this._versionChild && this._versionIdentity === probe.identity)) {
+                        this._versionChild = null;
+                        this._versionIdentity = null;
+                    }
+                    if (!this._stopPromise && this._stopTargets.get(versionChild) === probe) {
+                        this._stopTargets.delete(versionChild);
+                    }
+                }
             };
+            probe.cancel = () => { reason ||= "CODEX_VERSION_STOPPED"; clearTimeout(timer); };
+            probe.finish = () => finish(new SidecarError(
+                reason || "CODEX_VERSION_STOPPED", "Codex version probe interrupted"));
             try {
                 versionChild = spawn(this.codexBin, args, {
                     cwd: this.cwd,
@@ -62,28 +86,42 @@ class CodexAppServerProcess extends EventEmitter {
                     stdio: ["ignore", "pipe", "ignore"],
                     windowsHide: true
                 });
-                this._versionChild = versionChild;
-                this._versionIdentity = getProcessIdentity(versionChild.pid);
-            } catch (error) {
-                finish(new SidecarError("CODEX_VERSION_SPAWN_FAILED", "Could not start Codex version probe", { cause: error.code }));
+            } catch {
+                finish(new SidecarError("CODEX_VERSION_SPAWN_FAILED", "Could not start Codex version probe"));
                 return;
             }
-            const timer = setTimeout(() => {
+            this._versionChild = versionChild;
+            try { probe.identity = getProcessIdentity(versionChild.pid); } catch {}
+            this._versionIdentity = probe.identity;
+            this._stopTargets.set(versionChild, probe);
+            timer = setTimeout(() => {
                 if (settled) return;
-                terminateOwnedChild(versionChild, {
-                    identity: this._versionIdentity,
-                    gracefulTimeoutMs: 250
-                }).finally(() => finish(new SidecarError("CODEX_VERSION_TIMEOUT", "Codex version probe timed out")));
+                reason = "CODEX_VERSION_TIMEOUT";
+                const pending = Promise.resolve().then(() => terminateOwnedChild(versionChild, {
+                    identity: probe.identity, gracefulTimeoutMs: 250,
+                    forceConfirmationTimeoutMs: 1000, requireProcessTree: false
+                })).then(result => ({ result, failed: false }), () => ({ failed: true }));
+                probe.pending = pending;
+                void pending.then(({ result, failed }) => {
+                    if (probe.pending === pending) probe.pending = null;
+                    probe.confirmed = probe.closed || (result?.confirmed === true &&
+                        !result.identityMismatch && !result.identityMissing);
+                    finish(new SidecarError("CODEX_VERSION_TIMEOUT", "Codex version probe timed out",
+                        { confirmed: probe.confirmed, terminationFailed: failed }));
+                });
             }, this.versionTimeoutMs);
             versionChild.stdout?.on("data", chunk => { stdout += String(chunk).slice(0, 512); });
-            versionChild.once("error", error => {
-                clearTimeout(timer);
-                finish(new SidecarError("CODEX_VERSION_SPAWN_FAILED", "Codex version probe failed", { cause: error.code }));
+            versionChild.once("error", () => {
+                finish(new SidecarError("CODEX_VERSION_SPAWN_FAILED", "Codex version probe failed"));
             });
-            versionChild.once("close", (code, signal) => {
+            versionChild.once("close", (code) => {
+                probe.closed = true;
                 clearTimeout(timer);
+                if (probe.pending) return;
+                if (reason) return probe.finish();
                 if (code !== 0) {
-                    finish(new SidecarError("CODEX_VERSION_FAILED", "Codex version probe returned an error", { code, signal }));
+                    finish(new SidecarError("CODEX_VERSION_FAILED", "Codex version probe returned an error",
+                        { exitCode: Number.isInteger(code) ? code : null }));
                     return;
                 }
                 finish(null, stdout.trim().split(/\r?\n/, 1)[0].slice(0, 128) || "unknown");
@@ -92,10 +130,23 @@ class CodexAppServerProcess extends EventEmitter {
     }
 
     async start() {
+        if (this._starting || this._stopPromise || this.stopping) {
+            throw new SidecarError("CODEX_START_BLOCKED", "Codex lifecycle is busy");
+        }
         if (this.started && !this.closed) return this;
+        if (this.connection || this.child || this.codexPid || this.codexIdentity || this._versionChild ||
+            this._versionIdentity || this._stopTargets.size) {
+            throw new SidecarError("CODEX_START_BLOCKED", "Codex ownership is not clear");
+        }
+        const attempt = { cancelled: false };
+        this._starting = attempt;
+        this.closed = false;
         let child = null;
         try {
             this.version = await this._readVersion();
+            if (attempt.cancelled || this._stopPromise || this._stopTargets.size) {
+                throw new SidecarError("CODEX_START_ABORTED", "Codex start was stopped");
+            }
             const args = [...this.codexGlobalArgs, "app-server", "--stdio"];
             try {
                 child = spawn(this.codexBin, args, {
@@ -106,11 +157,12 @@ class CodexAppServerProcess extends EventEmitter {
                     windowsHide: true
                 });
             } catch (error) {
-                throw new SidecarError("CODEX_APP_SERVER_SPAWN_FAILED", "Could not start Codex app-server", { cause: error.code });
+                throw new SidecarError("CODEX_APP_SERVER_SPAWN_FAILED", "Could not start Codex app-server", { cause: "SPAWN_FAILED" });
             }
             this.child = child;
             this.codexPid = child.pid || null;
-            this.codexIdentity = getProcessIdentity(child.pid);
+            try { this.codexIdentity = getProcessIdentity(child.pid); } catch {}
+            this._stopTargets.set(child, { kind: "main", identity: this.codexIdentity });
             this.connection = new JsonLineRpcConnection(child, { defaultTimeoutMs: this.requestTimeoutMs });
             this.connection.on("notification", message => this.emit("notification", message));
             this.connection.on("serverRequest", request => this.emit("serverRequest", request));
@@ -130,16 +182,23 @@ class CodexAppServerProcess extends EventEmitter {
                     optOutNotificationMethods: []
                 }
             });
-            this.codexIdentity = this.codexIdentity || getProcessIdentity(child.pid);
+            if (attempt.cancelled || this._stopPromise || this.child !== child || this.closed) {
+                throw new SidecarError("CODEX_START_ABORTED", "Codex start was stopped");
+            }
             if (!this.connection._write({ jsonrpc: "2.0", method: "initialized" })) {
                 throw new SidecarError("CODEX_INITIALIZE_FAILED", "Could not send initialized notification");
+            }
+            if (attempt.cancelled || this._stopPromise || this.child !== child || this.closed) {
+                throw new SidecarError("CODEX_START_ABORTED", "Codex start was stopped");
             }
             this.started = true;
             return this;
         } catch (error) {
-            await this.stop({ suppressClosed: true, childOverride: child });
+            await this.stop({ suppressClosed: true });
             if (error instanceof SidecarError) throw error;
-            throw new SidecarError("CODEX_INITIALIZE_FAILED", "Codex app-server initialization failed", { cause: error.code });
+            throw new SidecarError("CODEX_INITIALIZE_FAILED", "Codex app-server initialization failed", { cause: "INITIALIZE_FAILED" });
+        } finally {
+            if (this._starting === attempt) this._starting = null;
         }
     }
 
@@ -205,22 +264,100 @@ class CodexAppServerProcess extends EventEmitter {
         return this.connection.request("turn/interrupt", { threadId, turnId });
     }
 
-    async stop(options = {}) {
-        if (this.stopping) return;
-        this.stopping = true;
+    stop(options = {}) {
+        const remember = (child, identity, kind, capture = false) => {
+            if (!child || this._stopTargets.has(child)) return;
+            // An override is captured once; existing startup evidence is never refreshed.
+            if (capture) { try { identity = getProcessIdentity(child.pid); } catch {} }
+            this._stopTargets.set(child, { identity, kind });
+        };
+        remember(this.child, this.codexIdentity, "main");
+        remember(this._versionChild, this._versionIdentity, "version");
+        remember(options.childOverride, null, "main", true);
+        if (this._stopPromise) return this._stopPromise;
+        const targets = [...this._stopTargets];
         const connection = this.connection;
-        const child = options.childOverride || this.child;
-        if (connection && !connection.closed) connection.close("intentional stop");
-        if (child && child.pid) await terminateOwnedChild(child, {
-            identity: child === this.child ? this.codexIdentity : getProcessIdentity(child.pid),
-            gracefulTimeoutMs: 750
-        });
-        this.child = null;
-        this.connection = null;
-        this.codexPid = null;
-        this.codexIdentity = null;
+        this.stopping = true;
         this.started = false;
-        if (!this.closed) this._onClosed({ intentional: true, suppressed: Boolean(options.suppressClosed) });
+        if (this._starting) this._starting.cancelled = true;
+        this._stopPromise = Promise.resolve().then(async () => {
+            let connectionCloseFailed = false;
+            try {
+                if (connection && !connection.closed) connection.close("intentional stop");
+            } catch { connectionCloseFailed = true; }
+            const results = [];
+            for (const [child, ownership] of targets) {
+                const main = ownership.kind === "main";
+                ownership.cancel?.();
+                const pid = Number.isInteger(child.pid) && child.pid > 0 ? child.pid : null;
+                const identity = ownership.identity;
+                const identityMissing = main && (!identity || identity.pid !== pid ||
+                    !(identity.startTime || identity.startTimeTicks));
+                const rootAlreadyExited = main && (child.exitCode != null || child.signalCode != null);
+                let result, failed = false;
+                if (!ownership.confirmed) {
+                    const pending = ownership.pending || Promise.resolve().then(() =>
+                        terminateOwnedChild(child, {
+                            identity, gracefulTimeoutMs: 750,
+                            forceConfirmationTimeoutMs: 1000, requireProcessTree: main
+                        })).then(value => ({ result: value, failed: false }), () => ({ failed: true }));
+                    ownership.pending = pending;
+                    ({ result, failed } = await pending);
+                    if (ownership.pending === pending) ownership.pending = null;
+                }
+                const confirmed = ownership.confirmed === true || (!main && ownership.closed === true) ||
+                    (!failed && !identityMissing && !rootAlreadyExited &&
+                        result?.confirmed === true && !result.identityMissing &&
+                        !result.identityMismatch && !result.rootAlreadyExited &&
+                        (!main || result.treeTermination === "confirmed"));
+                ownership.confirmed = confirmed;
+                ownership.finish?.();
+                results.push({
+                    pid, kind: ownership.kind, confirmed, failed,
+                    terminated: result?.terminated === true,
+                    code: failed ? "TERMINATION_FAILED" : confirmed ? "CONFIRMED" :
+                        identityMissing || result?.identityMissing ? "IDENTITY_MISSING" :
+                        result?.identityMismatch ? "IDENTITY_MISMATCH" :
+                        rootAlreadyExited || result?.rootAlreadyExited ? "ROOT_ALREADY_EXITED" :
+                        main ? "TREE_UNCONFIRMED" : "PROBE_UNCONFIRMED"
+                });
+                if (!confirmed) continue;
+                if (this.child === child) {
+                    this.child = null;
+                    this.codexPid = null;
+                    this.codexIdentity = null;
+                }
+                if (this._versionChild === child ||
+                    (!this._versionChild && this._versionIdentity === identity)) {
+                    this._versionChild = null;
+                    this._versionIdentity = null;
+                }
+            }
+            const pendingTargets = [...this._stopTargets.values()].filter(item => !item.confirmed).length;
+            const orphanedOwnership = Boolean(this.child || this.codexPid || this.codexIdentity ||
+                this._versionChild || this._versionIdentity || (this.connection && this.connection !== connection));
+            const failed = connectionCloseFailed || results.some(item => item.failed);
+            if (failed || pendingTargets || orphanedOwnership) {
+                throw new SidecarError(failed ? "CODEX_STOP_FAILED" : "CODEX_STOP_UNCONFIRMED",
+                    "Codex stop did not converge",
+                    { connectionCloseFailed, pendingTargets, orphanedOwnership, results });
+            }
+            if (this.connection === connection) this.connection = null;
+            try {
+                if (!this.closed) this._onClosed({ intentional: true, suppressed: Boolean(options.suppressClosed) });
+            } catch {
+                throw new SidecarError("CODEX_STOP_FAILED", "Codex closed notification failed",
+                    { notificationFailed: true });
+            }
+            return { confirmed: true, terminated: results.some(item => item.terminated), results };
+        }).finally(() => {
+            for (const [child, ownership] of this._stopTargets) {
+                if (ownership.confirmed) this._stopTargets.delete(child);
+            }
+            this.stopping = false;
+            this._stopPromise = null;
+        });
+        return this._stopPromise;
     }
 
     _onClosed(info) {

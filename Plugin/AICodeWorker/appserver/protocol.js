@@ -1009,7 +1009,8 @@ async function terminateOwnedChild(child, options = {}) {
             forceSent = options.forceKill(child) !== false;
         } else if (process.platform === "win32") {
             const result = spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-                stdio: "ignore", windowsHide: true
+                stdio: "ignore", windowsHide: true,
+                timeout: Math.max(250, forceConfirmationTimeoutMs)
             });
             forceSent = result.status === 0;
         } else {
