@@ -1,9 +1,9 @@
 {
   "manifestVersion": "1.0.0",
   "name": "ServerPowerShellExecutor",
-  "version": "1.1.0",
+  "version": "1.2.1",
   "displayName": "PowerShell命令执行器",
-  "description": "一个允许AI执行PowerShell命令并返回其输出的插件。支持阻塞式和后台式执行并捕获输出结果。v1.1.0: PS7优先检测 + 路径感知智能安全检查 + BOM编码保护。",
+  "description": "一个允许AI执行PowerShell命令并返回其输出的插件。支持阻塞式和后台式执行并捕获输出结果。v1.2.1: 原生AST命令检查 + 验证码授权增强；review-required可凭tool_password放行，禁止项依然严格拒绝，详见插件SECURITY.md。",
   "author": "lionsky",
   "pluginType": "synchronous",
   "requiresAdmin": true,
@@ -19,7 +19,7 @@
     "invocationCommands": [
       {
         "commandIdentifier": "PowerShellExecutor",
-        "description": "调用此工具执行指定的 PowerShell 命令并返回其输出。可以选择阻塞或后台执行。\n参数:\n- command (字符串, 必需): 要执行的 PowerShell 命令内容。\n- executionType (字符串, 必须): 执行类型。'blocking' 用于短期运行并立即返回结果；'background' 用于长期运行的服务类任务，将打开一个用户可见的PowerShell窗口。\n- tool_password (字符串, 可选): 验证码。如果指令被配置为敏感指令（如修改系统设置），则必须提供此参数以获得执行授权。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」PowerShellExecutor「末」,\ncommand:「始」Get-ChildItem「末」,\nexecutionType:「始」blocking「末」\n<<<[END_TOOL_REQUEST]>>>\n\n后台执行示例 (长期运行的服务类任务):\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」PowerShellExecutor「末」,\ncommand:「始」ls -R「末」,\nexecutionType:「始」background「末」\n<<<[END_TOOL_REQUEST]>>>\n\n敏感指令执行示例:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」PowerShellExecutor「末」,\ncommand:「始」net user test /add「末」,\nexecutionType:「始」blocking「末」,\ntool_password:「始」123456「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "调用此工具执行指定的 PowerShell 命令并返回其输出。可以选择阻塞或后台执行。执行前进行原生AST检查：普通字符串、注释和显示命令不触发全文关键词拦截；已识别的forbidden拒绝且验证码不可覆盖。auth-required和review-required均可凭正确tool_password授权；后者包括动态调用、外部PS脚本及解析故障，未提供正确验证码时拒绝。解析故障不证明命令不含禁止项，授权者须独立审查准确命令和副作用，不自动重放或换工具规避；本检查器不是OS沙箱。\n参数:\n- command (字符串, 必需): 要执行的 PowerShell 命令内容。\n- executionType (字符串, 必须): 执行类型。'blocking' 用于短期运行并立即返回结果；'background' 用于长期运行的服务类任务，将打开一个用户可见的PowerShell窗口。\n- tool_password (字符串, 可选): 验证码。如果指令被配置为敏感指令（如修改系统设置），则必须提供此参数以获得执行授权。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」PowerShellExecutor「末」,\ncommand:「始」Get-ChildItem「末」,\nexecutionType:「始」blocking「末」\n<<<[END_TOOL_REQUEST]>>>\n\n后台执行示例 (长期运行的服务类任务):\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」PowerShellExecutor「末」,\ncommand:「始」ls -R「末」,\nexecutionType:「始」background「末」\n<<<[END_TOOL_REQUEST]>>>\n\n敏感指令执行示例:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」PowerShellExecutor「末」,\ncommand:「始」net user test /add「末」,\nexecutionType:「始」blocking「末」,\ntool_password:「始」123456「末」\n<<<[END_TOOL_REQUEST]>>>"
       }
     ]
   }

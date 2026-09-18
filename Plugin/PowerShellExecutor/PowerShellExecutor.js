@@ -5,6 +5,7 @@ const http = require('http');
 const fs = require('fs');
 const fsPromises = require('fs').promises;
 const os = require('os');
+const { checkCommands } = require('./commandSecurity');
 require('dotenv').config({ path: path.join(__dirname, 'config.env') });
 
 // --- Shell 检测（PS7 优先） ---
@@ -66,94 +67,11 @@ try {
     console.error('[ServerPowerShellExecutor] Error reading config.env:', error);
 }
 
-// --- 智能安全检查（移植自前端 v1.1.0） ---
-/**
- * 智能安全检查函数 - 区分命令关键字和路径内容
- * @param {string} command - 要检查的命令字符串
- * @param {string[]} forbiddenKeywords - 禁止的关键字列表
- * @param {string[]} authRequiredKeywords - 需要授权的关键字列表
- * @returns {object} - 检查结果 {isForbidden, needsAuth, matchedKeyword, reason}
- */
-function intelligentSecurityCheck(command, forbiddenKeywords, authRequiredKeywords) {
-    const result = {
-        isForbidden: false,
-        needsAuth: false,
-        matchedKeyword: null,
-        reason: null
-    };
-
-    const normalizedCommand = command.trim().toLowerCase();
-    if (!normalizedCommand) {
-        return result;
-    }
-
-    // 定义路径模式
-    const pathPatterns = [
-        /[a-z]:\\[^\\/:*?"<>|]*(?:\\[^\\/:*?"<>|]*)*\\?/gi,  // Windows路径
-        /\/[^\/\s]*(?:\/[^\/\s]*)*\/?/g,                      // Unix路径
-        /\$env:[a-z_]+[^\\/:*?"<>|\s]*/gi,                   // PS环境变量路径
-        /\${[^}]+}[^\\/:*?"<>|\s]*/gi,                       // 变量路径
-        /~\/[^\/\s]*(?:\/[^\/\s]*)*\/?/g                     // 用户目录路径
-    ];
-
-    // 提取所有可能的路径
-    const detectedPaths = [];
-    pathPatterns.forEach(pattern => {
-        const matches = normalizedCommand.match(pattern);
-        if (matches) {
-            detectedPaths.push(...matches);
-        }
-    });
-
-    // 创建不包含路径的命令版本
-    let commandWithoutPaths = normalizedCommand;
-    detectedPaths.forEach(p => {
-        commandWithoutPaths = commandWithoutPaths.replace(p.toLowerCase(), ' __PATH_PLACEHOLDER__ ');
-    });
-    commandWithoutPaths = commandWithoutPaths.replace(/\s+/g, ' ').trim();
-
-    // 检查禁止的关键字
-    for (const keyword of forbiddenKeywords) {
-        if (!keyword) continue;
-        const keywordLower = keyword.toLowerCase();
-
-        const isInPath = detectedPaths.some(p => p.toLowerCase().includes(keywordLower));
-        if (isInPath && !commandWithoutPaths.includes(keywordLower)) {
-            continue;
-        }
-
-        if (commandWithoutPaths.includes(keywordLower)) {
-            const wordBoundaryPattern = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-            if (wordBoundaryPattern.test(commandWithoutPaths)) {
-                result.isForbidden = true;
-                result.matchedKeyword = keyword;
-                result.reason = `命令包含被禁止的关键字: ${keyword}`;
-                return result;
-            }
-        }
-    }
-
-    // 检查需要授权的关键字
-    for (const keyword of authRequiredKeywords) {
-        if (!keyword) continue;
-        const keywordLower = keyword.toLowerCase();
-
-        const isInPath = detectedPaths.some(p => p.toLowerCase().includes(keywordLower));
-        if (isInPath && !commandWithoutPaths.includes(keywordLower)) {
-            continue;
-        }
-
-        if (commandWithoutPaths.includes(keywordLower)) {
-            const wordBoundaryPattern = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-            if (wordBoundaryPattern.test(commandWithoutPaths)) {
-                result.needsAuth = true;
-                result.matchedKeyword = keyword;
-                result.reason = `命令包含需要授权的关键字: ${keyword}`;
-            }
-        }
-    }
-
-    return result;
+// --- AST safety gate: inspect source as data, never execute it during inspection. ---
+function securityError(message, security) {
+    const error = new Error(message);
+    error.security = security;
+    return error;
 }
 
 // --- 回调函数 ---
@@ -281,6 +199,10 @@ async function executePowerShellCommand(command, executionType = 'blocking', tim
                 timeout: 0,
             });
 
+            child.on('error', (err) => {
+                reject(new Error(`启动后台PowerShell命令失败: ${err.message}`));
+            });
+
             resolve(child);
         }
     });
@@ -320,26 +242,20 @@ async function main() {
                 i++;
             }
 
-            // --- 智能安全性检查 ---
-            let isAuthRequiredByConfig = false;
-
-            for (const cmd of commands) {
-                const securityResult = intelligentSecurityCheck(
-                    cmd,
-                    defaultConfig.forbiddenCommands,
-                    defaultConfig.authRequiredCommands
-                );
-
-                if (securityResult.isForbidden) {
-                    throw new Error(`执行被拒绝：${securityResult.reason}`);
-                }
-
-                if (securityResult.needsAuth) {
-                    isAuthRequiredByConfig = true;
-                    console.error(`[ServerPowerShellExecutor] 命令需要授权：${securityResult.reason}`);
-                }
+            // Inspect the entire batch BEFORE execution or credential comparison.
+            const securityResult = checkCommands(
+                commands,
+                defaultConfig.forbiddenCommands,
+                defaultConfig.authRequiredCommands,
+                { shell: resolvedShell }
+            );
+            if (securityResult.isForbidden) {
+                throw securityError(`执行被拒绝：${securityResult.reason}`, securityResult);
             }
-            // --- 安全性检查结束 ---
+            const isAuthRequiredByConfig = securityResult.needsAuth || securityResult.requiresReview;
+            if (isAuthRequiredByConfig) {
+                console.error(`[ServerPowerShellExecutor] 命令需要授权：${securityResult.reason}`);
+            }
 
             let command;
             const isMultiCommand = commands.length > 1;
@@ -370,16 +286,16 @@ async function main() {
 
             // 验证码验证逻辑
             if (isAuthRequiredByConfig && !toolPassword) {
-                throw new Error('此操作涉及敏感指令，需要验证码授权，但未提供 tool_password。');
+                throw securityError('此操作涉及敏感指令，需要验证码授权，但未提供 tool_password。', securityResult);
             }
 
             if (toolPassword) {
                 const realCode = process.env.DECRYPTED_AUTH_CODE;
                 if (!realCode) {
-                    throw new Error('无法获取验证码。请确保主服务器配置正确。');
+                    throw securityError('无法获取验证码。请确保主服务器配置正确。', securityResult);
                 }
                 if (String(toolPassword) !== realCode) {
-                    throw new Error('验证码错误。');
+                    throw securityError('验证码错误。', securityResult);
                 }
             }
 
@@ -514,7 +430,10 @@ async function main() {
                 console.log(JSON.stringify({ status: 'success', result: { content: [{ type: 'text', text: resultOutput }] } }));
             }
         } catch (error) {
-            console.error(JSON.stringify({ status: 'error', error: error.message }));
+            console.error(JSON.stringify({
+                status: 'error', error: error.message,
+                ...(error.security ? { security: error.security } : {})
+            }));
             process.exit(1);
         }
     });
