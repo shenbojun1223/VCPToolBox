@@ -32,6 +32,8 @@ const {
     isPatchProtocolProof
 } = require("./appserver/protocol");
 
+const { resolveFrameLimit } = require("./appserver/frameTransport");
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 const BACKOFF_RUN_WAIT = [2, 3, 5, 10, 15, 20, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30];
@@ -76,6 +78,8 @@ function loadConfig() {
             String(raw.ENABLE_CODEX_APP_SERVER_PATCH || "").trim().toLowerCase() === "true",
         enableCodexAppServerWrite:
             String(raw.ENABLE_CODEX_APP_SERVER_WRITE || "").trim().toLowerCase() === "true",
+        maxCodexFrameBytes: resolveFrameLimit(raw.CODEX_APP_SERVER_MAX_FRAME_BYTES, "CODEX_APP_SERVER_MAX_FRAME_BYTES"),
+        maxIpcBufferBytes: resolveFrameLimit(raw.CODEX_APP_SERVER_IPC_MAX_FRAME_BYTES, "CODEX_APP_SERVER_IPC_MAX_FRAME_BYTES"),
         codexBin:          raw.CODEX_BIN            || "codex",
         codexModel:        raw.CODEX_MODEL          || "",
         codexProfile:      raw.CODEX_PROFILE        || "",
@@ -126,6 +130,8 @@ function createSidecarClient(options = {}) {
         jobRoot: CFG.jobRoot,
         codexBin: CFG.codexBin,
         maxConcurrency: CFG.appServerMaxConcurrentJobs,
+        maxCodexFrameBytes: CFG.maxCodexFrameBytes,
+        maxIpcBufferBytes: CFG.maxIpcBufferBytes,
         ...options
     });
 }
@@ -2188,6 +2194,9 @@ function compactCapabilitiesResult(full) {
         codexAppServerWriteConfigurationErrorCode: full.codexAppServerWriteConfigurationErrorCode || null,
         codexAppServerWriteMaxConcurrency: WRITE_MAX_CONCURRENCY,
         appServerRuntimeMaxConcurrentJobs: full.appServerRuntimeMaxConcurrentJobs ?? null,
+        codexAppServerFrameLimits: full.codexAppServerFrameLimits ?? null,
+        codexAppServerRequestedFrameLimits: full.codexAppServerRequestedFrameLimits ?? null,
+        codexAppServerFrameLimitsCompatible: full.codexAppServerFrameLimitsCompatible ?? null,
         codexAppServerWriteRuntimeMaxConcurrency: full.codexAppServerWriteRuntimeMaxConcurrency ?? null,
         codexAppServerWriteValidationPolicy: full.codexAppServerWriteValidationPolicy || null,
         patchContractVersion: PATCH_CONTRACT_VERSION,
@@ -2372,6 +2381,9 @@ async function cmdCapabilities(input = {}) {
         codexAppServerWriteConfigurationErrorCode: appServerInspection.writeConfigurationErrorCode || null,
         codexAppServerWriteMaxConcurrency: WRITE_MAX_CONCURRENCY,
         appServerRuntimeMaxConcurrentJobs: appServerInspection.runtimeMaxConcurrency ?? null,
+        codexAppServerFrameLimits: appServerInspection.frameLimits ?? null,
+        codexAppServerRequestedFrameLimits: appServerInspection.requestedFrameLimits ?? null,
+        codexAppServerFrameLimitsCompatible: appServerInspection.frameLimitsCompatible ?? null,
         codexAppServerWriteRuntimeMaxConcurrency:
             Number.isSafeInteger(appServerInspection.writeMaxConcurrency)
                 ? appServerInspection.writeMaxConcurrency

@@ -39,6 +39,7 @@ function fixture(cfg = {}) {
     _write() { return true; }
   }
   const dependencies = {
+    "./frameTransport": require("../../appserver/frameTransport"),
     events: { EventEmitter: EE }, path,
     child_process: { spawn(bin, args) {
       spawns.push(args);

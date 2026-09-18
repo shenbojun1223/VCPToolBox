@@ -68,6 +68,7 @@ const sandbox = {
 module, Buffer, setTimeout, clearTimeout, setImmediate,
 process: { platform: "win32", pid: 31, cwd: () => "/project" },
 require(name) {
+if (name === "./frameTransport") return require("../../appserver/frameTransport");
 if (name === "fs") return fakeFs;
 if (name === "events") return { EventEmitter };
 if (name === "path") return require("node:path");

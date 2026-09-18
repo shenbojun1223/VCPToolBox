@@ -3,6 +3,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const net = require("net");
+const { resolveFrameLimit, frameLimitStatus, encodeJsonLine, BoundedLineReader, FRAME_LIMIT_PROTOCOL_VERSION } = require("./frameTransport");
 const path = require("path");
 const { EventEmitter } = require("events");
 const { CodexAppServerProcess } = require("./codexAppServerProcess");
@@ -167,10 +168,8 @@ class SidecarServer extends EventEmitter {
         this.cancelTimeoutMs = Math.max(250, Number(options.cancelTimeoutMs || 3000));
         this.timeoutGraceMs = Math.max(250, Number(options.timeoutGraceMs || Math.min(this.cancelTimeoutMs, 1000)));
         this.drainTimeoutMs = Math.max(500, Number(options.drainTimeoutMs || 2500));
-        const maxIpcBufferBytes = Number(options.maxIpcBufferBytes);
-        this.maxIpcBufferBytes = Number.isFinite(maxIpcBufferBytes)
-            ? Math.max(1024, Math.floor(maxIpcBufferBytes))
-            : 1024 * 1024;
+        this.maxIpcBufferBytes = resolveFrameLimit(options.maxIpcBufferBytes, "maxIpcBufferBytes");
+        this.maxCodexFrameBytes = resolveFrameLimit(options.maxCodexFrameBytes, "maxCodexFrameBytes");
         this.testStartupDelayMs = Math.max(0, Number(options.testStartupDelayMs || 0));
         this.patchGitOptions = options.patchGitOptions || {};
         this.patchMonitorIntervalMs = Math.max(50, Number(options.patchMonitorIntervalMs || 500));
@@ -263,6 +262,7 @@ class SidecarServer extends EventEmitter {
             }),
             status: "starting",
             codexBin: this.codexBin,
+            frameLimits: frameLimitStatus(this.maxCodexFrameBytes, this.maxIpcBufferBytes),
             codexVersion: null,
             codexPid: null
         };
@@ -273,7 +273,8 @@ class SidecarServer extends EventEmitter {
             codexBin: this.codexBin,
             codexGlobalArgs: this.codexGlobalArgs,
             cwd: this.pluginDir,
-            requestTimeoutMs: this.requestTimeoutMs
+            requestTimeoutMs: this.requestTimeoutMs,
+            maxCodexFrameBytes: this.maxCodexFrameBytes
         });
         this.codex.on("notification", message => this._handleNotification(message));
         this.codex.on("serverRequest", request => this._handleServerRequest(request));
@@ -301,40 +302,30 @@ class SidecarServer extends EventEmitter {
 
     _acceptSocket(socket) {
         this.sockets.add(socket);
-        let buffer = "";
+        const reader = new BoundedLineReader(this.maxIpcBufferBytes, {
+            code: "SIDECAR_IPC_BUFFER_OVERFLOW", message: "Sidecar IPC request exceeded the buffer limit"
+        });
         let handled = false;
-        socket.setEncoding("utf8");
         socket.on("data", chunk => {
             if (handled) return;
-            buffer += chunk;
-            let newline;
-            while (!handled) {
-                newline = buffer.indexOf("\n");
-                if (newline === -1) {
-                    if (Buffer.byteLength(buffer, "utf8") > this.maxIpcBufferBytes) {
-                        handled = true;
-                        buffer = "";
-                        this._sendError(socket, null, new SidecarError("SIDECAR_IPC_BUFFER_OVERFLOW", "Sidecar IPC request exceeded the buffer limit"));
-                    }
-                    return;
-                }
-                const rawLine = buffer.slice(0, newline);
-                if (Buffer.byteLength(rawLine, "utf8") > this.maxIpcBufferBytes) {
+            try {
+                reader.push(chunk, line => {
+                    if (!line.trim()) return true;
                     handled = true;
-                    buffer = "";
-                    this._sendError(socket, null, new SidecarError("SIDECAR_IPC_BUFFER_OVERFLOW", "Sidecar IPC request exceeded the buffer limit"));
-                    return;
-                }
-                const line = rawLine.replace(/\r$/, "");
-                buffer = buffer.slice(newline + 1);
-                if (!line.trim()) continue;
+                    this._handleIpcLine(socket, line).catch(error => this._sendError(socket, null, error));
+                    return false;
+                });
+            } catch (error) {
                 handled = true;
-                buffer = "";
-                this._handleIpcLine(socket, line).catch(error => this._sendError(socket, null, error));
+                reader.reset();
+                this._sendError(socket, null, new SidecarError(error.code || "INVALID_IPC_JSON",
+                    error.code === "SIDECAR_IPC_BUFFER_OVERFLOW" ? error.message : "Invalid IPC frame",
+                    error.details));
             }
         });
-        socket.once("close", () => this.sockets.delete(socket));
-        socket.once("error", () => this.sockets.delete(socket));
+        const cleanup = () => { handled = true; reader.reset(); this.sockets.delete(socket); };
+        socket.once("close", cleanup);
+        socket.once("error", cleanup);
     }
 
     async _handleIpcLine(socket, line) {
@@ -362,21 +353,34 @@ class SidecarServer extends EventEmitter {
 
     _sendResult(socket, requestId, result) {
         if (socket.destroyed) return;
-        try { socket.end(`${JSON.stringify({ requestId, ok: true, result })}\n`); } catch {}
+        try {
+            socket.end(encodeJsonLine({ requestId, ok: true, result }, this.maxIpcBufferBytes,
+                "SIDECAR_IPC_BUFFER_OVERFLOW", "Sidecar IPC response exceeded the buffer limit"));
+        } catch (error) {
+            this._sendError(socket, requestId, new SidecarError(
+                error.code || "SIDECAR_INTERNAL_ERROR",
+                error.code === "SIDECAR_IPC_BUFFER_OVERFLOW" ? error.message : "Could not serialize Sidecar result",
+                error.details));
+        }
     }
 
     _sendError(socket, requestId, error) {
         if (socket.destroyed) return;
         const safe = error instanceof SidecarError
-            ? error
-            : new SidecarError("SIDECAR_INTERNAL_ERROR", "Sidecar request failed");
+            ? error : new SidecarError("SIDECAR_INTERNAL_ERROR", "Sidecar request failed");
+        const encode = value => encodeJsonLine(value, this.maxIpcBufferBytes,
+            "SIDECAR_IPC_BUFFER_OVERFLOW", "Sidecar IPC error response exceeded the buffer limit");
+        let line;
         try {
-            socket.end(`${JSON.stringify({
-                requestId,
-                ok: false,
-                error: { code: safe.code, message: safe.message, details: safe.details }
-            })}\n`);
-        } catch {}
+            line = encode({ requestId, ok: false,
+                error: { code: safe.code, message: safe.message, details: safe.details } });
+        } catch {
+            const minimal = { code: "SIDECAR_IPC_BUFFER_OVERFLOW",
+                message: "Sidecar IPC response exceeded the buffer limit" };
+            try { line = encode({ requestId, ok: false, error: minimal }); }
+            catch { line = encode({ requestId: null, ok: false, error: minimal }); }
+        }
+        try { socket.end(line); } catch { socket.destroy(); }
     }
 
     async _dispatch(method, params) {
@@ -415,6 +419,7 @@ class SidecarServer extends EventEmitter {
                 errorCode: job.finalizationError?.code || null
             })),
             maxConcurrency: this.maxConcurrency,
+            frameLimits: frameLimitStatus(this.maxCodexFrameBytes, this.maxIpcBufferBytes),
             serviceTierOverrideProtocolVersion: 1,
             ...getPatchProtocolProof(),
             ...getWriteProtocolStatus({

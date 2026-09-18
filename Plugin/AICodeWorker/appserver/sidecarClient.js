@@ -3,6 +3,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const net = require("net");
+const { resolveFrameLimit, frameLimitStatus, encodeJsonLine, BoundedLineReader, FRAME_LIMIT_PROTOCOL_VERSION } = require("./frameTransport");
 const path = require("path");
 const { spawn } = require("child_process");
 const {
@@ -92,10 +93,8 @@ class SidecarClient {
         this.startingTimeoutMs = Math.max(100, Number(options.startingTimeoutMs || this.startupTimeoutMs));
         this.lockWaitMs = Math.max(1000, Number(options.lockWaitMs || 20000));
         this.staleLockMs = Math.max(1000, Number(options.staleLockMs || 5000));
-        const maxIpcBufferBytes = Number(options.maxIpcBufferBytes);
-        this.maxIpcBufferBytes = Number.isFinite(maxIpcBufferBytes)
-            ? Math.max(1024, Math.floor(maxIpcBufferBytes))
-            : 1024 * 1024;
+        this.maxIpcBufferBytes = resolveFrameLimit(options.maxIpcBufferBytes, "maxIpcBufferBytes");
+        this.maxCodexFrameBytes = resolveFrameLimit(options.maxCodexFrameBytes, "maxCodexFrameBytes");
         this.cleanupHooks = options.cleanupHooks || options.hooks || {};
         this.stateReader = options.stateReader || options.readState || options.testHooks?.readState || this.cleanupHooks.readState || null;
         this.testStartupDelayMs = Math.max(0, Number(options.testStartupDelayMs || 0));
@@ -170,6 +169,7 @@ class SidecarClient {
 
     async submitAnalyzeJob(params) {
         const state = await this.ensure();
+        this._assertFrameLimitsCompatible(state);
         this._assertServiceTierOverrideCompatible(state, params);
         return this._callWithState(state, "submitAnalyzeJob", params);
     }
@@ -178,6 +178,7 @@ class SidecarClient {
         const jobId = assertJobId(params.jobId);
         const fixedPaths = jobPaths(this.jobRoot, jobId);
         const state = await this.ensure();
+        this._assertFrameLimitsCompatible(state);
         this._assertServiceTierOverrideCompatible(state, params);
         try {
             return await this._callWithState(state, "submitPatchJob", {
@@ -211,6 +212,7 @@ class SidecarClient {
         const jobId = assertJobId(params.jobId);
         const fixedPaths = jobPaths(this.jobRoot, jobId);
         const state = await this.ensure();
+        this._assertFrameLimitsCompatible(state);
         this._assertWriteSubmissionCompatible(state);
         this._assertServiceTierOverrideCompatible(state, params);
         try {
@@ -305,6 +307,12 @@ class SidecarClient {
                 { timeoutMs: Math.min(this.requestTimeoutMs, Math.max(250, Number(options.pingTimeoutMs || 750))) }
             );
             const inspection = this._safeInspection(state, "ready", status, lockWarning);
+            inspection.frameLimits = status?.frameLimits || null;
+            inspection.requestedFrameLimits = frameLimitStatus(this.maxCodexFrameBytes, this.maxIpcBufferBytes);
+            try {
+                this._assertFrameLimitsCompatible({ frameLimits: inspection.frameLimits });
+                inspection.frameLimitsCompatible = true;
+            } catch { inspection.frameLimitsCompatible = false; }
             if (Number(status?.maxConcurrency) !== this.maxConcurrency) {
                 inspection.status = "error";
                 inspection.errorCode = "SIDECAR_CONCURRENCY_MISMATCH";
@@ -678,6 +686,7 @@ class SidecarClient {
         }
         return {
             ...state,
+            frameLimits: status?.frameLimits || null,
             serviceTierOverrideProtocolVersion:
                 status?.serviceTierOverrideProtocolVersion === SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION
                     ? SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION
@@ -685,6 +694,18 @@ class SidecarClient {
             ...projectPatchProtocolProof(status),
             ...projectWriteProtocolStatus(status)
         };
+    }
+
+    _assertFrameLimitsCompatible(state) {
+        const actual = state?.frameLimits;
+        if (actual?.protocolVersion !== FRAME_LIMIT_PROTOCOL_VERSION ||
+            actual.codexMaxFrameBytes !== this.maxCodexFrameBytes ||
+            actual.ipcMaxFrameBytes !== this.maxIpcBufferBytes) {
+            throw new SidecarError("SIDECAR_FRAME_LIMIT_MISMATCH",
+                "Active Sidecar frame limits differ from the requested configuration; controlled restart required",
+                { expected: frameLimitStatus(this.maxCodexFrameBytes, this.maxIpcBufferBytes),
+                  actual: actual || null });
+        }
     }
 
     _assertWriteSubmissionCompatible(state) {
@@ -801,6 +822,8 @@ class SidecarClient {
             "--codex-bin", this.codexBin,
             "--codex-global-args", JSON.stringify(this.codexGlobalArgs),
             "--max-concurrency", String(this.maxConcurrency),
+            "--max-codex-frame-bytes", String(this.maxCodexFrameBytes),
+            "--max-ipc-frame-bytes", String(this.maxIpcBufferBytes),
             ...(this.testStartupDelayMs > 0 ? ["--test-startup-delay-ms", String(this.testStartupDelayMs)] : [])
         ];
         let child;
@@ -854,14 +877,25 @@ class SidecarClient {
     _callWithState(state, method, params, options = {}) {
         if (!state?.endpoint || !state.controlToken) return Promise.reject(new SidecarError("SIDECAR_STATE_INVALID", "Sidecar state is incomplete"));
         const requestId = String(this.requestCounter++);
+        let requestLine;
+        try {
+            requestLine = encodeJsonLine({ requestId, token: state.controlToken, method, params },
+                this.maxIpcBufferBytes, "SIDECAR_IPC_REQUEST_TOO_LARGE", "Sidecar IPC request exceeds the configured limit");
+        } catch (error) {
+            return Promise.reject(new SidecarError(error.code || "SIDECAR_IPC_WRITE_FAILED",
+                error.code === "SIDECAR_IPC_REQUEST_TOO_LARGE" ? error.message : "Could not serialize Sidecar request",
+                error.code === "SIDECAR_IPC_REQUEST_TOO_LARGE" ? error.details : undefined));
+        }
         return new Promise((resolve, reject) => {
             let settled = false;
-            let buffer = "";
+            const reader = new BoundedLineReader(this.maxIpcBufferBytes, {
+                code: "SIDECAR_IPC_BUFFER_OVERFLOW", message: "Sidecar IPC response exceeded the buffer limit"
+            });
             let socket;
             const finish = (error, value) => {
                 if (settled) return;
                 settled = true;
-                buffer = "";
+                reader.reset();
                 clearTimeout(timeout);
                 if (socket && !socket.destroyed) socket.destroy();
                 if (error) reject(error); else resolve(value);
@@ -870,29 +904,12 @@ class SidecarClient {
             const timeout = setTimeout(() => finish(new SidecarError("SIDECAR_IPC_TIMEOUT", `Sidecar request timed out: ${method}`)), timeoutMs);
             try {
                 socket = net.createConnection(state.endpoint);
-                socket.setEncoding("utf8");
                 socket.setTimeout(this.connectTimeoutMs, () => finish(new SidecarError("SIDECAR_IPC_TIMEOUT", "Sidecar IPC connection timed out")));
                 socket.once("connect", () => {
                     socket.setTimeout(0);
-                    try { socket.write(`${JSON.stringify({ requestId, token: state.controlToken, method, params })}\n`); } catch (error) { finish(new SidecarError("SIDECAR_IPC_WRITE_FAILED", "Could not write Sidecar request", { cause: error.code })); }
+                    try { socket.write(requestLine); } catch (error) { finish(new SidecarError("SIDECAR_IPC_WRITE_FAILED", "Could not write Sidecar request", { cause: error.code })); }
                 });
-                socket.on("data", chunk => {
-                    if (settled) return;
-                    buffer += chunk;
-                    const newline = buffer.indexOf("\n");
-                    if (newline === -1) {
-                        if (Buffer.byteLength(buffer, "utf8") > this.maxIpcBufferBytes) {
-                            finish(new SidecarError("SIDECAR_IPC_BUFFER_OVERFLOW", "Sidecar IPC response exceeded the buffer limit"));
-                        }
-                        return;
-                    }
-                    const lineBytes = Buffer.byteLength(buffer.slice(0, newline), "utf8");
-                    if (lineBytes > this.maxIpcBufferBytes) {
-                        finish(new SidecarError("SIDECAR_IPC_BUFFER_OVERFLOW", "Sidecar IPC response exceeded the buffer limit"));
-                        return;
-                    }
-                    const line = buffer.slice(0, newline);
-                    buffer = "";
+                const handleLine = line => {
                     let response;
                     try { response = JSON.parse(line); } catch { finish(new SidecarError("INVALID_SIDECAR_RESPONSE", "Sidecar returned invalid JSON")); return; }
                     if (!response || typeof response !== "object" || Array.isArray(response)) {
@@ -915,6 +932,16 @@ class SidecarClient {
                         return;
                     }
                     finish(new SidecarError("INVALID_SIDECAR_RESPONSE", "Sidecar response envelope is invalid"));
+                };
+                socket.on("data", chunk => {
+                    if (settled) return;
+                    try {
+                        reader.push(chunk, line => { handleLine(line); return false; });
+                    } catch (error) {
+                        finish(new SidecarError(error.code || "INVALID_SIDECAR_RESPONSE",
+                            error.code === "SIDECAR_IPC_BUFFER_OVERFLOW" ? error.message : "Invalid Sidecar response",
+                            error.details));
+                    }
                 });
                 socket.once("error", error => finish(new SidecarError("SIDECAR_IPC_ERROR", "Sidecar IPC failed", { cause: error.code })));
                 socket.once("close", () => {

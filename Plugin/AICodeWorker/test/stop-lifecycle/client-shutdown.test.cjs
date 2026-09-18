@@ -19,6 +19,7 @@ function fixture(status='degraded'){
  };
  const module={exports:{}};
  const deps={
+   "./frameTransport":require("../../appserver/frameTransport"),
   crypto:{},fs:{},net:{},path,child_process:{spawn:()=>{throw Error('REAL_SPAWN_FORBIDDEN');}},
   './protocol':protocol,'./writeRuntimeConfig':{
    APP_SERVER_MAX_CONCURRENCY:3,projectWriteProtocolStatus:()=>({})

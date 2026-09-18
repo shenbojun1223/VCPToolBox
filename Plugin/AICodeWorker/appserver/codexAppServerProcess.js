@@ -4,6 +4,7 @@ const { EventEmitter } = require("events");
 const { spawn } = require("child_process");
 const path = require("path");
 const { JsonLineRpcConnection } = require("./jsonLineRpcConnection");
+const { resolveFrameLimit } = require("./frameTransport");
 const { SidecarError, getProcessIdentity, terminateOwnedChild } = require("./protocol");
 
 const PATCH_CODEX_VERSION = "codex-cli 0.144.5";
@@ -21,6 +22,7 @@ function normalizeServiceTierOverride(value) {
 class CodexAppServerProcess extends EventEmitter {
     constructor(options = {}) {
         super();
+        this.maxCodexFrameBytes = resolveFrameLimit(options.maxCodexFrameBytes, "maxCodexFrameBytes");
         this.codexBin = options.codexBin || "codex";
         this.codexGlobalArgs = Array.isArray(options.codexGlobalArgs) ? [...options.codexGlobalArgs] : [];
         this.clientVersion = options.clientVersion || "vcp-aicodeworker-sidecar/1.0";
@@ -163,7 +165,9 @@ class CodexAppServerProcess extends EventEmitter {
             this.codexPid = child.pid || null;
             try { this.codexIdentity = getProcessIdentity(child.pid); } catch {}
             this._stopTargets.set(child, { kind: "main", identity: this.codexIdentity });
-            this.connection = new JsonLineRpcConnection(child, { defaultTimeoutMs: this.requestTimeoutMs });
+            this.connection = new JsonLineRpcConnection(child, {
+                defaultTimeoutMs: this.requestTimeoutMs, maxBufferBytes: this.maxCodexFrameBytes
+            });
             this.connection.on("notification", message => this.emit("notification", message));
             this.connection.on("serverRequest", request => this.emit("serverRequest", request));
             this.connection.on("protocolError", error => this.emit("protocolError", error));

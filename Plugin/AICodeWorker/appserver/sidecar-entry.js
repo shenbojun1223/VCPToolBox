@@ -1,6 +1,7 @@
 "use strict";
 
 const { SidecarServer } = require("./sidecarServer");
+const { resolveFrameLimit } = require("./frameTransport");
 const { APP_SERVER_MAX_CONCURRENCY, loadWriteRuntimeConfig } = require("./writeRuntimeConfig");
 
 function parseArgs(argv) {
@@ -18,6 +19,8 @@ function parseArgs(argv) {
         ["--codex-bin", "codexBin"],
         ["--codex-global-args", "codexGlobalArgs"],
         ["--max-concurrency", "maxConcurrency"],
+        ["--max-codex-frame-bytes", "maxCodexFrameBytes"],
+        ["--max-ipc-frame-bytes", "maxIpcBufferBytes"],
         ["--test-startup-delay-ms", "testStartupDelayMs"]
     ]);
     for (let index = 0; index < argv.length; index++) {
@@ -37,6 +40,8 @@ function parseArgs(argv) {
     if (!Number.isInteger(result.testStartupDelayMs) || result.testStartupDelayMs < 0 || result.testStartupDelayMs > 60000) {
         throw new Error("testStartupDelayMs is invalid");
     }
+    result.maxCodexFrameBytes = resolveFrameLimit(result.maxCodexFrameBytes, "maxCodexFrameBytes");
+    result.maxIpcBufferBytes = resolveFrameLimit(result.maxIpcBufferBytes, "maxIpcBufferBytes");
     return result;
 }
 

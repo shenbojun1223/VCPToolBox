@@ -63,6 +63,7 @@ function fixture(cfg={}){
   _write(){return true;}
  }
  const dependencies={
+    "./frameTransport": require("../../appserver/frameTransport"),
   events:{EventEmitter},path,
   child_process:{spawn(bin,args){
    const pid=args.includes('--version')?102:101;

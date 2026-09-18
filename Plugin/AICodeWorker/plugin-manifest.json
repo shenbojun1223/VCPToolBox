@@ -48,7 +48,9 @@
     "TRACE_EVENT_TEXT_CHARS": "integer",
     "TRACE_RAW_MAX_CHARS": "integer",
     "CODEX_HOME": "string",
-    "CODEX_MODELS_CACHE": "string"
+    "CODEX_MODELS_CACHE": "string",
+    "CODEX_APP_SERVER_MAX_FRAME_BYTES": "integer",
+    "CODEX_APP_SERVER_IPC_MAX_FRAME_BYTES": "integer"
   },
   "configSchemaDescriptions": {
     "ENABLE_OPENCODE": "是否启用 OpenCode Worker。",
@@ -84,7 +86,9 @@
     "TRACE_EVENT_TEXT_CHARS": "单个命令、输出或阶段说明的最大字符数。",
     "TRACE_RAW_MAX_CHARS": "raw 模式最大返回字符数。",
     "CODEX_HOME": "Codex 配置目录；留空使用环境变量或当前用户配置。",
-    "CODEX_MODELS_CACHE": "可选 models_cache.json 路径；留空使用 Codex 配置目录中的缓存。"
+    "CODEX_MODELS_CACHE": "可选 models_cache.json 路径；留空使用 Codex 配置目录中的缓存。",
+    "CODEX_APP_SERVER_MAX_FRAME_BYTES": "Codex JSONL 单帧 UTF-8 字节上限，不含 LF/CRLF；默认16MiB，范围1024..67108864，非法值拒绝。变更后须受控重启Sidecar。",
+    "CODEX_APP_SERVER_IPC_MAX_FRAME_BYTES": "Sidecar IPC 单帧 UTF-8 字节上限，不含 LF/CRLF；默认16MiB，范围1024..67108864，非法值拒绝。变更后须受控重启Sidecar，patch制品上限不变。"
   },
   "defaults": {
     "ENABLE_OPENCODE": true,
@@ -120,7 +124,9 @@
     "TRACE_EVENT_TEXT_CHARS": 800,
     "TRACE_RAW_MAX_CHARS": 16000,
     "CODEX_HOME": "",
-    "CODEX_MODELS_CACHE": ""
+    "CODEX_MODELS_CACHE": "",
+    "CODEX_APP_SERVER_MAX_FRAME_BYTES": 16777216,
+    "CODEX_APP_SERVER_IPC_MAX_FRAME_BYTES": 16777216
   },
   "capabilities": {
     "responseModes": {

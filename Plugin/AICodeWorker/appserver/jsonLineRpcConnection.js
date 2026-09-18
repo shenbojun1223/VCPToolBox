@@ -1,6 +1,7 @@
 "use strict";
 
 const { EventEmitter } = require("events");
+const { resolveFrameLimit, frameLimitStatus, encodeJsonLine, BoundedLineReader, FRAME_LIMIT_PROTOCOL_VERSION } = require("./frameTransport");
 const { SidecarError } = require("./protocol");
 
 class JsonLineRpcConnection extends EventEmitter {
@@ -9,11 +10,14 @@ class JsonLineRpcConnection extends EventEmitter {
         this.child = child;
         this.defaultTimeoutMs = Math.max(100, Number(options.defaultTimeoutMs || 10000));
         this.stderrLimit = Math.max(256, Number(options.stderrLimit || 8192));
-        this.maxBufferBytes = Math.max(1024, Number(options.maxBufferBytes || 1024 * 1024));
+        this.maxBufferBytes = resolveFrameLimit(options.maxBufferBytes, "maxBufferBytes");
+        this.lineReader = new BoundedLineReader(this.maxBufferBytes, {
+            code: "PROTOCOL_BUFFER_OVERFLOW", message: "Codex JSONL message exceeded the buffer limit"
+        });
         this.pending = new Map();
         this.nextRequestId = 1;
         this.stderrSample = "";
-        this.buffer = "";
+        this.lineReader.reset();
         this.closed = false;
         this.closeInfo = null;
         this._bindChild();
@@ -26,22 +30,18 @@ class JsonLineRpcConnection extends EventEmitter {
         this.child.once("close", (code, signal) => this._onChildFailure("close", { code, signal }));
     }
 
+    get buffer() { return this.lineReader.pendingText(); }
+
     _onStdout(chunk) {
         if (this.closed) return;
-        this.buffer += String(chunk);
-        let newline;
-        while ((newline = this.buffer.indexOf("\n")) !== -1) {
-            const line = this.buffer.slice(0, newline).replace(/\r$/, "");
-            this.buffer = this.buffer.slice(newline + 1);
-            if (Buffer.byteLength(line, "utf8") > this.maxBufferBytes) {
-                this._failProtocol(new SidecarError("PROTOCOL_BUFFER_OVERFLOW", "Codex JSONL message exceeded the buffer limit"));
-                return;
-            }
-            if (line.trim()) this._onLine(line);
-            if (this.closed) return;
-        }
-        if (Buffer.byteLength(this.buffer, "utf8") > this.maxBufferBytes) {
-            this._failProtocol(new SidecarError("PROTOCOL_BUFFER_OVERFLOW", "Codex JSONL message exceeded the buffer limit"));
+        try {
+            this.lineReader.push(chunk, line => {
+                if (line.trim()) this._onLine(line);
+                return !this.closed;
+            });
+        } catch (error) {
+            if (error.code !== "PROTOCOL_BUFFER_OVERFLOW") throw error;
+            this._failProtocol(new SidecarError(error.code, error.message, error.details));
         }
     }
 
@@ -107,9 +107,14 @@ class JsonLineRpcConnection extends EventEmitter {
     _write(message) {
         if (this.closed || !this.child.stdin || this.child.stdin.destroyed) return false;
         try {
-            this.child.stdin.write(`${JSON.stringify(message)}\n`);
+            this.child.stdin.write(encodeJsonLine(message, this.maxBufferBytes,
+                "PROTOCOL_BUFFER_OVERFLOW", "Codex JSONL message exceeded the buffer limit"));
             return true;
         } catch (error) {
+            if (error.code === "PROTOCOL_BUFFER_OVERFLOW") {
+                this._failProtocol(new SidecarError(error.code, error.message, error.details));
+                return false;
+            }
             this.emit("protocolError", new SidecarError("WRITE_FAILED", "Could not write Codex JSONL message", { cause: error.code }));
             return false;
         }
@@ -139,7 +144,7 @@ class JsonLineRpcConnection extends EventEmitter {
     }
 
     _failProtocol(error) {
-        this.buffer = "";
+        this.lineReader.reset();
         this.emit("protocolError", error);
         this._onChildFailure("protocol", { code: error.code });
     }
@@ -147,7 +152,7 @@ class JsonLineRpcConnection extends EventEmitter {
     _onChildFailure(kind, detail) {
         if (this.closed) return;
         this.closed = true;
-        this.buffer = "";
+        this.lineReader.reset();
         this.closeInfo = { kind, detail, stderrSample: this.stderrSample };
         const error = new SidecarError(
             "CODEX_CONNECTION_CLOSED",
