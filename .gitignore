@@ -315,3 +315,8 @@ Plugin/.backup/
 # ==== 开发SDK ====
 Plugin/VCPQQBotServer/bot-node-sdk-main
 开发日志/
+
+# Timestamped local backups: retain on disk, exclude from new Git additions.
+*.bak-*
+*.bak.*
+*.backup-*
