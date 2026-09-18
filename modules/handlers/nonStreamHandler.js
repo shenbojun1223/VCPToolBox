@@ -301,7 +301,7 @@ class NonStreamHandler {
     const parsedMaxRecursion = Number.parseInt(maxVCPLoopNonStream, 10);
     const maxRecursion = Number.isFinite(parsedMaxRecursion) && parsedMaxRecursion > 0
       ? parsedMaxRecursion
-      : 12;
+      : 20;
     let conversationHistoryForClient = [];
     let currentAIContentForLoop = fullContentFromAI;
     let currentMessagesForNonStreamLoop = originalBody.messages ? JSON.parse(JSON.stringify(originalBody.messages)) : [];
@@ -627,7 +627,18 @@ class NonStreamHandler {
       oneRingAssistantTurnParts.push(notice);
     }
 
-    const finalContentForClient = conversationHistoryForClient.join('');
+    let finalContentForClient = conversationHistoryForClient.join('');
+
+    // ★ 熔断收口时净化尾部未闭合的 VCP 工具块残片，确保落盘 history.json 的语法完整。
+    if (loopEndedAtLimit && !vcpToolUseForbidden && finalContentForClient) {
+      try {
+        const { sanitizeContent } = require('../vcpLoop/historySanitizer.js');
+        finalContentForClient = sanitizeContent(finalContentForClient);
+      } catch (sanitizeErr) {
+        if (DEBUG_MODE) console.warn('[VCP NonStream Loop] Final content sanitize failed:', sanitizeErr.message);
+      }
+    }
+
     const finalFinishReason = hasPendingToolCallsAtLimit ? 'length' : 'stop';
     let finalJsonResponse;
     try {

@@ -9,11 +9,34 @@ const PARSER_TIMEOUT_MS = 10000;
 const REVIEW_COMMANDS = new Set([
     'invoke-expression', 'invoke-command', 'start-process',
     'powershell', 'pwsh', 'cmd',
-    'set-alias', 'new-alias', 'import-alias', 'import-module'
+    'set-alias', 'new-alias', 'import-alias', 'import-module',
+    // [2026-09-19 security audit] High-risk execution primitives.
+    'start-job', 'start-threadjob',
+    'invoke-cimmethod', 'invoke-wmimethod',
+    'register-scheduledtask', 'unregister-scheduledtask', 'schtasks',
+    'new-service', 'remove-service', 'set-service',
+    'add-type',
+    'mshta', 'rundll32', 'regsvr32', 'cscript', 'wscript',
+    'certutil', 'bitsadmin', 'takeown', 'icacls', 'reg', 'wmic',
+    'invoke-webrequest', 'invoke-restmethod',
+    'sc', 'stop-service', 'stop-process', 'stop-computer',
+    'new-object', 'new-webserviceproxy', 'curl', 'netsh', 'dism'
 ]);
 const REVIEW_MEMBERS = new Set([
     'invoke', 'invokereturnasis', 'invokewithcontext',
-    'addscript', 'newscriptblock', 'invokescript'
+    'addscript', 'newscriptblock', 'invokescript',
+    // [2026-09-19 security audit] Destructive object members.
+    'delete', 'writealltext', 'writeallbytes', 'writealllines', 'kill'
+]);
+const REVIEW_TYPES = new Set([
+    'system.io.file', 'system.io.directory',
+    'system.diagnostics.process', 'system.diagnostics.processstartinfo',
+    'system.net.webclient',
+    'microsoft.win32.registry', 'microsoft.win32.registrykey'
+]);
+const DANGEROUS_TYPE_MEMBERS = new Set([
+    'delete', 'writealltext', 'writeallbytes', 'writealllines',
+    'move', 'copy', 'create', 'start', 'kill', 'open', 'setvalue'
 ]);
 const PROVIDER_WRITERS = new Set([
     'set-item', 'new-item', 'set-content', 'add-content', 'copy-item', 'move-item'
@@ -113,8 +136,10 @@ function evaluateFacts(parsed, forbiddenKeywords, authRequiredKeywords) {
                 const resolved = commandIdentity(fact.resolved || fact.name);
                 // Literal forbidden aliases win over canonical authorization rules.
                 applyPolicy([fact.name, fact.resolved || fact.name], fact, index);
-                if (REVIEW_COMMANDS.has(literal) || REVIEW_COMMANDS.has(resolved)) {
-                    diagnostics.push(diagnostic('review-required', 'INDIRECT_EXECUTION', fact, index, literal));
+                // Match the RESOLVED identity so built-in aliases are not confused with
+                // native executables sharing the same short name (e.g. `sc`=Set-Content vs `sc.exe`).
+                if (REVIEW_COMMANDS.has(resolved)) {
+                    diagnostics.push(diagnostic('review-required', 'INDIRECT_EXECUTION', fact, index, resolved));
                 }
                 if (fact.dotSource || /\.(?:ps1|psm1)$/i.test(fact.name)) {
                     diagnostics.push(diagnostic('review-required', 'EXTERNAL_PS_SCRIPT', fact, index, literal));
@@ -134,7 +159,8 @@ function evaluateFacts(parsed, forbiddenKeywords, authRequiredKeywords) {
                 }
                 const member = fact.member.toLowerCase();
                 const type = fact.typeName.toLowerCase().replace(/^system\.management\.automation\./, '');
-                if (!member || REVIEW_MEMBERS.has(member) ||
+                const dangerousTypeMember = REVIEW_TYPES.has(type) && DANGEROUS_TYPE_MEMBERS.has(member);
+                if (!member || REVIEW_MEMBERS.has(member) || dangerousTypeMember ||
                     (member === 'create' && (type === 'scriptblock' || type === 'powershell'))) {
                     diagnostics.push(diagnostic('review-required', 'DYNAMIC_EVALUATION', fact, index, member));
                 }

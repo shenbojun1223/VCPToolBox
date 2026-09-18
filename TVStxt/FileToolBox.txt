@@ -142,50 +142,21 @@ context_lines:「始」(可选) 匹配行前后显示的上下文行数，默认
 [===vcp_fold:0.5::desc:AICodeWorker Codex 代码任务执行器：仓库调查、跨文件修改、补丁生成、运行测试、异步任务提交、查结果、任务状态、执行轨迹和取消。===]
 
 ## 9. AI 代码任务执行器 (AICodeWorker)
-适合明确范围的仓库调查、复杂改码和测试；不替代简单文件读写。以下按当前 manifest v1.13.0 核准，实际 Worker、路由开关、模型能力、白名单和额度以 capabilities 为准；说明冲突时读取当前 manifest，不按旧记忆猜测。
+基于 OpenAI Codex CLI 的专用代码工程调度中心（全面停用 OpenCode、Antigravity 等 legacy worker）。
+配置、参数、额度与路由以 `Plugin/AICodeWorker/plugin-manifest.json` 为唯一真相源。
 
-### 调用顺序与最小参数
-以下是参数示例，调用时使用标准 VCP 工具请求格式；不是自动执行指令。
-
-先查询能力（可传 model 核对拟用模型）：
-tool_name:「始」AICodeWorker「末」,
-command:「始」capabilities「末」,
-worker:「始」codex「末」,
-responseMode:「始」compact「末」
-
-提交任务：
-tool_name:「始」AICodeWorker「末」,
-command:「始」run「末」,
-worker:「始」codex「末」,
-projectPath:「始」<白名单内的原项目 Git 仓库根>「末」,
-task:「始」<目标；必要背景；相对文件范围；禁止事项；验收命令；交付要求>「末」,
-mode:「始」analyze「末」,
-fastMode:「始」false「末」,
-traceMode:「始」summary「末」,
-timeoutSec:「始」600「末」
-
-- mode 按任务选 analyze / patch / write，上例 analyze 只读，不会改文件。projectPath 不是待改文件的子目录。
-- task 必须自包含，不假设 Worker 看过聊天或 RAG；不注入凭据。按任务预算设置 timeoutSec，长回归单独安排并保留日志与退出码。
-- 每次显式 worker=codex，省略会默认 opencode。Codex run/run_and_wait 显式 fastMode=false；仅用户对本任务明确授权 Fast 时设 true，“尽快/继续/并发”不算授权。省略、null、空值是继承配置，不是关闭。
-- 目标、路径、验收均明确的机械实现任务，按本部署规范传 model=gpt-5.6-luna、reasoningEffort=max；先用 capabilities 针对该模型核验。架构判断、需求不清或独立审查不因 write 模式就套用 Luna。能力不符报告，不静默换模型。
-- reasoningEffort 由实际模型动态校验，max 不等于 Fast；ultra 不作默认，需单独明确授权。不擅自改用其他 Worker。
-
-### 异步查询与异常处理
-- 默认 run；取得成功提交及 jobId 后结束当轮，不自动连续轮询。用户要求查结果或继续时单次 query。仅用户明确要求同步等待才用 run_and_wait。
-- 查状态：tool_name=AICodeWorker, command=query, worker=codex, jobId=<原ID>, wait=false, responseMode=compact。
-- compact 不含完整正文或轨迹；验收需要报告时，同一 jobId 查询 responseMode=full。
-- 查轨迹：command=trace, jobId=<原ID>, traceMode=events；summary/events/raw 按需选择，默认不要灌入 raw 全轨迹。
-- 历史：command=listJobs。取消：command=cancel, jobId=<明确目标ID>；取消后核实状态与所有权已收敛，不能把单次取消回执当作清理完成。
-- 中断、超时或提交结果 unknown，先查原 jobId 与落盘证据；没有 jobId 则核对历史任务，不能盲目重发。禁止全局杀同名进程。
-- 并发、占槽与路由状态以实时 capabilities 为准；模型停止输出不代表名额已释放。超额拒绝时不要循环重试。
-
-### 模式与候选交付边界
-- analyze：只读分析。
-- app-server patch：要求干净 Git 根；仅为已有 tracked 普通文件生成并验证 diff 制品，不自动应用。create/delete/rename/mode/binary/submodule 不支持，制品上限 512 KiB。
-- app-server write：要求干净 Git 根，从基线建立受控 Worktree；任务书写相对路径，不把原工作区绝对路径当写入目标。原项目有未提交、暂存或未忽略的新文件时会拒绝，不擅自 stash/clean。
-- candidateAvailable、resultCommit、worktreePath 表示候选交付，不是原仓库已经修改。候选默认保留，应用、merge、cherry-pick、push、清理按用户授权另行处理，不删除唯一候选。
-- 已选 app-server 路由失败或 unknown 不回退、不重放；对应开关关闭时可能走 legacy，不能把 Worktree 语义泛化到所有路由。不自动重启服务。
-- 不覆盖 sandbox、approval、env 或可信验证命令，不用 danger-full-access；Worktree 不是 OS 安全边界。不传 Codex sessionId；当前 app-server 任务不支持附件。
-
-### 主 Agent 验收
-检查实际产物/候选 diff、修改范围、测试命令和退出码；不能只转述 Worker 自报完成。固定静态检查不替代项目功能测试。明确区分“分析完成”“补丁已生成”“候选已生成”和“已获授权应用到原仓库”。
+### 核心选型与门禁铁律（一票否决制）
+1. **模式选型**：
+   - **analyze（只读分析）**：架构测绘、调用链排查、影响面评估。read-only 沙箱，绝不改动任何文件。
+   - **app-server patch（单/少文件微调）**：仅限已有 tracked 普通文件极小改动。**严禁**用于新增文件、删除文件、重命名或二进制文件；diff 上限 512 KiB。
+   - **app-server write（新建/重构/实现主力通道）**：**凡涉及新建文件（如补写测试、新建模块）、删除、重构、多文件联动，必须直接走 write**（基于干净 Git 根创建独立受控 Git Worktree，生成 Candidate Commit）。
+2. **模型选型**：
+   - **deepseek-flash（高通量搬砖首选）**：已通过 Profile 隔离直连接入 Codex（wire_api=responses，1M 上下文，支持 low/high/max）。**生成响应极快、指令遵循与代码执行高度精准，极其适合承接大量流水线代码搬砖、批量实现、文件迁移与单测补齐等高通量工程任务**。
+   - **gpt-5.6-luna（reasoningEffort=max）**：官方机械搬砖与深度推理实现模型，适用于与 ChatGPT 生态绑定的复杂实现。架构决策与模糊排查另行按需选型（如 sol）。
+3. **调度纪律**：
+   - 必须显式指定 `worker=codex`；默认显式 `fastMode=false`（请求 Standard 档），未获明确授权严禁私开 Fast。
+   - app-server 共享总额度 3（Write 最多 2），超额拒绝不排队。
+   - 默认 `command=run`，取得 jobId 后立即结束当轮会话释放心流，**严禁借助心流心跳（Flowlock）轮询后台任务**；用户要求继续时单次 `command=query, wait=false, responseMode=compact` 查询。
+4. **前端双模态协同与交付规范**：
+   - VCPChat 已上线伴随检查器抽屉（右上角）与独立全屏工作台（TabBar），用户可直接实时观测 Trace 与可视化 Diff。
+   - **任务验收后严禁在聊天视窗倾倒全量 Diff 或终端日志**；交付标准格式为：核心改动摘要 + 验证命令与退出码 + Candidate Commit SHA，并引导用户在侧栏/工作台中一键审查。

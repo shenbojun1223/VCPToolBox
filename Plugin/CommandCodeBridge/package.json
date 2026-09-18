@@ -1,0 +1,33 @@
+{
+  "name": "@mmmbuto/zai-codex-bridge",
+  "version": "0.4.9",
+  "description": "Local proxy that translates OpenAI Responses API format to Z.AI Chat Completions format for Codex",
+  "main": "src/server.js",
+  "bin": {
+    "zai-codex-bridge": "bin/zai-codex-bridge"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node scripts/test-curl.js",
+    "test:curl": "node scripts/test-curl.js",
+    "release:patch": "node scripts/release-patch.js"
+  },
+  "keywords": [
+    "codex",
+    "zai",
+    "glm",
+    "proxy",
+    "openai",
+    "responses-api",
+    "chat-completions"
+  ],
+  "author": "Davide A. Guglielmi",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DioNanos/zai-codex-bridge.git"
+  }
+}

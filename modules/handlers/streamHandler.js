@@ -69,7 +69,7 @@ class StreamHandler {
     const parsedMaxRecursion = Number.parseInt(maxVCPLoopStream, 10);
     const maxRecursion = Number.isFinite(parsedMaxRecursion) && parsedMaxRecursion > 0
       ? parsedMaxRecursion
-      : 12;
+      : 20;
     let currentAIContentForLoop = '';
     let chatLogs = [];
     let oneRingAssistantTurnParts = [];
@@ -777,6 +777,18 @@ class StreamHandler {
 
       recursionDepth++;
     } // toolcall loop end
+
+    // ★ 熔断收口前，将尾部未闭合的 VCP 工具块残片从 OneRing 记忆流中剥除，
+    //   防止残片进入 Agent 长期记忆并污染未来的 RAG 检索。
+    if (recursionDepth >= maxRecursion && oneRingAssistantTurnParts.length > 0) {
+      try {
+        const { sanitizeContent } = require('../vcpLoop/historySanitizer.js');
+        const lastIdx = oneRingAssistantTurnParts.length - 1;
+        oneRingAssistantTurnParts[lastIdx] = sanitizeContent(oneRingAssistantTurnParts[lastIdx]);
+      } catch (sanitizeErr) {
+        if (DEBUG_MODE) console.warn('[VCP Stream Loop] Final turn sanitize failed:', sanitizeErr.message);
+      }
+    }
 
     if (writeChatLog) writeChatLog(originalBody, chatLogs);
     recordOneRingAIResponse(oneRingAssistantTurnParts.join('\n'), 'final_turn');

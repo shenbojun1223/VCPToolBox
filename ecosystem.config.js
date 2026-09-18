@@ -15,9 +15,14 @@ module.exports = {
       script: 'server.js',
       watch: false,
       // 不设置 max_memory_restart：允许主服务按系统可用内存自然增长。
+      // 临时性能诊断: 生成 CPU Profile (仅进程退出时写出)
+      node_args: ['--cpu-prof', '--cpu-prof-dir=./DebugLog/cpuprof', '--cpu-prof-name=vcp-main.cpuprofile'],
       kill_timeout: 15000,
       env: {
-        NODE_ENV: 'production'
+        NODE_ENV: 'production',
+        UV_THREADPOOL_SIZE: '16',
+        MaxVCPLoopStream: '20',
+        MaxVCPLoopNonStream: '20'
       }
     },
     {

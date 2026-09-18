@@ -871,6 +871,19 @@ class ChatCompletionHandler {
 
       await writeDebugLog('LogInput', originalBody);
 
+      // ★ 入口历史净化：剥除历史消息中尾部未闭合的 VCP 工具块残片。
+      //   防御路径：上一轮 MaxVCPLoopStream 熔断时，未闭合的 TOOL_REQUEST 语法
+      //   被流式透传并落盘到 history.json，如果不在入口净化，会被重新送入模型
+      //   上下文，引发 Attention 撕裂与 ToolCallParser 幽灵解析。
+      if (Array.isArray(originalBody.messages)) {
+        try {
+          const { sanitizeHistoryMessages } = require('./vcpLoop/historySanitizer.js');
+          sanitizeHistoryMessages(originalBody.messages, { debugMode: DEBUG_MODE });
+        } catch (sanitizeErr) {
+          if (DEBUG_MODE) console.warn('[ChatCompletionHandler] History sanitize failed:', sanitizeErr.message);
+        }
+      }
+
       const vcpToolUseForbidden = consumeVcpToolUseForbiddenPlaceholder(originalBody.messages);
       if (vcpToolUseForbidden && DEBUG_MODE) {
         console.log(`[VCPToolUse] Detected ${VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER} in top-level system prompt. Tool parsing/execution is disabled for this request.`);
