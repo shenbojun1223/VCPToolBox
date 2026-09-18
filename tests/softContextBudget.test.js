@@ -252,7 +252,9 @@ test('real finalContextStore returns this snapshot count, including attachments;
     assert(!a.includes('赞妮'));
     assert(!a.includes('C:\\VCP\\VCPToolBox'));
     for (const text of ['自然安全断点', '用户明确确认', 'DailyNote',
-      'TopicSponsor', 'CreateFlowlockTopic', 'ServerFileOperator.ReadFile',
+      '客户端插件TopicSponsor', '不是服务端插件', '客户端FileOperator',
+      'VCPDistributedServer/Plugin/TopicSponsor/plugin-manifest.json',
+      'CreateFlowlockTopic', 'ServerFileOperator.ReadFile',
       '创建成功不等于接管成功', '本预警不进入原始聊天历史']) {
       assert(a.includes(text), `guide must contain ${text}`);
     }
@@ -273,9 +275,10 @@ test('DOM confirmation stays self-contained after the transient guide is gone', 
     for (const text of ['确认执行跨话题交接', '既有授权任务', '当前Agent',
       '记忆目录规则', 'DailyNote create', 'Date/Content/Tag', '证据/限制',
       '无凭据', '禁用no_reply', '成功回执', 'folder/fileName',
-      '已核实根目录', '绝对路径', 'TopicSponsor.CreateFlowlockTopic',
+      '已核实根目录', '绝对路径', '客户端插件',
+      'tool_name=TopicSponsor', 'command=CreateFlowlockTopic',
       'maid=', 'topic_name', 'initial_message', 'flowlock_heartbeat=15',
-      'flowlock_prompt', 'manifest', 'ServerFileOperator.ReadFile',
+      'flowlock_prompt', 'ServerFileOperator.ReadFile',
       '复述核验', '停止推进及心跳', '分别验收', '结果不明即停',
       '保留交接单', '不重建不全库搜索', '手动新建口令', '提供正文']) {
       assert(clickMessage.includes(text), `standalone confirmation must contain ${text}`);
@@ -299,5 +302,37 @@ test('250000 configured boundary still warns once with the generic guide', () =>
     assert.strictEqual(outgoing[0], messages[0]);
     assert.strictEqual(outgoing[1], messages[1]);
     assert.strictEqual(append(messages, identity(), 250001), messages);
+  });
+});
+
+test('handoff embeds usable client tool parameters without a routine manifest lookup', (t) => {
+  withBudget('250000', () => {
+    const notice = createSoftContextBudget()(messages, identity(), 250000)[2].content;
+    for (const text of [
+      '正常调用直接采用下列字段，无需先查manifest',
+      'tool_name: TopicSponsor', 'command: CreateFlowlockTopic',
+      'maid: <当前Agent中文名>', 'topic_name: <本次交接话题标题>',
+      'initial_message: 请先用ServerFileOperator.ReadFile',
+      'flowlock_heartbeat: 15', 'flowlock_prompt: 先读取',
+      '旧话题最终回复完整落盘后由客户端认领'
+    ]) {
+      assert(notice.includes(text), `inline guide must contain ${text}`);
+    }
+    const match = notice.match(/data-send="([^"]+)"/);
+    assert(match);
+    const payload = match[1];
+    assert(!payload.includes('manifest'), 'confirmation must not require routine tool discovery');
+    for (const text of [
+      'tool_name=TopicSponsor', 'command=CreateFlowlockTopic',
+      'maid=当前Agent', 'topic_name=交接标题', 'flowlock_heartbeat=15',
+      'initial_message填交接单绝对路径及接管指令',
+      'flowlock_prompt填先用ServerFileOperator.ReadFile',
+      '复述核验', '既有授权'
+    ]) {
+      assert(payload.includes(text), `standalone invocation must contain ${text}`);
+    }
+    const wrappedLength = `[[点击按钮:${payload}]]`.length;
+    assert(wrappedLength <= 500, `click wrapper too long: ${wrappedLength}`);
+    t.diagnostic(`confirmation=${payload.length}; wrapped=${wrappedLength}; limit=500`);
   });
 });

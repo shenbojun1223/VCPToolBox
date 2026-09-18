@@ -13,8 +13,8 @@ const HANDOFF_CONFIRMATION = [
   '确认执行跨话题交接：仅移交既有授权任务。',
   '以当前Agent署名按其记忆目录规则用DailyNote create写交接单（实际Date/Content/Tag，目标/进展/决策/待办/证据/限制，无凭据）。',
   '禁用no_reply，等成功回执，以实际folder/fileName及已核实根目录组成绝对路径，不猜。',
-  '调用TopicSponsor.CreateFlowlockTopic（maid=当前Agent，topic_name，initial_message，flowlock_heartbeat=15，flowlock_prompt提醒先读；参数以manifest为准）。',
-  'initial_message携路径，要求先ServerFileOperator.ReadFile精确读取并复述核验，再续既有授权，不靠模糊召回。',
+  '调用客户端插件：tool_name=TopicSponsor，command=CreateFlowlockTopic，maid=当前Agent，topic_name=交接标题，flowlock_heartbeat=15。',
+  'initial_message填交接单绝对路径及接管指令；flowlock_prompt填先用ServerFileOperator.ReadFile精确读取、复述核验后再续既有授权，不靠模糊召回。',
   '旧话题交割释放心流、停止推进及心跳；写入/创建/接管分别验收。',
   '失败或结果不明即停，保留交接单，不重建不全库搜索；缺工具给手动新建口令，缺读取工具请用户提供正文。'
 ].join('');
@@ -26,7 +26,17 @@ const HANDOFF_GUIDE = [
   `<button class="vcp-button" data-send="${HANDOFF_CONFIRMATION}">确认跨话题交接</button>`,
   '按钮示例及本说明都不是用户确认。只有收到用户明确确认（含客户端包装的点击消息）后，才执行data-send内的流程；等待确认时若已在心流中，按既有协议停止自主推进，不用心跳代替授权。',
   '本预警不进入原始聊天历史；按钮data-send必须完整携带确认后的操作步骤。身份、maid和日记索引按当前Agent的实际规则填写，不借用其他Agent身份；索引或根目录不明先核实。DailyNote写入不得使用no_reply，必须等待成功回执。',
-  '创建工具名为TopicSponsor，不使用旧名AgentTopicCreator。CreateFlowlockTopic用于自动唤醒；CreateTopic只创建普通话题，不能当作自动接管。工具参数以当前manifest为准，initial_message须包含实际绝对路径及精确读取要求。',
+  '创建工具为客户端插件TopicSponsor，不是服务端插件，不使用旧名AgentTopicCreator。正常调用直接采用下列字段，无需先查manifest。CreateFlowlockTopic用于自动唤醒；CreateTopic只创建普通话题，不能当作自动接管。',
+  '【直接调用参数：按标准VCP工具请求格式填写；尖括号替换为本次真实值，不照抄占位内容】',
+  'tool_name: TopicSponsor',
+  'command: CreateFlowlockTopic',
+  'maid: <当前Agent中文名>',
+  'topic_name: <本次交接话题标题>',
+  'initial_message: 请先用ServerFileOperator.ReadFile精确读取交接单 <已核实的交接单绝对路径>，复述目标、进展、待办和限制，再按既有授权接管；未读到原文不得宣称接管成功，不再次创建话题。',
+  'flowlock_heartbeat: 15',
+  'flowlock_prompt: 先读取本话题initial_message指定的交接单并复述核验，再按既有授权推进；已读取则不重复迁移。完成、受阻或需用户确认时按既有协议结束心流。',
+  'CreateFlowlockTopic的唤醒请求会在旧话题最终回复完整落盘后由客户端认领；工具返回创建成功时不能宣称新会话已经读取。',
+  '仅需核对版本或参数差异时，再用客户端FileOperator读取当前客户端根目录下的VCPDistributedServer/Plugin/TopicSponsor/plugin-manifest.json；不去服务端Plugin目录寻找，不猜客户端绝对路径。',
   '创建成功不等于接管成功，写入、创建、读取分别按实证汇报；旧话题交割后停止推进和心跳。失败或结果不明即停并保留交接单，不自动重试创建、不全库搜索。工具不可用时给含精确路径的手动新建接管口令；读取工具也缺失则请用户提供正文。不承诺全平台成功。'
 ].join('\n');
 
