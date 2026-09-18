@@ -320,3 +320,6 @@ Plugin/VCPQQBotServer/bot-node-sdk-main
 *.bak-*
 *.bak.*
 *.backup-*
+
+# Local repository inspection helper; retain on disk only.
+/_read_section.js
