@@ -264,8 +264,27 @@ async function testWatchdogAndLoopback() {
   });
 }
 
-function runCpuFixture(directory) {
+async function runCpuFixture(directory) {
   const samplerPath = path.join(repoRoot, 'modules', 'diagnostics', 'cpuSampler.js');
+  const samplingCallsPath = path.join(directory, 'sampling-intervals.jsonl');
+  const preloadPath = path.join(directory, 'inspector-unit-check.cjs');
+  // Test-only preload is inherited by the sampler Worker. Observe the actual
+  // Inspector command and reject unsafe units before profiling can start.
+  await fsp.writeFile(preloadPath, `
+    'use strict';
+    const fs = require('fs');
+    const inspector = require('inspector');
+    const originalPost = inspector.Session.prototype.post;
+    inspector.Session.prototype.post = function(method, params, callback) {
+      if (method === 'Profiler.setSamplingInterval') {
+        fs.appendFileSync(${JSON.stringify(samplingCallsPath)}, JSON.stringify({ interval: params.interval }) + '\\n');
+        if (params.interval !== 5000) {
+          throw new Error('Expected 5000 microseconds for the 5 millisecond fixture');
+        }
+      }
+      return Reflect.apply(originalPost, this, arguments);
+    };
+  `, 'utf8');
   const code = `
     const { createCpuSampler } = require(${JSON.stringify(samplerPath)});
     function diagnosticMainThreadBusyLoop() {
@@ -282,7 +301,7 @@ function runCpuFixture(directory) {
     })().catch(() => { process.exitCode = 1; });
   `;
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['-e', code], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, ['--require', preloadPath, '-e', code], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
     const collect = chunk => {
       output += chunk.toString();
@@ -309,6 +328,13 @@ function runCpuFixture(directory) {
 async function testCpuSampler() {
   await withTempDirectory('vcp-diagnostics-cpu-', async directory => {
     await runCpuFixture(directory);
+    const samplingCalls = (await fsp.readFile(path.join(directory, 'sampling-intervals.jsonl'), 'utf8'))
+      .split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+    assert.ok(samplingCalls.length >= 1, 'fixture must observe the actual Inspector sampling command');
+    for (const call of samplingCalls) {
+      assert.strictEqual(call.interval, 5000, 'Inspector takes microseconds: 5 ms must be sent as 5000 us');
+    }
+    console.log('CPU sampling unit regression: 5 ms -> 5000 us');
     const names = (await fsp.readdir(directory)).filter(name => name.endsWith('.cpuprofile'));
     assert.ok(names.length >= 1, 'CPU sampler must periodically persist at least one segment');
     assert.strictEqual(new Set(names).size, names.length, 'CPU segment names must not overwrite one another');
@@ -318,6 +344,7 @@ async function testCpuSampler() {
       assert.strictEqual(profile.diagnostics.sampleTarget, 'main-thread');
       assert.strictEqual(profile.diagnostics.targetThreadId, 'main');
       assert.strictEqual(profile.diagnostics.serviceRole, 'main');
+      assert.strictEqual(profile.diagnostics.samplingIntervalMs, 5, 'profile metadata must retain millisecond units');
       assert.strictEqual(profile.diagnostics.processPid > 0, true);
       if (profile.nodes.some(node => String(node.callFrame?.functionName || '').includes('diagnosticMainThreadBusyLoop'))) {
         foundBusyLoop = true;

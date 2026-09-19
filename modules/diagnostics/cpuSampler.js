@@ -201,7 +201,8 @@ async function runSamplerWorker(options) {
     if (stopping || profilerStarted) return false;
     try {
       await postInspector(session, 'Profiler.enable');
-      await postInspector(session, 'Profiler.setSamplingInterval', { interval: options.samplingIntervalMs });
+      // Inspector expects microseconds; configuration and profile metadata use milliseconds.
+      await postInspector(session, 'Profiler.setSamplingInterval', { interval: options.samplingIntervalMs * 1000 });
       await postInspector(session, 'Profiler.start');
       profilerStarted = true;
       sequence++;

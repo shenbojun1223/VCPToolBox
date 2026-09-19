@@ -1,6 +1,6 @@
 # VCP 故障诊断补丁
 
-本文档对应本次候选补丁。默认不产生诊断目录、不挂载诊断请求监听器、不启动 CPU sampler，也不启动 watchdog。
+本文档对应本次诊断补丁。模块在环境开关缺省时不产生诊断目录、不挂载诊断请求监听器、不启动 CPU sampler，也不启动 watchdog。部署准备后的 ecosystem 配置显式启用请求诊断和 CPU 子开关，详见下节；写入配置不代表运行进程已经加载。
 
 ## 总开关和边界
 
@@ -15,8 +15,8 @@ CPU 采样另需 `VCP_DIAGNOSTICS_CPU_ENABLED=true`，默认 `false`；watchdog 
 默认有界参数：
 
 - JSONL 队列 2048 条，单条 4 KiB；队列满只增加丢弃计数，不阻断业务。
-- 单文件 8 MiB，最多 8 个文件，总量 64 MiB；轮转只清理本功能自己生成的 `vcp-diagnostics-<role>-pid< pid >-*` 文件。
-- CPU sampler 10 ms 采样、60 秒分段、最多 8 个 profile、总量 256 MiB。安全范围分别为 2–1000 ms、1–900000 ms、1–64 段；文件名含服务角色、PID、`target-main`、时间和分段序号。
+- JSONL 单文件 8 MiB，最多 8 个文件、64 MiB 的保留预算按 **服务角色 + PID** 分别计算；只轮转该前缀的文件，不清理历次启动的其他 PID。因此 64 MiB 不是整个诊断目录的跨重启总上限，旧 PID 的证据需另行授权归档。
+- CPU sampler 配置间隔 10 ms，传给 Inspector `Profiler.setSamplingInterval` 时明确换算为 **10000 微秒**；profile 元数据继续使用毫秒。60 秒分段，每个服务角色最多保留 8 个 profile、256 MiB 预算，CPU 轮转覆盖该角色的历次 PID。配置限幅分别为 2–1000 ms、1000–900000 ms、1–64 段；文件名含服务角色、PID、`target-main`、时间和分段序号。保留预算为软限额：最新一份 profile 即使超限也保留，写入中的临时文件及元数据不计入上述预算。
 - watchdog 默认每 5 秒一次、单路 2 秒 deadline；安全范围为 1–60000 ms 和 250–10000 ms。请求不重叠，超时连接会销毁。
 
 磁盘失败、队列饱和、Inspector 不支持或 Inspector 请求超时只记录固定错误码并停止对应诊断分支，不让诊断代码改变业务响应。CPU sampler 最后一个尚未完成的分段可能丢失；它不能保证捕获 native 死锁。
@@ -83,3 +83,35 @@ $env:VCP_DIAGNOSTICS_CPU_SEGMENT_MS = '60000'
 回滚只需恢复候选代码并将 `VCP_DIAGNOSTICS_ENABLED=false`，随后按部署流程重启读取了开关的进程；本补丁不自动重启 PM2，不删除既有日志，不改变业务配置、网络分流、OneRing、Embedding 或工具循环限制。
 
 已知限制：当前故障的旧 profile 只覆盖先前时间窗，不能由本补丁回溯补齐；Inspector 停止请求若主线程同时卡在 native 层可能无法及时返回，最后分段可能未落盘；本机 watchdog 也不能单独证明公网链路状态。
+## 本部署交接：准备完成后由用户手动重启
+
+本次获授权的范围仅为代码应用和启动配置准备。Agent 不执行重启、不启动独立 watchdog、不执行 `pm2 save`。写入磁盘不证明现有进程已加载；运行验收必须在用户手动重启之后另做。
+
+本部署 `ecosystem.config.js` 对 `vcp-main` 和 `vcp-admin` 显式设置：
+
+- `node_args: []`，清除旧固定同名 `--cpu-prof` 配置。
+- 请求诊断与 CPU 子开关为 `true`，watchdog 子开关为 `false`。
+- CPU 间隔 10 ms（Inspector 实参为 10000 微秒），60 秒分段；每个服务角色保留 8 段、256 MiB 软预算。
+- JSONL 每个角色/PID 为 8 个文件、64 MiB 预算；跨重启的旧 PID 文件不自动清理。
+- 目录为 `C:/VCP/VCPToolBox/DebugLog/diagnostics`；其他业务启动参数保持原值。
+
+本次补充的采样单位回归直接拦截隔离 fixture 的实际 Inspector 调用。未修复时测试必须失败，修复后确认 `5 ms -> 5000 us`，profile 元数据仍为毫秒。该测试不启动生产采样器。
+
+用户确认当前没有需要保留的在途请求后，在服务器 PowerShell 中执行：
+
+```powershell
+Set-Location 'C:\VCP\VCPToolBox'
+pm2 restart .\ecosystem.config.js --only "vcp-main,vcp-admin" --update-env
+```
+
+这里必须把 **ecosystem 文件路径** 传给 PM2，让本部署 PM2 6.0.14 的配置加载路径传递 `current_conf`，同步更新 `env` 和 `node_args`；不要替换为仅按进程名重启。命令失败时保留错误输出，不连续重试或执行 `restart all`。
+
+重启后仍需核验：
+
+1. 两个目标进程的 PID/启动时间更新，实际启动参数不含 `--cpu-prof`，诊断开关与配置一致。
+2. 主服务 `6005` 的 `/__vcp_diag/health`、Admin `6006` 的 `/__vcp_diag/health` 和 `/__vcp_diag/proxy-health` 均能在真实 loopback 请求下正常返回。
+3. 等待至少一个 60 秒采样周期，确认 main/admin 的 `target-main` 分段文件及 JSONL 正常落盘；核对采样元数据 `samplingIntervalMs=10` 和时间窗。
+4. 未经再次授权，不启动持续 watchdog。单次健康验收也应明确与“已经运行持续监测”区分。
+5. 全部运行验收通过后，再决定是否保存 PM2 进程清单，不能在本次准备阶段执行 `pm2 save`。
+
+若需停用，先把目标服务配置中的 `VCP_DIAGNOSTICS_ENABLED` 和 `VCP_DIAGNOSTICS_CPU_ENABLED` 均改为 `'false'`，保留 `node_args: []`，再由用户执行同一条按配置文件重启命令。不要仅删除变量或假定旧 PM2 环境会自动清空，也不要删除诊断证据或自动做 Git 硬回滚。任何恢复旧源码的操作需先核对当前差异并单独授权。
