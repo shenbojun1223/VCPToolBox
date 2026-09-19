@@ -410,7 +410,7 @@ function applyModelFallbackForAttempt(options, candidates, attemptIndex, debugMo
 async function fetchWithRetry(
   url,
   options,
-  { retries = 3, delay = 1000, debugMode = false, onRetry = null, connectionTimeout = 900000, modelFallbackCandidates = null } = {},
+  { retries = 3, delay = 1000, debugMode = false, onRetry = null, onRequestSent = null, onResponseHeaders = null, connectionTimeout = 900000, modelFallbackCandidates = null } = {},
 ) {
   const { default: fetch } = await import('node-fetch');
   const maxAttempts = Math.max(
@@ -446,12 +446,27 @@ async function fetchWithRetry(
 
     try {
       const attemptOptions = applyModelFallbackForAttempt(options, modelFallbackCandidates, i, debugMode);
+      if (typeof onRequestSent === 'function') {
+        try {
+          onRequestSent();
+        } catch (_) {
+          // Diagnostic callbacks are observational and cannot alter the request.
+        }
+      }
       const response = await fetch(url, {
         ...attemptOptions,
         agent: getFetchAgent, // 注入防御性长连接池
         signal: attemptController.signal,
       });
       cleanup();
+
+      if (typeof onResponseHeaders === 'function') {
+        try {
+          onResponseHeaders(response.status);
+        } catch (_) {
+          // Diagnostic callbacks are observational and cannot alter the request.
+        }
+      }
 
       let shouldRetryStatus = response.status === 500 || response.status === 503 || response.status === 429;
       let retryMessage = response.statusText;
@@ -730,6 +745,22 @@ class ChatCompletionHandler {
     };
 
     let clientIp = normalizeClientIp(req.ip);
+
+    const requestDiagnostic = req.__vcpDiagnostics;
+    if (requestDiagnostic) requestDiagnostic.stage('preprocess_start');
+    const observedFetchWithRetry = requestDiagnostic
+      ? (url, options, retryOptions = {}) => fetchWithRetry(url, options, {
+        ...retryOptions,
+        onRequestSent: () => {
+          requestDiagnostic.stage('upstream_request_sent');
+          if (typeof retryOptions.onRequestSent === 'function') retryOptions.onRequestSent();
+        },
+        onResponseHeaders: status => {
+          requestDiagnostic.stage('upstream_response_headers', status);
+          if (typeof retryOptions.onResponseHeaders === 'function') retryOptions.onResponseHeaders(status);
+        }
+      })
+      : fetchWithRetry;
 
     const id = req.body.requestId || req.body.messageId;
     let originalBody = req.body;
@@ -1194,7 +1225,9 @@ class ChatCompletionHandler {
 
       await writeDebugLog('LogOutputAfterProcessing', finalUpstreamBody);
 
-      let firstAiAPIResponse = await fetchWithRetry(
+      if (requestDiagnostic) requestDiagnostic.stage('preprocess_end');
+
+      let firstAiAPIResponse = await observedFetchWithRetry(
         `${apiUrl}/v1/chat/completions`,
         {
           method: 'POST',
@@ -1319,7 +1352,7 @@ class ChatCompletionHandler {
         clientIp,
         forceShowVCP,
         _refreshRagBlocksIfNeeded,
-        fetchWithRetry,
+        fetchWithRetry: observedFetchWithRetry,
         isToolResultError,
         formatToolResult,
         vcpToolUseForbidden,
@@ -1339,6 +1372,7 @@ class ChatCompletionHandler {
       }
     } catch (error) {
       if (error.name === 'AbortError') {
+        requestDiagnostic?.error('aborted', res.statusCode);
         // 显式 /v1/interrupt 或客户端断联都会走到这里。
         // 如果是客户端断联，响应通道通常已经不可写；如果是显式 interrupt，则由 interrupt 路由负责关闭响应流。
         // 这里仅停止后续处理，避免与中止链路竞态写入。
@@ -1346,6 +1380,10 @@ class ChatCompletionHandler {
         console.log(`[Abort] Caught AbortError for request ${id}. Execution halted. reason=${abortReason}`);
         return; // Stop processing and allow the 'finally' block to clean up.
       }
+      const diagnosticErrorCode = error?.code === 'UND_ERR_HEADERS_TIMEOUT'
+        ? 'upstream_timeout'
+        : 'handler_error';
+      requestDiagnostic?.error(diagnosticErrorCode, res.statusCode || 500);
       // Only log full stack trace for non-abort errors
       console.error('处理请求或转发时出错:', error.message, error.stack);
 

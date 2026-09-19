@@ -15,8 +15,9 @@ module.exports = {
       script: 'server.js',
       watch: false,
       // 不设置 max_memory_restart：允许主服务按系统可用内存自然增长。
-      // 临时性能诊断: 生成 CPU Profile (仅进程退出时写出)
-      node_args: ['--cpu-prof', '--cpu-prof-dir=./DebugLog/cpuprof', '--cpu-prof-name=vcp-main.cpuprofile'],
+      // CPU 诊断默认关闭；按 docs/DIAGNOSTICS.md 受控启用内置 Worker sampler。
+      // 不再使用固定同名 --cpu-prof，避免与分段主线程采样并行或覆盖。
+      node_args: [],
       kill_timeout: 15000,
       env: {
         NODE_ENV: 'production',

@@ -11,6 +11,12 @@ const { promises: fs, existsSync } = require("fs");
 const http = require("http");
 const basicAuth = require("basic-auth");
 const cors = require("cors");
+const {
+  RequestDiagnostics,
+  classifyAdminRoute,
+  isLoopbackSocket,
+} = require("./modules/diagnostics/requestDiagnostics.js");
+const { createCpuSampler } = require("./modules/diagnostics/cpuSampler.js");
 
 const MAIN_PORT = parseInt(process.env.PORT) || 3000;
 const ADMIN_PORT = MAIN_PORT + 1;
@@ -52,9 +58,112 @@ const NO_CREDENTIAL_BLOCK_DURATION = 15 * 60 * 1000; // 无凭据DDoS触发封�
 const app = express();
 app.set("trust proxy", true);
 app.use(cors({ origin: "*" }));
+const adminDiagnostics = new RequestDiagnostics({
+  role: "admin",
+  rootDir: __dirname,
+});
+let adminCpuSampler = null;
+
+// 必须在 body parser 之前生成服务端诊断 ID；此 middleware 不读取或记录正文。
+app.use(adminDiagnostics.middleware({ routeClassifier: classifyAdminRoute }));
 app.use(express.json({ limit: "300mb" }));
 app.use(express.urlencoded({ limit: "300mb", extended: true }));
 app.use(express.text({ limit: "300mb", type: "text/plain" }));
+app.use((req, res, next) => {
+  adminDiagnostics.markBodyParsed(req, req.body);
+  next();
+});
+
+// 仅供受控的本机 watchdog 使用；loopback 判断只看真实 socket 对端。
+app.get("/__vcp_diag/health", (req, res, next) => {
+  if (!adminDiagnostics.enabled || !isLoopbackSocket(req)) return next();
+  return res.status(200).json({ status: "ok" });
+});
+
+// 固定目标的 Admin→main 探测，不接受 URL、query 或转发目标输入。
+app.get("/__vcp_diag/proxy-health", (req, res, next) => {
+  if (!adminDiagnostics.enabled || !isLoopbackSocket(req)) return next();
+
+  const diagnosticContext = req.__vcpDiagnostics;
+  diagnosticContext?.markProxyStarted();
+  diagnosticContext?.stageOnce("local_processing_end", "local_processing_end");
+  const proxyReq = http.request(
+    {
+      host: "127.0.0.1",
+      port: MAIN_PORT,
+      method: "GET",
+      path: "/__vcp_diag/health",
+      headers: { Accept: "application/json" },
+    },
+    (proxyRes) => {
+      diagnosticContext?.stage("proxy_response_headers", proxyRes.statusCode);
+      proxyRes.resume();
+      armBodyDeadline();
+      proxyRes.on("data", armBodyDeadline);
+      proxyRes.once("end", () => {
+        if (bodyDeadline) clearTimeout(bodyDeadline);
+        settled = true;
+        if (proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
+          return res.status(200).json({ status: "ok" });
+        }
+        return res.status(502).json({ status: "error" });
+      });
+    }
+  );
+  let settled = false;
+  let bodyDeadline = null;
+  const deadline = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    diagnosticContext?.stageOnce("proxy_timeout", "proxy_timeout", 504, "proxy_timeout");
+    proxyReq.destroy();
+    if (!res.headersSent) res.status(504).json({ status: "error" });
+  }, 1500);
+  deadline.unref?.();
+  const armBodyDeadline = () => {
+    if (bodyDeadline) clearTimeout(bodyDeadline);
+    bodyDeadline = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      diagnosticContext?.stageOnce("proxy_timeout", "proxy_timeout", 504, "proxy_timeout");
+      proxyReq.destroy();
+      if (!res.headersSent) res.status(504).json({ status: "error" });
+    }, 1500);
+    bodyDeadline.unref?.();
+  };
+  proxyReq.once("error", () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(deadline);
+    if (bodyDeadline) clearTimeout(bodyDeadline);
+    diagnosticContext?.stageOnce("proxy_error", "proxy_error", 502, "proxy_error");
+    if (!res.headersSent) res.status(502).json({ status: "error" });
+  });
+  proxyReq.once("response", () => {
+    clearTimeout(deadline);
+  });
+  diagnosticContext?.stage("proxy_request_sent");
+  proxyReq.end();
+});
+
+function beginAdminProxyDiagnostics(req) {
+  const context = req.__vcpDiagnostics;
+  context?.markProxyStarted();
+  context?.stageOnce("local_processing_end", "local_processing_end");
+  return context;
+}
+
+function markAdminProxySent(context) {
+  context?.stage("proxy_request_sent");
+}
+
+function markAdminProxyHeaders(context, status) {
+  context?.stage("proxy_response_headers", status);
+}
+
+function markAdminProxyFailure(context, phase, status, errorCode) {
+  context?.stageOnce(`admin_${phase}`, phase, status, errorCode);
+}
 
 // ============================================================
 // Admin Authentication Middleware (从 server.js 复制并精简)
@@ -397,6 +506,7 @@ for (const moduleName of localModules) {
 // 若由本地 routes/admin/system.js 处理会只能返回空 profile；必须在 localAdminRouter 前转发。
 // ============================================================
 app.get("/admin_api/system-monitor/memory/profile", async (req, res) => {
+  const diagnosticContext = beginAdminProxyDiagnostics(req);
   if (DEBUG_MODE)
     console.log(
       "[AdminServer] Memory profile request received — forwarding to main process..."
@@ -413,6 +523,7 @@ app.get("/admin_api/system-monitor/memory/profile", async (req, res) => {
       timeout: 10000,
     },
     (profileRes) => {
+      markAdminProxyHeaders(diagnosticContext, profileRes.statusCode);
       let body = "";
 
       profileRes.on("data", (chunk) => {
@@ -444,6 +555,7 @@ app.get("/admin_api/system-monitor/memory/profile", async (req, res) => {
   );
 
   profileReq.on("error", (err) => {
+    markAdminProxyFailure(diagnosticContext, "proxy_error", 502, "proxy_error");
     console.error(
       `[AdminServer] Failed to forward memory profile request to main process: ${
         err.code || err.message
@@ -459,6 +571,7 @@ app.get("/admin_api/system-monitor/memory/profile", async (req, res) => {
   });
 
   profileReq.on("timeout", () => {
+    markAdminProxyFailure(diagnosticContext, "proxy_timeout", 504, "proxy_timeout");
     profileReq.destroy();
     if (!res.headersSent) {
       res.status(504).json({
@@ -468,6 +581,7 @@ app.get("/admin_api/system-monitor/memory/profile", async (req, res) => {
     }
   });
 
+  markAdminProxySent(diagnosticContext);
   profileReq.end();
 });
 
@@ -475,6 +589,7 @@ app.get("/admin_api/system-monitor/memory/profile", async (req, res) => {
 // 🧹 Tag 一致性预检/执行必须代理到持有 KnowledgeBaseManager 的主服务。
 // ============================================================
 function proxyTagConsistencyRequest(req, res, endpoint, timeoutMs) {
+  const diagnosticContext = beginAdminProxyDiagnostics(req);
   const targetPath = `/admin_api/${endpoint}`;
   console.log(
     `[AdminServer] Tag consistency request received — forwarding ${targetPath} to main process...`
@@ -492,6 +607,7 @@ function proxyTagConsistencyRequest(req, res, endpoint, timeoutMs) {
       timeout: timeoutMs,
     },
     (proxyRes) => {
+      markAdminProxyHeaders(diagnosticContext, proxyRes.statusCode);
       let body = "";
       proxyRes.on("data", (chunk) => {
         body += chunk;
@@ -520,6 +636,7 @@ function proxyTagConsistencyRequest(req, res, endpoint, timeoutMs) {
   );
 
   proxyReq.on("error", (error) => {
+    markAdminProxyFailure(diagnosticContext, "proxy_error", 502, "proxy_error");
     console.error(
       `[AdminServer] Failed to forward ${targetPath}: ${
         error.code || error.message
@@ -534,6 +651,7 @@ function proxyTagConsistencyRequest(req, res, endpoint, timeoutMs) {
     }
   });
   proxyReq.on("timeout", () => {
+    markAdminProxyFailure(diagnosticContext, "proxy_timeout", 504, "proxy_timeout");
     proxyReq.destroy();
     if (!res.headersSent) {
       res.status(504).json({
@@ -545,6 +663,7 @@ function proxyTagConsistencyRequest(req, res, endpoint, timeoutMs) {
   if (req.method !== "GET" && req.method !== "HEAD") {
     proxyReq.write(JSON.stringify(req.body || {}));
   }
+  markAdminProxySent(diagnosticContext);
   proxyReq.end();
 }
 
@@ -581,6 +700,7 @@ app.post("/admin_api/rag-tag-consistency/apply", (req, res) => {
 // 因此该运行态端点必须在 localAdminRouter 之前转发到主进程。
 // ============================================================
 app.post("/admin_api/rag-active-full-training", async (req, res) => {
+  const diagnosticContext = beginAdminProxyDiagnostics(req);
   console.log(
     "[AdminServer] Active full training request received — forwarding to main process..."
   );
@@ -597,6 +717,7 @@ app.post("/admin_api/rag-active-full-training", async (req, res) => {
       timeout: 10000,
     },
     (trainingRes) => {
+      markAdminProxyHeaders(diagnosticContext, trainingRes.statusCode);
       let body = "";
 
       trainingRes.on("data", (chunk) => {
@@ -628,6 +749,7 @@ app.post("/admin_api/rag-active-full-training", async (req, res) => {
   );
 
   trainingReq.on("error", (err) => {
+    markAdminProxyFailure(diagnosticContext, "proxy_error", 502, "proxy_error");
     console.error(
       `[AdminServer] Failed to forward active full training request to main process: ${
         err.code || err.message
@@ -643,6 +765,7 @@ app.post("/admin_api/rag-active-full-training", async (req, res) => {
   });
 
   trainingReq.on("timeout", () => {
+    markAdminProxyFailure(diagnosticContext, "proxy_timeout", 504, "proxy_timeout");
     trainingReq.destroy();
     if (!res.headersSent) {
       res.status(504).json({
@@ -653,6 +776,7 @@ app.post("/admin_api/rag-active-full-training", async (req, res) => {
   });
 
   trainingReq.write(JSON.stringify(req.body || {}));
+  markAdminProxySent(diagnosticContext);
   trainingReq.end();
 });
 
@@ -662,6 +786,7 @@ app.post("/admin_api/rag-active-full-training", async (req, res) => {
 // 在独立后台进程里，这个行为需要被重定向为"通知主进程重启"
 // ============================================================
 app.post("/admin_api/server/restart", async (req, res) => {
+  const diagnosticContext = beginAdminProxyDiagnostics(req);
   console.log(
     "[AdminServer] Restart request received — forwarding to main process..."
   );
@@ -678,6 +803,7 @@ app.post("/admin_api/server/restart", async (req, res) => {
       timeout: 10000,
     },
     (restartRes) => {
+      markAdminProxyHeaders(diagnosticContext, restartRes.statusCode);
       let body = "";
 
       restartRes.on("data", (chunk) => {
@@ -712,6 +838,7 @@ app.post("/admin_api/server/restart", async (req, res) => {
   );
 
   restartReq.on("error", (err) => {
+    markAdminProxyFailure(diagnosticContext, "proxy_error", 502, "proxy_error");
     console.error(
       `[AdminServer] Failed to forward restart request to main process: ${
         err.code || err.message
@@ -727,6 +854,7 @@ app.post("/admin_api/server/restart", async (req, res) => {
   });
 
   restartReq.on("timeout", () => {
+    markAdminProxyFailure(diagnosticContext, "proxy_timeout", 504, "proxy_timeout");
     restartReq.destroy();
     if (!res.headersSent) {
       res.status(504).json({
@@ -737,9 +865,23 @@ app.post("/admin_api/server/restart", async (req, res) => {
   });
 
   restartReq.write("{}");
+  markAdminProxySent(diagnosticContext);
   restartReq.end();
 });
 
+// 标记本地 Admin API 处理边界；若请求继续落入兜底代理，则由代理 middleware 结束该阶段。
+app.use("/admin_api", (req, res, next) => {
+  const diagnosticContext = req.__vcpDiagnostics;
+  diagnosticContext?.stage("local_processing_start");
+  const markLocalEnd = () => {
+    if (!diagnosticContext?.proxyStarted) {
+      diagnosticContext?.stageOnce("local_processing_end", "local_processing_end", res.statusCode);
+    }
+  };
+  res.once("finish", markLocalEnd);
+  res.once("close", markLocalEnd);
+  next();
+});
 app.use("/admin_api", localAdminRouter);
 
 // ============================================================
@@ -754,6 +896,10 @@ app.use("/admin_api", localAdminRouter);
 app.use("/admin_api", (req, res, next) => {
   // 如果响应已经被发送（由本地路由处理），则跳过
   if (res.headersSent) return;
+
+  const diagnosticContext = req.__vcpDiagnostics;
+  diagnosticContext?.markProxyStarted();
+  diagnosticContext?.stageOnce("local_processing_end", "local_processing_end");
 
   // 构建代理请求
   const fullPath = "/admin_api" + req.path;
@@ -782,6 +928,7 @@ app.use("/admin_api", (req, res, next) => {
   }
 
   const proxyReq = http.request(proxyUrl, proxyOptions, (proxyRes) => {
+    diagnosticContext?.stage("proxy_response_headers", proxyRes.statusCode);
     res.status(proxyRes.statusCode);
     // 复制响应头
     for (const [key, value] of Object.entries(proxyRes.headers)) {
@@ -793,6 +940,7 @@ app.use("/admin_api", (req, res, next) => {
   });
 
   proxyReq.on("error", (err) => {
+    diagnosticContext?.stageOnce("proxy_error", "proxy_error", 502, "proxy_error");
     console.error(
       `[AdminServer Proxy] Error proxying to main process: ${err.message}`
     );
@@ -806,6 +954,7 @@ app.use("/admin_api", (req, res, next) => {
   });
 
   proxyReq.on("timeout", () => {
+    diagnosticContext?.stageOnce("proxy_timeout", "proxy_timeout", 504, "proxy_timeout");
     proxyReq.destroy();
     if (!res.headersSent) {
       res.status(504).json({
@@ -819,6 +968,7 @@ app.use("/admin_api", (req, res, next) => {
   if (req.method !== "GET" && req.method !== "HEAD") {
     // multipart/form-data 需要原样流式透传，否则会破坏 boundary 与文件体
     if (isMultipartBody) {
+      diagnosticContext?.stage("proxy_request_sent");
       req.pipe(proxyReq);
       return;
     }
@@ -841,6 +991,7 @@ app.use("/admin_api", (req, res, next) => {
     proxyReq.write(bodyData);
   }
 
+  diagnosticContext?.stage("proxy_request_sent");
   proxyReq.end();
 });
 
@@ -849,6 +1000,7 @@ app.use("/admin_api", (req, res, next) => {
 // 前端可调用此端点，在本地写完文件后额外通知主进程
 // ============================================================
 app.post("/admin_api/config/main/reload-notify", async (req, res) => {
+  const diagnosticContext = beginAdminProxyDiagnostics(req);
   try {
     // 通知主进程重新加载插件（fire-and-forget）
     const notifyReq = http.request(
@@ -863,6 +1015,7 @@ app.post("/admin_api/config/main/reload-notify", async (req, res) => {
         timeout: 10000,
       },
       (notifyRes) => {
+        markAdminProxyHeaders(diagnosticContext, notifyRes.statusCode);
         let body = "";
         notifyRes.on("data", (chunk) => (body += chunk));
         notifyRes.on("end", () => {
@@ -874,6 +1027,7 @@ app.post("/admin_api/config/main/reload-notify", async (req, res) => {
       }
     );
     notifyReq.on("error", (err) => {
+      markAdminProxyFailure(diagnosticContext, "proxy_error", 502, "proxy_error");
       // 主进程可能不可达，但本地文件已保存
       res.json({
         success: true,
@@ -882,10 +1036,18 @@ app.post("/admin_api/config/main/reload-notify", async (req, res) => {
       });
     });
     notifyReq.write(JSON.stringify(req.body));
+    markAdminProxySent(diagnosticContext);
     notifyReq.end();
   } catch (error) {
+    markAdminProxyFailure(diagnosticContext, "proxy_error", 502, "proxy_error");
     res.status(500).json({ error: error.message });
   }
+});
+
+app.use((error, req, res, next) => {
+  const errorCode = error?.type === "entity.parse.failed" ? "body_parse_error" : "handler_error";
+  req.__vcpDiagnostics?.error(errorCode, res.statusCode || 500);
+  next(error);
 });
 
 // ============================================================
@@ -905,4 +1067,9 @@ app.listen(ADMIN_PORT, () => {
   console.log(
     `[AdminServer] 未匹配的 /admin_api 请求将自动代理到主进程 PORT ${MAIN_PORT}`
   );
+  adminCpuSampler = createCpuSampler({
+    role: "admin",
+    rootDir: __dirname,
+    eventLogger: adminDiagnostics,
+  });
 });

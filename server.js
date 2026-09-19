@@ -27,6 +27,12 @@ https.globalAgent.maxSockets = 10000;
 const logger = require('./modules/logger.js');
 logger.initializeServerLogger();
 logger.overrideConsole();
+const {
+    RequestDiagnostics,
+    classifyMainRoute,
+    isLoopbackSocket
+} = require('./modules/diagnostics/requestDiagnostics.js');
+const { createCpuSampler } = require('./modules/diagnostics/cpuSampler.js');
 
 // Agent 目录路径初始化（同步，在模块加载时解析）
 let AGENT_DIR;
@@ -555,10 +561,29 @@ const app = express();
 app.set('trust proxy', true); // 新增：信任代理，以便正确解析 X-Forwarded-For 头，解决本地IP识别为127.0.0.1的问题
 app.use(cors({ origin: '*' })); // 启用 CORS，允许所有来源的跨域请求，方便本地文件调试
 
+const mainDiagnostics = new RequestDiagnostics({
+    role: 'main',
+    rootDir: __dirname
+});
+let mainCpuSampler = null;
+
+// 必须在 body parser 之前生成服务端诊断 ID；此 middleware 不读取或记录正文。
+app.use(mainDiagnostics.middleware({ routeClassifier: classifyMainRoute }));
+
 // 在路由决策之前解析请求体，以便 req.body 可用
 app.use(express.json({ limit: '300mb' }));
 app.use(express.urlencoded({ limit: '300mb', extended: true }));
 app.use(express.text({ limit: '300mb', type: 'text/plain' })); // 新增：用于处理纯文本请求体
+app.use((req, res, next) => {
+    mainDiagnostics.markBodyParsed(req, req.body);
+    next();
+});
+
+// 仅供受控的本机 watchdog 使用；不信任 X-Forwarded-For，关闭时继续走原有鉴权链。
+app.get('/__vcp_diag/health', (req, res, next) => {
+    if (!mainDiagnostics.enabled || !isLoopbackSocket(req)) return next();
+    return res.status(200).json({ status: 'ok' });
+});
 
 // 新增：IP追踪中间件
 app.use((req, res, next) => {
@@ -1215,7 +1240,8 @@ const chatCompletionHandler = new ChatCompletionHandler({
     chinaModel1: CHINA_MODEL_1,
     chinaModel1Cot: CHINA_MODEL_1_COT,
     semanticModelRouter,
-    multiModalForceTranslateModels: MULTIMODAL_FORCE_TRANSLATE_MODELS // 纯文本模型 tag 命中后强制翻译多模态
+    multiModalForceTranslateModels: MULTIMODAL_FORCE_TRANSLATE_MODELS, // 纯文本模型 tag 命中后强制翻译多模态
+    diagnostics: mainDiagnostics
 });
 
 // Route for standard chat completions. VCP info is shown based on the .env config.
@@ -1223,6 +1249,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     try {
         await chatCompletionHandler.handle(req, res, false);
     } catch (e) {
+        req.__vcpDiagnostics?.error('handler_error', res.statusCode || 500);
         console.error(`[FATAL] Uncaught exception from chatCompletionHandler for ${req.path}:`, e);
         if (!res.headersSent) {
             res.status(500).json({ error: "A fatal internal error occurred." });
@@ -1237,6 +1264,7 @@ app.post('/v1/chatvcp/completions', async (req, res) => {
     try {
         await chatCompletionHandler.handle(req, res, true);
     } catch (e) {
+        req.__vcpDiagnostics?.error('handler_error', res.statusCode || 500);
         console.error(`[FATAL] Uncaught exception from chatCompletionHandler for ${req.path}:`, e);
         if (!res.headersSent) {
             res.status(500).json({ error: "A fatal internal error occurred." });
@@ -1520,6 +1548,13 @@ async function initialize() {
 
     // 初始化通用任务调度器
     taskScheduler.initialize(pluginManager, webSocketServer, DEBUG_MODE);
+
+    // 让 body parser 和后置路由异常进入同一条安全诊断路径；原异常继续交给 Express 默认处理。
+    app.use((error, req, res, next) => {
+        const errorCode = error?.type === 'entity.parse.failed' ? 'body_parse_error' : 'handler_error';
+        req.__vcpDiagnostics?.error(errorCode, res.statusCode || 500);
+        next(error);
+    });
 }
 
 // Store the server instance globally so it can be accessed by gracefulShutdown
@@ -1594,6 +1629,12 @@ async function startServer() {
                     activeHttpRequests.delete(req.socket);
                 });
             }
+        });
+
+        mainCpuSampler = createCpuSampler({
+            role: 'main',
+            rootDir: __dirname,
+            eventLogger: mainDiagnostics
         });
 
         // Initialize the new WebSocketServer
@@ -1722,6 +1763,11 @@ async function gracefulShutdown(exitCode = 0, reason = 'signal') {
                 console.log(`[Server][ShutdownTrace] Phase 9/10 - knowledgeBaseManager.shutdown done`);
             } else {
                 console.log(`[Server][ShutdownTrace] Phase 9/10 - knowledgeBaseManager shutdown skipped`);
+            }
+
+            if (mainCpuSampler) {
+                await mainCpuSampler.stop();
+                mainCpuSampler = null;
             }
 
             const serverLogWriteStream = logger.getLogWriteStream();

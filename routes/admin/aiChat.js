@@ -41,6 +41,7 @@ async function proxyJsonRequest(req, res, {
 
     const abortController = new AbortController();
     const timeout = setTimeout(() => abortController.abort(), timeoutMs);
+    const diagnosticContext = req.__vcpDiagnostics;
 
     try {
         const { default: fetch } = await import('node-fetch');
@@ -51,6 +52,7 @@ async function proxyJsonRequest(req, res, {
             console.log(`[AdminAI] Proxying ${logLabel || targetPath} to ${targetUrl}`);
         }
 
+        diagnosticContext?.stage('proxy_request_sent');
         const upstreamResponse = await fetch(targetUrl, {
             method: req.method,
             headers: {
@@ -62,6 +64,7 @@ async function proxyJsonRequest(req, res, {
             body: req.method === 'GET' || req.method === 'HEAD' ? undefined : JSON.stringify(body),
             signal: abortController.signal
         });
+        diagnosticContext?.stage('proxy_response_headers', upstreamResponse.status);
 
         res.status(upstreamResponse.status);
         copySafeResponseHeaders(upstreamResponse, res);
@@ -88,6 +91,12 @@ async function proxyJsonRequest(req, res, {
         return res.send(responseText);
     } catch (error) {
         const isAbort = error && error.name === 'AbortError';
+        diagnosticContext?.stageOnce(
+            isAbort ? 'proxy_timeout' : 'proxy_error',
+            isAbort ? 'proxy_timeout' : 'proxy_error',
+            isAbort ? 504 : 502,
+            isAbort ? 'proxy_timeout' : 'proxy_error'
+        );
         console.error(`[AdminAI] Failed to proxy ${logLabel || targetPath}:`, error.message);
         if (!res.headersSent) {
             return res.status(isAbort ? 504 : 502).json({
