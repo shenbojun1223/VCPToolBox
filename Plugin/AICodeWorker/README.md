@@ -106,7 +106,7 @@ ALLOW_DANGEROUS_SKIP_PERMISSIONS=false
 REDACT_SECRETS=true
 ```
 
-## Codex CLI Worker
+## Codex CLI Worker 与双通道 DeepSeek 支持
 
 Codex 适合作为“VCP 外层大脑 + Codex 下层执行器”架构中的代码执行层：
 
@@ -118,6 +118,13 @@ Codex 适合作为“VCP 外层大脑 + Codex 下层执行器”架构中的代�
 - Windows 使用 Job PID + `taskkill /T` 清理当前任务进程树，不全局杀 Codex
 - Codex 登录态必须对运行 VCP/PM2 的同一系统用户有效
 - 已实测 Codex CLI 0.144.5 的 Windows `workspace-write` 沙箱会保护工作目录中的 `.git` 与 `.agents`；目录不存在时可能创建空占位目录并写入拒绝沙箱写入的 ACL。这不是模型越权修改。write 模式应优先把 `projectPath` 指向真实仓库根目录，插件不得自动删除这两个目录
+
+### 双通道 DeepSeek 架构与调用规范（Profile 内部化）
+- **外层无感调用**：外层调用者与 Agent **严禁且无需指定 Profile 文件**，直接传入模型别名：
+  - `deepseek-4.1-flash`：DeepSeek 官方直连通道（原生 Responses API，支持 low/high/max）。底层自动挂载物理隔离沙箱，**官方 ChatGPT 订阅零污染、零冲突**。
+  - `deepseek-4.1-flash-commandcode`：CommandCode 渠道，自动经由本地轻量固化 relay 网关转译。
+  - `gpt-5.6-luna`：官方 ChatGPT 订阅原生直连，零中间件。
+- **并发与 Worktree 统一安全**：所有通道的 Worktree 创建、文件锁、验证门禁与 CAS Commit，由唯一的 Sidecar 统筹调度，彻底杜绝 Git 文件锁冲突与状态撕裂。
 
 配置示例：
 
