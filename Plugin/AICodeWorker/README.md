@@ -5,7 +5,7 @@
 - 每次显式传 worker=codex；插件底层默认 worker 仍为 opencode，不传不会自动选择 Codex。
 - Fast 默认不启用：所有 Codex run/run_and_wait 都显式传 fastMode=false。只有用户明确要求本任务开启 Fast 才传 true；“继续”“尽快”“并发”不构成 Fast 授权。不要把一次授权扩展到后续任务。
 - API 兼容语义未改变：省略/null/空字符串会继承 Codex 配置，不等于关闭 Fast。上述默认关闭是 Agent 调用规范，不是后端强制默认。
-- 纯搬砖任务（目标、路径和验收已明确的机械修改、批量实现、按既定方案补测试）使用 model=gpt-5.6-luna、reasoningEffort=max。不得因是 write 模式就一律用 Luna；架构判断、需求不清及独立审查另行选型。
+- 默认主力任务（日常工程开发、机械修改、批量实现、按既定方案补测试）使用 model=deepseek-4.1-flash-commandcode、reasoningEffort=high。外层调用无需指定 Profile，底层自动经由本地 relay 网关转译。
 - 派任务前查 capabilities，针对拟用模型核对可用性与合法推理档位；能力不符则报告，不静默换模型。模型默认档位随配置变化，不硬编码。
 - app-server analyze/patch/write 共享总额度3，其中 Write最多2；legacy Worker共用独立额度1（以实时 capabilities 为准）。2W+1A/P、1W+2A/P、3A/P可行；第三个Write或第四个总任务拒绝，不排队。
 - 额度按仍持有所有权的任务计数，创建Worktree、验证、提交和未释放的终态均占槽；不能仅因模型停止输出就认为名额释放。
@@ -22,8 +22,8 @@ worker: codex
 projectPath: <白名单内干净Git仓库根>
 task: <目标、相对文件路径、禁区与验收要求>
 mode: write
-model: gpt-5.6-luna
-reasoningEffort: max
+model: deepseek-4.1-flash-commandcode
+reasoningEffort: high
 fastMode: false
 traceMode: events
 timeoutSec: 1200
@@ -413,7 +413,7 @@ state 含义：`running` 进行中 / `completed` 成功 / `failed` 失败 / `tim
 
 | worker | 定位 | 使用条件 |
 |---|---|---|
-| codex | 本部署默认代码执行器；纯搬砖使用 gpt-5.6-luna / max | capabilities确认模型与档位；默认fastMode=false |
+| codex | 本部署默认代码执行器；默认主力使用 deepseek-4.1-flash-commandcode / high | capabilities确认模型与档位；默认fastMode=false |
 | opencode | 可选legacy后端 | 用户另行指定且实际可用；模型与费用以服务商为准 |
 | antigravity | 可选legacy后端 | 用户另行指定且实际启用；模型与配额以实际配置为准 |
 

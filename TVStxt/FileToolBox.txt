@@ -150,10 +150,10 @@ context_lines:「始」(可选) 匹配行前后显示的上下文行数，默认
    - **analyze（只读分析）**：架构测绘、调用链排查、影响面评估。read-only 沙箱，绝不改动任何文件。
    - **app-server patch（单/少文件微调）**：仅限已有 tracked 普通文件极小改动。**严禁**用于新增文件、删除文件、重命名或二进制文件；diff 上限 512 KiB。
    - **app-server write（新建/重构/实现主力通道）**：**凡涉及新建文件（如补写测试、新建模块）、删除、重构、多文件联动，必须直接走 write**（基于干净 Git 根创建独立受控 Git Worktree，生成 Candidate Commit）。
-2. **模型选型（双通道 DeepSeek 与 Profile 内部化，外层只传别名）**：
-   - **deepseek-4.1-flash（官方直连通道）**：原生 Responses API 直连，1M 上下文，支持 low/high/max 档位。Sidecar 自动绑定专属物理沙箱，**官方 ChatGPT 订阅零污染、零冲突**。生成响应极快、指令遵循与代码实现高度精准，高通量流水线搬砖首选。
-   - **deepseek-4.1-flash-commandcode（CommandCode 转换通道）**：经由本地固化 relay 网关自动转译，内存解密 DPAPI 凭据，支持 low/high/max 档位。
-   - **gpt-5.6-luna（reasoningEffort=max）**：官方 ChatGPT 订阅原生通道，直连 OpenAI，适合复杂工程实现。架构决策与深潜审查选 sol。
+2. **模型选型与默认主力（Profile 内部化，外层只传别名）**：
+   - **【默认主力首选】deepseek-4.1-flash-commandcode（reasoningEffort=high）**：日常工程开发、批量搬砖、测试编写的首选默认模型。经由本地固化 relay 网关自动转译，内存解密 DPAPI 凭据，默认思考强度设为 high。
+   - **deepseek-4.1-flash（官方直连通道）**：原生 Responses API 直连，1M 上下文，支持 low/high/max 档位。Sidecar 自动绑定专属物理沙箱，**官方 ChatGPT 订阅零污染、零冲突**。
+   - **gpt-5.6-luna（reasoningEffort=max）**：官方 ChatGPT 订阅原生通道，直连 OpenAI，仅在复杂任务或特殊需要时显式选用。架构决策与深潜审查选 sol。
    - 【调用铁律】：外层与 Agent 调用时**严禁且无需指定 Profile 文件**，直接传入模型别名即可，由 Sidecar 统一调度独立沙箱执行，Worktree 锁与并发配额全局统管。
 3. **调度纪律**：
    - 必须显式指定 `worker=codex`；默认显式 `fastMode=false`（请求 Standard 档），未获明确授权严禁私开 Fast。
