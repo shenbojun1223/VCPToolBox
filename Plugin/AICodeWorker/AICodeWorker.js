@@ -38,8 +38,12 @@ const {
     assertNoExternalReservedFields,
     getProviderAliasInfo,
     isProviderAlias,
-    providerErrorResult
+    providerErrorResult,
+    resolveProviderRoutePlan,
+    providerPlanToIpc
 } = require("./appserver/providerRoutes");
+
+const { loadProviderRuntimeConfig } = require("./appserver/providerRuntimeConfig");
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -174,30 +178,63 @@ function resolveRequestedProviderAlias(model, useConfiguredDefault = true) {
     return isProviderAlias(candidate) ? getProviderAliasInfo(candidate) : null;
 }
 
-function providerAliasEntryGate(aliasInfo, worker, mode) {
-    const errorCode = CFG.enableCodex && isCodexAppServerAnalyzeRoute(worker, mode)
-        ? PROVIDER_ERROR_CODES.ROUTE_NOT_CONFIGURED
-        : PROVIDER_ERROR_CODES.MODE_UNSUPPORTED;
-    return providerErrorResult({ code: errorCode });
+function loadTrustedProviderCatalog() {
+    try {
+        return loadProviderRuntimeConfig({ pluginDir: __dirname }).catalog;
+    } catch {
+        return null;
+    }
+}
+
+function resolveProviderAnalyzePlan(aliasInfo, worker, mode, options = {}) {
+    if (!CFG.enableCodex || !isCodexAppServerAnalyzeRoute(worker, mode)) {
+        return providerErrorResult({ code: PROVIDER_ERROR_CODES.MODE_UNSUPPORTED });
+    }
+    const catalog = loadTrustedProviderCatalog();
+    if (!catalog) {
+        return providerErrorResult({ code: PROVIDER_ERROR_CODES.ROUTE_NOT_CONFIGURED });
+    }
+    const planOptions = {};
+    if (options.reasoningEffort !== undefined) planOptions.reasoningEffort = options.reasoningEffort;
+    if (options.fastMode !== undefined) planOptions.fastMode = options.fastMode;
+    try {
+        const plan = resolveProviderRoutePlan(aliasInfo.alias, planOptions, { routeCatalog: catalog });
+        return { status: "success", plan };
+    } catch (error) {
+        return providerErrorResult(error);
+    }
 }
 
 function providerAliasCapabilitiesResult(aliasInfo) {
+    const catalog = loadTrustedProviderCatalog();
+    const route = catalog
+        ? catalog.find(candidate => candidate.routeId === aliasInfo.routeId) || null
+        : null;
+    const configured = Boolean(route);
+    const executionAvailable = configured && CFG.enableCodex && CFG.enableCodexAppServerAnalyze;
+    const blockedReason = executionAvailable
+        ? null
+        : configured
+            ? PROVIDER_ERROR_CODES.MODE_UNSUPPORTED
+            : PROVIDER_ERROR_CODES.ROUTE_NOT_CONFIGURED;
     return {
         status: "success",
         workers: [
             {
                 name: "codex",
-                available: false,
+                available: executionAvailable,
                 model: aliasInfo.alias,
-                reasoningEfforts: []
+                reasoningEfforts: configured ? [...route.reasoningEfforts] : []
             }
         ],
         providerRouting: {
             alias: aliasInfo.alias,
             routeId: aliasInfo.routeId,
-            configured: false,
-            executionAvailable: false,
-            blockedReason: PROVIDER_ERROR_CODES.ROUTE_NOT_CONFIGURED
+            revision: configured ? route.revision : null,
+            upstreamModel: configured ? route.upstreamModel : null,
+            configured,
+            executionAvailable,
+            blockedReason
         }
     };
 }
@@ -2507,7 +2544,21 @@ function normalizeRunRequest(input = {}) {
     const requestedWorker = String(worker || "opencode").trim().toLowerCase();
     const normWorker = requestedWorker === "agy" ? "antigravity" : requestedWorker;
     const providerAlias = resolveRequestedProviderAlias(model, normWorker === "codex");
-    if (providerAlias) return providerAliasEntryGate(providerAlias, normWorker, mode);
+    let providerPlan = null;
+    if (providerAlias) {
+        const fastModeForRoute = normalizeFastMode(fastMode);
+        if (fastModeForRoute.status === "error") return fastModeForRoute;
+        const trimmedEffort = (reasoningEffort === undefined || reasoningEffort === null ||
+            String(reasoningEffort).trim() === "")
+            ? undefined
+            : String(reasoningEffort).trim().toLowerCase();
+        const planResult = resolveProviderAnalyzePlan(providerAlias, normWorker, mode, {
+            reasoningEffort: trimmedEffort,
+            fastMode: fastModeForRoute.value
+        });
+        if (planResult.status === "error") return planResult;
+        providerPlan = planResult.plan;
+    }
 
     if (!["opencode", "codex", "antigravity"].includes(normWorker)) {
         return { status: "error", error: `worker "${worker}" 不支持。可用: opencode, codex, antigravity` };
@@ -2546,10 +2597,10 @@ function normalizeRunRequest(input = {}) {
         };
     }
 
-    const codexCapabilities = normWorker === "codex"
+    const codexCapabilities = normWorker === "codex" && !providerPlan
         ? resolveCodexModelCapabilities(model)
         : null;
-    if (normalizedReasoningEffort) {
+    if (normalizedReasoningEffort && !providerPlan) {
         if (!codexCapabilities?.model) {
             return {
                 status: "error",
@@ -2584,11 +2635,14 @@ function normalizeRunRequest(input = {}) {
             normalizedReasoningEffort,
             normalizedFastMode: fastModeResult.value,
             serviceTierOverride: fastModeResult.serviceTier,
+            providerPlan,
             codexCapabilities,
             reasoningMetadata: buildReasoningMetadata(
                 normWorker,
-                normalizedReasoningEffort,
-                codexCapabilities
+                providerPlan ? providerPlan.reasoningEffort : normalizedReasoningEffort,
+                providerPlan
+                    ? { model: providerPlan.upstreamModel, modelSource: "provider_route" }
+                    : codexCapabilities
             )
         }
     };
@@ -2679,6 +2733,8 @@ function buildAppServerMeta(jobId, p, prepared, projectPath, timeoutS) {
         configuredReasoningEffort: prepared.reasoningMetadata.configuredReasoningEffort,
         fastMode: prepared.normalizedFastMode,
         serviceTierOverride: prepared.serviceTierOverride,
+        providerRouteId: prepared.providerPlan?.routeId || null,
+        providerRouteRevision: prepared.providerPlan?.revision || null,
         output: p.output,
         log: p.log,
         patch: p.patch,
@@ -2971,11 +3027,15 @@ async function cmdRunAppServerAnalyze(prepared, dependencies = {}) {
             outputPath: p.output,
             codexOutputPath: p.codexOutput,
             timeoutSec: timeoutS,
-            model: prepared.codexCapabilities?.model || undefined,
-            effort: prepared.normalizedReasoningEffort || undefined,
-            ...(prepared.serviceTierOverride
-                ? { serviceTier: prepared.serviceTierOverride }
-                : {})
+            ...(prepared.providerPlan
+                ? providerPlanToIpc(prepared.providerPlan)
+                : {
+                    model: prepared.codexCapabilities?.model || undefined,
+                    effort: prepared.normalizedReasoningEffort || undefined,
+                    ...(prepared.serviceTierOverride
+                        ? { serviceTier: prepared.serviceTierOverride }
+                        : {})
+                })
         });
     } catch (error) {
         let current = readMeta(jobId) || meta;

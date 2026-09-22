@@ -212,7 +212,7 @@ function assertNoExecutionSideEffects(environment, isolated) {
     assert.equal(fs.existsSync(environment.jobRoot), false);
 }
 
-test("both provider aliases are rejected at normalize, run, and run_and_wait entry gates", async () => {
+test("provider aliases pass the entry gate only for an enabled codex analyze route", async () => {
     // In production main repo, config.env may legitimately exist; the isolated test uses its own mock env
 
     for (const enableCodex of [false, true]) {
@@ -230,9 +230,20 @@ test("both provider aliases are rejected at normalize, run, and run_and_wait ent
                                 { reasoningEffort: "high", fastMode: false }
                             ]) {
                                 const input = request(environment, { model: alias, mode, worker, ...options });
-                                const expected = enableCodex && analyze && worker === "codex" && mode === "analyze"
-                                    ? PROVIDER_ERROR_CODES.ROUTE_NOT_CONFIGURED
-                                    : PROVIDER_ERROR_CODES.MODE_UNSUPPORTED;
+                                const accepted = enableCodex && analyze && worker === "codex" && mode === "analyze";
+                                if (accepted) {
+                                    const normalized = isolated.worker.normalizeRunRequest(input);
+                                    assert.equal(normalized.status, "success");
+                                    assert.equal(normalized.prepared.providerPlan.alias, alias);
+                                    assert.equal(
+                                        normalized.prepared.providerPlan.routeId,
+                                        ALIASES.find(candidate => candidate.alias === alias).routeId
+                                    );
+                                    assert.equal(normalized.prepared.codexCapabilities, null);
+                                    assert.equal(isolated.counters.cacheReads, 0);
+                                    continue;
+                                }
+                                const expected = PROVIDER_ERROR_CODES.MODE_UNSUPPORTED;
                                 assertProviderError(isolated.worker.normalizeRunRequest(input), expected);
                                 assertProviderError(await isolated.worker.cmdRun(input), expected);
                                 const started = Date.now();
@@ -265,16 +276,20 @@ test("provider capabilities are static for compact and full aliases, including C
                 assert.equal(result.status, "success");
                 assert.deepEqual(result.workers, [{
                     name: "codex",
-                    available: false,
+                    available: true,
                     model: alias,
-                    reasoningEfforts: []
+                    reasoningEfforts: ["low", "high", "max"]
                 }]);
                 assert.deepEqual(result.providerRouting, {
                     alias,
                     routeId,
-                    configured: false,
-                    executionAvailable: false,
-                    blockedReason: PROVIDER_ERROR_CODES.ROUTE_NOT_CONFIGURED
+                    revision: routeId === "deepseek-official" ? "official-v1" : "commandcode-v1",
+                    upstreamModel: routeId === "deepseek-official"
+                        ? "deepseek-flash"
+                        : "deepseek/deepseek-v4.1-flash",
+                    configured: true,
+                    executionAvailable: true,
+                    blockedReason: null
                 });
                 assert.equal(Object.prototype.hasOwnProperty.call(result.workers[0], "version"), false);
                 assert.equal(Object.prototype.hasOwnProperty.call(result, "codexAppServerStatus"), false);
@@ -350,10 +365,9 @@ test("external provider fields are rejected by run and capabilities without scan
             model: ALIASES[0].alias,
             task: "the words providerRouteId, providerPlan, dependencies, and routePlan are only task text"
         });
-        assertProviderError(
-            isolated.worker.normalizeRunRequest(taskTextOnly),
-            PROVIDER_ERROR_CODES.ROUTE_NOT_CONFIGURED
-        );
+        const taskTextNormalized = isolated.worker.normalizeRunRequest(taskTextOnly);
+        assert.equal(taskTextNormalized.status, "success");
+        assert.equal(taskTextNormalized.prepared.providerPlan.routeId, "deepseek-official");
         assert.equal(JSON.stringify(taskTextOnly).includes(CANARY), false);
         assertNoExecutionSideEffects(environment, isolated);
     } finally {
