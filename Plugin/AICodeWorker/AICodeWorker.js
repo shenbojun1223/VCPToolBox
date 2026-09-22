@@ -33,6 +33,13 @@ const {
 } = require("./appserver/protocol");
 
 const { resolveFrameLimit } = require("./appserver/frameTransport");
+const {
+    PROVIDER_ERROR_CODES,
+    assertNoExternalReservedFields,
+    getProviderAliasInfo,
+    isProviderAlias,
+    providerErrorResult
+} = require("./appserver/providerRoutes");
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -150,6 +157,49 @@ function isCodexAppServerWriteRoute(worker, mode) {
     return CFG.enableCodexAppServerWrite &&
         String(worker || "").trim().toLowerCase() === "codex" &&
         String(mode || "").trim().toLowerCase() === "write";
+}
+
+function rejectExternalProviderFields(input) {
+    try {
+        assertNoExternalReservedFields(input);
+        return null;
+    } catch (error) {
+        return providerErrorResult(error);
+    }
+}
+
+function resolveRequestedProviderAlias(model, useConfiguredDefault = true) {
+    const explicitModel = typeof model === "string" ? model.trim() : "";
+    const candidate = explicitModel || (useConfiguredDefault ? String(CFG.codexModel || "").trim() : "");
+    return isProviderAlias(candidate) ? getProviderAliasInfo(candidate) : null;
+}
+
+function providerAliasEntryGate(aliasInfo, worker, mode) {
+    const errorCode = CFG.enableCodex && isCodexAppServerAnalyzeRoute(worker, mode)
+        ? PROVIDER_ERROR_CODES.ROUTE_NOT_CONFIGURED
+        : PROVIDER_ERROR_CODES.MODE_UNSUPPORTED;
+    return providerErrorResult({ code: errorCode });
+}
+
+function providerAliasCapabilitiesResult(aliasInfo) {
+    return {
+        status: "success",
+        workers: [
+            {
+                name: "codex",
+                available: false,
+                model: aliasInfo.alias,
+                reasoningEfforts: []
+            }
+        ],
+        providerRouting: {
+            alias: aliasInfo.alias,
+            routeId: aliasInfo.routeId,
+            configured: false,
+            executionAvailable: false,
+            blockedReason: PROVIDER_ERROR_CODES.ROUTE_NOT_CONFIGURED
+        }
+    };
 }
 
 function safeErrorDetails(error) {
@@ -2219,6 +2269,16 @@ async function cmdCapabilities(input = {}) {
     if (!responseMode) {
         return { status: "error", error: "responseMode 不支持。可用: compact, full" };
     }
+    const externalProviderError = rejectExternalProviderFields(input);
+    if (externalProviderError) return externalProviderError;
+
+    const requestedModel =
+        typeof input?.model === "string"
+            ? input.model.trim()
+            : "";
+    const providerAlias = resolveRequestedProviderAlias(requestedModel);
+    if (providerAlias) return providerAliasCapabilitiesResult(providerAlias);
+
     let appServerInspection = {
         status: "disabled",
         activeJobs: 0,
@@ -2263,10 +2323,6 @@ async function cmdCapabilities(input = {}) {
         ? await checkAgyVersion()
         : { ok: false, ver: "" };
 
-    const requestedModel =
-        typeof input?.model === "string"
-            ? input.model.trim()
-            : "";
     const codexCapabilities =
         resolveCodexModelCapabilities(requestedModel);
     const patchProtocolSupport = inspectPatchProtocolSupport(
@@ -2408,11 +2464,18 @@ function normalizeRunRequest(input = {}) {
     if (!input || typeof input !== "object") {
         return { status: "error", error: "请求必须是 JSON 对象。" };
     }
+    const externalInputError = rejectExternalProviderFields(input);
+    if (externalInputError) return externalInputError;
+
     let prepared = input;
     if (input.preset) {
         const presetResult = applyPreset(input);
         if (presetResult && presetResult.status === "error") return presetResult;
-        if (presetResult) prepared = presetResult;
+        if (presetResult) {
+            prepared = presetResult;
+            const preparedProviderError = rejectExternalProviderFields(prepared);
+            if (preparedProviderError) return preparedProviderError;
+        }
     }
 
     const {
@@ -2443,6 +2506,9 @@ function normalizeRunRequest(input = {}) {
 
     const requestedWorker = String(worker || "opencode").trim().toLowerCase();
     const normWorker = requestedWorker === "agy" ? "antigravity" : requestedWorker;
+    const providerAlias = resolveRequestedProviderAlias(model, normWorker === "codex");
+    if (providerAlias) return providerAliasEntryGate(providerAlias, normWorker, mode);
+
     if (!["opencode", "codex", "antigravity"].includes(normWorker)) {
         return { status: "error", error: `worker "${worker}" 不支持。可用: opencode, codex, antigravity` };
     }

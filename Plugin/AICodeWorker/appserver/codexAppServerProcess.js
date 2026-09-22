@@ -9,6 +9,10 @@ const { SidecarError, getProcessIdentity, terminateOwnedChild } = require("./pro
 
 const PATCH_CODEX_VERSION = "codex-cli 0.144.5";
 const SERVICE_TIER_OVERRIDES = new Set(["default", "fast"]);
+const CONTROLLED_MODEL_PROVIDERS = new Set([
+    "aicw-deepseek-official",
+    "aicw-deepseek-commandcode"
+]);
 
 function normalizeServiceTierOverride(value) {
     if (value === undefined || value === null || String(value).trim() === "") return null;
@@ -17,6 +21,18 @@ function normalizeServiceTierOverride(value) {
         throw new SidecarError("CODEX_SERVICE_TIER_INVALID", "serviceTier must be default or fast");
     }
     return normalized;
+}
+
+function validateModelProvider(modelProvider) {
+    if (!CONTROLLED_MODEL_PROVIDERS.has(modelProvider)) {
+        throw new SidecarError("CODEX_MODEL_PROVIDER_INVALID", "modelProvider is not supported");
+    }
+}
+
+function validateProviderModel(model) {
+    if (typeof model !== "string" || model.length === 0 || model.trim() !== model || /[\0\r\n]/u.test(model)) {
+        throw new SidecarError("CODEX_PROVIDER_MODEL_REQUIRED", "model is required for an explicit modelProvider");
+    }
 }
 
 class CodexAppServerProcess extends EventEmitter {
@@ -206,9 +222,14 @@ class CodexAppServerProcess extends EventEmitter {
         }
     }
 
-    async startThread({ projectPath, model, serviceTier, writeMode = false } = {}) {
+    async startThread({ projectPath, model, serviceTier, writeMode = false, modelProvider } = {}) {
         if (writeMode && (!projectPath || !path.isAbsolute(projectPath))) {
             throw new SidecarError("CODEX_WRITE_PROJECT_PATH_INVALID", "writeMode requires an absolute projectPath");
+        }
+        const hasExplicitModelProvider = modelProvider !== undefined && modelProvider !== null;
+        if (hasExplicitModelProvider) {
+            validateModelProvider(modelProvider);
+            validateProviderModel(model);
         }
         if (!this.connection || this.closed) throw new SidecarError("CODEX_NOT_READY", "Codex app-server is not ready");
         const params = {
@@ -217,12 +238,27 @@ class CodexAppServerProcess extends EventEmitter {
             sandbox: writeMode ? "workspace-write" : "read-only",
             approvalPolicy: "never"
         };
-        if (model) params.model = model;
+        if (hasExplicitModelProvider) {
+            params.model = model;
+            params.modelProvider = modelProvider;
+            params.allowProviderModelFallback = false;
+        } else if (model) {
+            params.model = model;
+        }
         const normalizedServiceTier = normalizeServiceTierOverride(serviceTier);
         if (normalizedServiceTier) params.serviceTier = normalizedServiceTier;
         const result = await this.connection.request("thread/start", params);
         const threadId = result?.thread?.id;
-        if (!threadId) throw new SidecarError("CODEX_INVALID_RESPONSE", "thread/start did not return thread.id");
+        if (!threadId) {
+            if (hasExplicitModelProvider) {
+                throw new SidecarError("CODEX_PROVIDER_ROUTE_UNCONFIRMED", "thread/start provider identity could not be confirmed");
+            }
+            throw new SidecarError("CODEX_INVALID_RESPONSE", "thread/start did not return thread.id");
+        }
+        if (hasExplicitModelProvider && (result?.model !== model ||
+            result?.modelProvider !== modelProvider || result?.thread?.modelProvider !== modelProvider)) {
+            throw new SidecarError("CODEX_PROVIDER_ROUTE_UNCONFIRMED", "thread/start provider identity could not be confirmed");
+        }
         return result.thread;
     }
 

@@ -52,6 +52,17 @@ const {
     publishCandidateNoOverwrite,
     sha256
 } = require("./patchValidator");
+const {
+    PROVIDER_ROUTING_PROTOCOL_VERSION,
+    PROVIDER_ERROR_CODES,
+    isPlainObject,
+    isProviderAlias,
+    assertNoIpcRawProviderFields,
+    createProviderRouteCatalog,
+    resolveProviderRouteRequest,
+    providerPlanToThreadParams,
+    providerErrorResult
+} = require("./providerRoutes");
 
 const TERMINAL_STATES = new Set(["completed", "cancelled", "failed", "timeout"]);
 const SAFE_WRITE_VALIDATION_PROFILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -64,6 +75,11 @@ const UNCERTAIN_WRITE_CANDIDATE_CODES = new Set([
     "WORKTREE_CANDIDATE_INDEX_ROLLBACK_UNCONFIRMED",
     "WORKTREE_SESSION_OUTCOME_UNCERTAIN"
 ]);
+const PROVIDER_START_ERROR_CODE = "AICW_PROVIDER_JOB_START_FAILED";
+const PROVIDER_PROCESS_ERROR_CODE = "AICW_PROVIDER_PROCESS_FAILED";
+const PROVIDER_CLOSED_ERROR_CODE = "AICW_PROVIDER_PROCESS_CLOSED";
+const PROVIDER_APPROVAL_ERROR_CODE = "AICW_PROVIDER_APPROVAL_REQUESTED";
+const PROVIDER_FINALIZATION_ERROR_CODE = "AICW_PROVIDER_FINALIZATION_UNCONFIRMED";
 
 function safeWriteErrorCode(error) {
     return typeof error?.code === "string" && /^[A-Z0-9_]+$/.test(error.code)
@@ -79,6 +95,11 @@ function safeValidationSteps(steps) {
         exitCode: Number.isInteger(step?.exitCode) ? step.exitCode : null,
         timedOut: step?.timedOut === true
     }));
+}
+
+function providerRoutingRejection(error) {
+    const result = providerErrorResult(error);
+    return new SidecarError(result.errorCode, result.error);
 }
 
 function canonicalWriteRoots(values) {
@@ -195,6 +216,16 @@ class SidecarServer extends EventEmitter {
             : this._writeEnabled
                 ? String(options.writeConfigurationErrorCode || "AICW_WRITE_CONFIGURATION_INVALID").slice(0, 64)
                 : null;
+        try {
+            this.providerRouteCatalog = createProviderRouteCatalog(
+                options.providerRouteCatalog === undefined ? [] : options.providerRouteCatalog
+            );
+        } catch {
+            throw new SidecarError(PROVIDER_ERROR_CODES.ROUTE_CATALOG_INVALID, "Provider route catalog is invalid");
+        }
+        this.providerCodexFactory = typeof options.providerCodexFactory === "function"
+            ? options.providerCodexFactory
+            : null;
         this.activeJobs = new Map();
         this.seenJobs = new Set();
         this.sockets = new Set();
@@ -205,6 +236,7 @@ class SidecarServer extends EventEmitter {
         this.stopPromise = null;
         this.stopGate = null;
         this.stopConfirmed = false;
+        this.sharedStopConfirmed = false;
         this.started = false;
         this.draining = false;
         this._loadSeenJobs();
@@ -276,10 +308,11 @@ class SidecarServer extends EventEmitter {
             requestTimeoutMs: this.requestTimeoutMs,
             maxCodexFrameBytes: this.maxCodexFrameBytes
         });
-        this.codex.on("notification", message => this._handleNotification(message));
-        this.codex.on("serverRequest", request => this._handleServerRequest(request));
-        this.codex.on("protocolError", error => this._handleProtocolError(error));
-        this.codex.once("closed", info => this._handleCodexClosed(info));
+        const sharedCodex = this.codex;
+        sharedCodex.on("notification", message => this._handleNotification(message, sharedCodex));
+        sharedCodex.on("serverRequest", request => this._handleServerRequest(request, sharedCodex));
+        sharedCodex.on("protocolError", error => this._handleProtocolError(error, sharedCodex));
+        sharedCodex.once("closed", info => this._handleCodexClosed(info, sharedCodex));
         try {
             await this.codex.start();
             this._assertCodexAvailable();
@@ -421,12 +454,184 @@ class SidecarServer extends EventEmitter {
             maxConcurrency: this.maxConcurrency,
             frameLimits: frameLimitStatus(this.maxCodexFrameBytes, this.maxIpcBufferBytes),
             serviceTierOverrideProtocolVersion: 1,
+            providerRoutingProtocolVersion: PROVIDER_ROUTING_PROTOCOL_VERSION,
+            providerExecutionAvailable: this._providerExecutionAvailable(),
             ...getPatchProtocolProof(),
             ...getWriteProtocolStatus({
                 configured: this._writeConfigured,
                 errorCode: this._writeConfigurationErrorCode
             })
         };
+    }
+
+    _providerExecutionAvailable() {
+        return Array.isArray(this.providerRouteCatalog) && this.providerRouteCatalog.length > 0 &&
+            typeof this.providerCodexFactory === "function" &&
+            this.state?.status === "ready" && !this.draining && !this.stopGate;
+    }
+
+    _assertProviderRoutingRequest(params, mode) {
+        if (!isPlainObject(params)) return;
+
+        try {
+            assertNoIpcRawProviderFields(params);
+        } catch (error) {
+            throw providerRoutingRejection(error);
+        }
+
+        let hasRouteField;
+        let model;
+        try {
+            hasRouteField = Object.prototype.hasOwnProperty.call(params, "providerRouteId") ||
+                Object.prototype.hasOwnProperty.call(params, "providerRouteRevision");
+            if (!hasRouteField && Object.prototype.hasOwnProperty.call(params, "model")) {
+                model = params.model;
+            }
+        } catch (error) {
+            throw providerRoutingRejection(error);
+        }
+
+        const hasProviderAlias = typeof model === "string" && isProviderAlias(model.trim());
+        if (!hasRouteField && !hasProviderAlias) return;
+        if (mode !== "analyze") {
+            throw providerRoutingRejection({ code: PROVIDER_ERROR_CODES.MODE_UNSUPPORTED });
+        }
+        if (!hasRouteField) {
+            throw providerRoutingRejection({ code: PROVIDER_ERROR_CODES.ROUTE_REQUIRED });
+        }
+
+        let plan;
+        try {
+            plan = resolveProviderRouteRequest(params, {
+                providerRouteCatalog: this.providerRouteCatalog
+            });
+        } catch (error) {
+            throw providerRoutingRejection(error);
+        }
+        if (!Array.isArray(this.providerRouteCatalog) || this.providerRouteCatalog.length === 0 ||
+            typeof this.providerCodexFactory !== "function") {
+            throw providerRoutingRejection({ code: PROVIDER_ERROR_CODES.RUNTIME_UNAVAILABLE });
+        }
+        return plan;
+    }
+
+    _jobExecution(job) {
+        return job?.execution || this.codex;
+    }
+
+    _jobExecutionRequest(job, method, ...args) {
+        const execution = this._jobExecution(job);
+        if (!execution || typeof execution[method] !== "function") {
+            throw new SidecarError("CODEX_NOT_READY", "Execution backend is not available");
+        }
+        return execution[method](...args);
+    }
+
+    _providerRuntimeUnavailable() {
+        return providerRoutingRejection({ code: PROVIDER_ERROR_CODES.RUNTIME_UNAVAILABLE });
+    }
+
+    _isUnstartedProviderExecution(value) {
+        try {
+            if (!(value instanceof CodexAppServerProcess) || value === this.codex ||
+                typeof value.start !== "function" || typeof value.startThread !== "function" ||
+                typeof value.startTurn !== "function" || typeof value.interruptTurn !== "function" ||
+                typeof value.stop !== "function") return false;
+            if (value.started === true || value.closed === true || value.stopping === true ||
+                value.connection || value.child || value.codexPid || value.codexIdentity ||
+                value._versionChild || value._versionIdentity || value._stopPromise || value._starting ||
+                value._stopTargets?.size) return false;
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    _createProviderExecution(job) {
+        if (typeof this.providerCodexFactory !== "function") throw this._providerRuntimeUnavailable();
+        let execution;
+        try {
+            execution = this.providerCodexFactory(Object.freeze({
+                jobId: job.jobId,
+                projectPath: job.projectPath,
+                plan: job.providerPlan
+            }));
+        } catch {
+            throw this._providerRuntimeUnavailable();
+        }
+        if (!this._isUnstartedProviderExecution(execution) ||
+            [...(this.activeJobs?.values?.() || [])].some(candidate => candidate !== job && candidate.execution === execution)) {
+            throw this._providerRuntimeUnavailable();
+        }
+        return execution;
+    }
+
+    _bindProviderExecution(job, execution) {
+        job.execution = execution;
+        job.executionOwned = true;
+        const listeners = {
+            notification: message => this._handleNotification(message, execution),
+            serverRequest: request => this._handleServerRequest(request, execution),
+            protocolError: error => {
+                void Promise.resolve(this._handleProtocolError(error, execution)).catch(() => {});
+            },
+            closed: info => {
+                void Promise.resolve(this._handleCodexClosed(info, execution)).catch(() => {});
+            }
+        };
+        execution.on("notification", listeners.notification);
+        execution.on("serverRequest", listeners.serverRequest);
+        execution.on("protocolError", listeners.protocolError);
+        execution.once("closed", listeners.closed);
+        job.executionListeners = listeners;
+    }
+
+    _detachProviderExecution(job) {
+        const execution = job?.execution;
+        const listeners = job?.executionListeners;
+        if (!execution || !listeners) return;
+        try {
+            if (typeof execution.removeListener === "function") {
+                execution.removeListener("notification", listeners.notification);
+                execution.removeListener("serverRequest", listeners.serverRequest);
+                execution.removeListener("protocolError", listeners.protocolError);
+                execution.removeListener("closed", listeners.closed);
+            }
+        } catch {}
+        job.executionListeners = null;
+    }
+
+    _assertProviderThreadIdentity(job, thread) {
+        try {
+            const plan = job.providerPlan;
+            const hasModel = Object.prototype.hasOwnProperty.call(thread, "model") && thread.model !== null;
+            if (!thread || thread.modelProvider !== plan.modelProvider ||
+                (hasModel && thread.model !== plan.upstreamModel)) {
+                throw new SidecarError("CODEX_PROVIDER_ROUTE_UNCONFIRMED", "thread/start provider identity could not be confirmed");
+            }
+        } catch (error) {
+            if (error instanceof SidecarError) throw error;
+            throw new SidecarError("CODEX_PROVIDER_ROUTE_UNCONFIRMED", "thread/start provider identity could not be confirmed");
+        }
+    }
+
+    _safeProviderStartError(error) {
+        const allowed = new Set([
+            PROVIDER_ERROR_CODES.RUNTIME_UNAVAILABLE,
+            "CODEX_PROVIDER_ROUTE_UNCONFIRMED",
+            "CODEX_RPC_ERROR",
+            "CODEX_INVALID_RESPONSE",
+            "CODEX_NOT_READY",
+            "CODEX_START_BLOCKED",
+            "CODEX_START_ABORTED",
+            "CODEX_INITIALIZE_FAILED",
+            "CODEX_TURN_START_FAILED",
+            "SIDECAR_NOT_READY",
+            PROVIDER_START_ERROR_CODE
+        ]);
+        return error instanceof SidecarError && allowed.has(error.code)
+            ? error
+            : new SidecarError(PROVIDER_START_ERROR_CODE, "Provider Job could not start");
     }
 
     async _openWriteSession(params) {
@@ -447,6 +652,7 @@ class SidecarServer extends EventEmitter {
     }
 
     async _submitWriteJob(params) {
+        this._assertProviderRoutingRequest(params, "write");
         if (!this._writeConfigured || !this._writeAdapter || !this._writeValidationRunner || !this._writeValidationProfile) {
             throw new SidecarError("AICW_WRITE_NOT_CONFIGURED", "Sidecar write Jobs are not configured");
         }
@@ -635,11 +841,12 @@ class SidecarServer extends EventEmitter {
     }
 
     async _submitAnalyzeJob(params) {
+        const providerPlan = this._assertProviderRoutingRequest(params, "analyze");
         if (this.draining || this.state?.status !== "ready") throw new SidecarError("SIDECAR_NOT_READY", "Sidecar is not ready");
         if (this.activeJobs.size >= this.maxConcurrency) throw new SidecarError("CONCURRENCY_LIMIT", "Sidecar concurrency limit reached");
         const jobId = assertJobId(params.jobId);
         const projectPath = assertAbsolutePath(params.projectPath, "projectPath");
-        const serviceTier = validateServiceTierOverride(params.serviceTier);
+        const serviceTier = providerPlan ? providerPlan.serviceTier : validateServiceTierOverride(params.serviceTier);
         const timeoutSec = params.timeoutSec === undefined ? 600 : Number(params.timeoutSec);
         if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutSec > 86400) {
             throw new SidecarError("INVALID_TIMEOUT_SEC", "timeoutSec must be a finite number greater than 0 and at most 86400");
@@ -654,8 +861,17 @@ class SidecarServer extends EventEmitter {
         }
         const job = {
             jobId,
+            kind: "analyze",
             projectPath,
             paths,
+            providerPlan,
+            providerExclusive: Boolean(providerPlan),
+            execution: this.codex,
+            executionOwned: false,
+            executionListeners: null,
+            executionStopPromise: null,
+            executionStopRequested: false,
+            executionStopConfirmed: false,
             outputBytes: 0,
             timeoutSec,
             timeoutTimer: null,
@@ -686,25 +902,37 @@ class SidecarServer extends EventEmitter {
         job.timeoutTimer.unref?.();
         this.seenJobs.add(jobId);
         try {
+            if (providerPlan) this._bindProviderExecution(job, this._createProviderExecution(job));
             job.resolveSetup();
+            if (job.executionOwned) {
+                const startOutcome = await this._awaitStartOrTerminal(
+                    job,
+                    this._jobExecutionRequest(job, "start", {})
+                );
+                if (startOutcome.terminal) return this._terminalSubmissionResult(job, startOutcome.terminal);
+            }
+            const threadParams = job.providerExclusive
+                ? { projectPath, ...providerPlanToThreadParams(providerPlan) }
+                : { projectPath, model: params.model, serviceTier };
             const threadOutcome = await this._awaitStartOrTerminal(
                 job,
-                this._codexRequest("startThread", {
-                    projectPath,
-                    model: params.model,
-                    serviceTier
-                })
+                this._jobExecutionRequest(job, "startThread", threadParams)
             );
             if (threadOutcome.terminal) {
                 return this._terminalSubmissionResult(job, threadOutcome.terminal);
             }
             const thread = threadOutcome.value;
+            if (job.providerExclusive) this._assertProviderThreadIdentity(job, thread);
             job.threadId = thread.id;
             await this._updateMeta(job, metaValue => {
                 metaValue.sidecarInstanceId = this.state.instanceId;
                 metaValue.sidecarPid = this.state.pid;
                 metaValue.threadId = job.threadId;
                 metaValue.executionBackend = "codex-app-server";
+                if (job.providerExclusive) {
+                    metaValue.providerRouteId = providerPlan.routeId;
+                    metaValue.providerRouteRevision = providerPlan.revision;
+                }
                 if (Object.prototype.hasOwnProperty.call(metaValue, "submissionState") && metaValue.submissionState !== "accepted") {
                     metaValue.submissionState = "submitting";
                 }
@@ -712,11 +940,11 @@ class SidecarServer extends EventEmitter {
             });
             const turnOutcome = await this._awaitStartOrTerminal(
                 job,
-                this._codexRequest("startTurn", {
+                this._jobExecutionRequest(job, "startTurn", {
                     threadId: job.threadId,
                     text: params.text,
-                    effort: params.effort,
-                    serviceTier
+                    effort: job.providerExclusive ? providerPlan.reasoningEffort : params.effort,
+                    serviceTier: job.providerExclusive ? providerPlan.serviceTier : serviceTier
                 })
             );
             if (turnOutcome.terminal) {
@@ -752,19 +980,25 @@ class SidecarServer extends EventEmitter {
                     ...(job.terminal ? { terminalState: job.state } : {})
                 };
             }
-            const errorCode = error.code === "CODEX_RPC_ERROR"
-                ? "CODEX_TURN_START_FAILED"
-                : (error.code || "CODEX_JOB_START_FAILED");
+            const safeProviderError = job.providerExclusive ? this._safeProviderStartError(error) : null;
+            const errorCode = job.providerExclusive
+                ? safeProviderError.code
+                : error.code === "CODEX_RPC_ERROR"
+                    ? "CODEX_TURN_START_FAILED"
+                    : (error.code || "CODEX_JOB_START_FAILED");
             if (job.timeoutRequested) {
                 await this._finishJob(job, "timeout", null, "JOB_TIMEOUT", "JOB_TIMEOUT");
             } else {
                 await this._finishJob(job, "failed", 1, errorCode, errorCode);
             }
-            throw error instanceof SidecarError ? error : new SidecarError("CODEX_JOB_START_FAILED", "Job could not start");
+            throw safeProviderError || (error instanceof SidecarError
+                ? error
+                : new SidecarError("CODEX_JOB_START_FAILED", "Job could not start"));
         }
     }
 
     async _submitPatchJob(params) {
+        this._assertProviderRoutingRequest(params, "patch");
         if (this.draining || this.state?.status !== "ready") throw new SidecarError("SIDECAR_NOT_READY", "Sidecar is not ready");
         if (this.activeJobs.size >= this.maxConcurrency) throw new SidecarError("CONCURRENCY_LIMIT", "Sidecar concurrency limit reached");
         if (!this.codex?.isPatchVersionAllowed?.()) {
@@ -997,6 +1231,14 @@ class SidecarServer extends EventEmitter {
         }
         if (job.kind === "patch" || job.kind === "write") job.terminalClaim = "cancelled";
         job.cancelRequested = true;
+        if (job.providerExclusive && !job.turnId) {
+            await this._finishJob(job, "cancelled", null, null);
+            const terminal = await job.terminalPromise;
+            if (job.finalizationError) throw job.finalizationError;
+            return terminal?.state === "cancelled"
+                ? { cancelled: true, jobId, state: "cancelled" }
+                : { cancelled: false, alreadyTerminal: true, state: terminal?.state || job.state };
+        }
         let bindingTimer = null;
         const bindingTimeout = new Promise(resolve => {
             bindingTimer = setTimeout(() => resolve({ timeout: true }), this.cancelTimeoutMs);
@@ -1034,20 +1276,31 @@ class SidecarServer extends EventEmitter {
         }
     }
 
-    _handleServerRequest(request) {
+    _handleServerRequest(request, source = this.codex) {
         if (this.stopGate) return;
         const params = request?.params || {};
         const threadId = params.threadId || params.thread?.id;
         const turnId = params.turnId || params.turn?.id;
-        let patchJobs = [...this.activeJobs.values()].filter(job => (job.kind === "patch" || job.kind === "write") && !job.terminal);
+        const sourceJobs = [...this.activeJobs.values()].filter(job => this._jobExecution(job) === source && !job.terminal);
+        let patchJobs = sourceJobs.filter(job => job.kind === "patch" || job.kind === "write");
+        let providerJobs = sourceJobs.filter(job => job.providerExclusive && job.executionOwned && !job.executionStopRequested);
         if (threadId || turnId) {
             patchJobs = patchJobs.filter(job => (!threadId || job.threadId === threadId) && (!turnId || !job.turnId || job.turnId === turnId));
+            providerJobs = providerJobs.filter(job => (!threadId || job.threadId === threadId) && (!turnId || !job.turnId || job.turnId === turnId));
         }
         this._recordProtocolEvent("serverRequest", {
             method: String(request?.method || "").slice(0, 128),
             handled: false,
-            failClosedPatchJobs: patchJobs.length
+            failClosedPatchJobs: patchJobs.length,
+            failClosedProviderJobs: providerJobs.length
         });
+        for (const job of providerJobs) {
+            this._enqueueJobEvent(job, async () => {
+                if (job.terminal || job.finalizing || job.executionStopRequested) return;
+                if (!job.terminalClaim) job.terminalClaim = "failed";
+                await this._finishJob(job, "failed", 1, PROVIDER_APPROVAL_ERROR_CODE, PROVIDER_APPROVAL_ERROR_CODE);
+            });
+        }
         for (const job of patchJobs) {
             this._enqueueJobEvent(job, async () => {
                 if (job.terminal || job.finalizing) return;
@@ -1058,19 +1311,19 @@ class SidecarServer extends EventEmitter {
         }
     }
 
-    _handleNotification(message) {
+    _handleNotification(message, source = this.codex) {
         if (this.stopGate) return;
         const method = message?.method;
         const params = message?.params || {};
         if (!method) return;
         const turnId = params.turnId || params.turn?.id;
-        const job = this._findJob(params.threadId, turnId);
+        const job = this._findJob(params.threadId, turnId, source);
         if (!job) {
             if (params.threadId || turnId) this._recordProtocolEvent("protocol/notification-mismatch", { method, threadId: params.threadId ? String(params.threadId).slice(0, 128) : null, turnId: turnId ? String(turnId).slice(0, 128) : null });
             return;
         }
         this._enqueueJobEvent(job, async () => {
-            if (this.stopGate || job.terminal) return;
+            if (this.stopGate || job.terminal || job.finalizationFailed) return;
             if (method === "turn/started") {
                 job.state = "running";
                 this._recordJobEvent(job, method, params);
@@ -1152,9 +1405,12 @@ class SidecarServer extends EventEmitter {
         });
     }
 
-    _findJob(threadId, turnId) {
+    _findJob(threadId, turnId, source = this.codex) {
         if (!threadId) return null;
-        const job = [...this.activeJobs.values()].find(candidate => candidate.threadId === threadId);
+        const job = [...this.activeJobs.values()].find(candidate =>
+            !candidate.terminal && !candidate.finalizationFailed &&
+            this._jobExecution(candidate) === source && candidate.threadId === threadId
+        );
         if (!job) return null;
         if (turnId && job.turnId && job.turnId !== turnId) {
             this._recordProtocolEvent("protocol/turn-id-conflict", { jobId: job.jobId, threadId: String(threadId).slice(0, 128) });
@@ -1213,6 +1469,8 @@ class SidecarServer extends EventEmitter {
         this._scheduleTimeoutFinalize(job);
         if (job.turnId) {
             this._requestInterruptOnce(job).catch(() => {});
+        } else if (job.providerExclusive) {
+            this._stopOwnedExecution(job).catch(() => {});
         }
     }
 
@@ -1230,6 +1488,7 @@ class SidecarServer extends EventEmitter {
     }
 
     _terminalSubmissionResult(job, terminal) {
+        if (job.executionOwned && job.finalizationError) throw job.finalizationError;
         return {
             accepted: true,
             jobId: job.jobId,
@@ -1261,8 +1520,42 @@ class SidecarServer extends EventEmitter {
         if (job.interruptPromise) return job.interruptPromise;
         if (!job.threadId || !job.turnId || job.terminal || job.finalizing) return Promise.resolve();
         job.interruptRequested = true;
-        job.interruptPromise = this.codex.interruptTurn({ threadId: job.threadId, turnId: job.turnId });
+        const execution = this._jobExecution(job);
+        job.interruptPromise = execution.interruptTurn({ threadId: job.threadId, turnId: job.turnId });
         return job.interruptPromise;
+    }
+
+    _providerFinalizationError() {
+        return new SidecarError(PROVIDER_FINALIZATION_ERROR_CODE, "Provider Job cleanup was not confirmed");
+    }
+
+    _stopOwnedExecution(job) {
+        if (!job?.executionOwned) return Promise.resolve({ confirmed: true });
+        if (job.executionStopConfirmed) return Promise.resolve({ confirmed: true });
+        if (job.executionStopPromise) return job.executionStopPromise;
+        const execution = job.execution;
+        job.executionStopRequested = true;
+        let timer = null;
+        const timeoutMs = Math.max(250, Number(this.drainTimeoutMs || 2500));
+        const stopOperation = execution && typeof execution.stop === "function"
+            ? Promise.resolve().then(() => execution.stop({ suppressClosed: true }))
+            : Promise.reject(this._providerFinalizationError());
+        const timeoutOperation = new Promise((resolve, reject) => {
+            timer = setTimeout(() => reject(this._providerFinalizationError()), timeoutMs);
+            timer.unref?.();
+        });
+        job.executionStopPromise = Promise.race([stopOperation, timeoutOperation]).then(result => {
+            clearTimeout(timer);
+            if (result?.confirmed !== true) throw this._providerFinalizationError();
+            job.executionStopConfirmed = true;
+            this._detachProviderExecution(job);
+            return result;
+        }, () => {
+            clearTimeout(timer);
+            throw this._providerFinalizationError();
+        });
+        job.executionStopPromise.catch(() => {});
+        return job.executionStopPromise;
     }
 
     async _finalizeWrite(job) {
@@ -1638,7 +1931,8 @@ class SidecarServer extends EventEmitter {
         const allowed = new Set(["CODEX_STOP_FAILED", "CODEX_STOP_UNCONFIRMED",
             "PROTOCOL_BUFFER_OVERFLOW", "INVALID_JSON", "INVALID_MESSAGE", "UNKNOWN_RESPONSE_ID", "WRITE_FAILED",
             "CODEX_APP_SERVER_EXITED", "CODEX_PROTOCOL_ERROR", "SIDECAR_START_FAILED",
-            "SIDECAR_SHUTDOWN", "SIDECAR_RESOURCES_UNCONFIRMED", "SIDECAR_CLEANUP_FAILED"]);
+            "SIDECAR_SHUTDOWN", "SIDECAR_RESOURCES_UNCONFIRMED", "SIDECAR_CLEANUP_FAILED",
+            PROVIDER_FINALIZATION_ERROR_CODE]);
         try { return allowed.has(error?.code) ? error.code : fallback; } catch { return fallback; }
     }
 
@@ -1675,13 +1969,40 @@ class SidecarServer extends EventEmitter {
         this.stopFailed = false;
         this.stopPromise = Promise.resolve().then(async () => {
             if (!this.stopConfirmed) {
-                if (!this.codex && (this.activeJobs.size || this.state?.codexPid || this.state?.codexProcessIdentity)) {
-                    throw new SidecarError("CODEX_STOP_UNCONFIRMED", "Codex execution ownership remains without a process handle");
-                }
-                const stopping = this.codex ? this.codex.stop({ suppressClosed: true }) : Promise.resolve({ confirmed: true });
+                const ownedProviderJobs = [...this.activeJobs.values()].filter(job =>
+                    job.executionOwned === true && job.execution
+                );
+                let sharedError = null;
                 this._recordStopFault("stopping", this.stopCause);
-                const result = await stopping;
-                if (result?.confirmed !== true) throw new SidecarError("CODEX_STOP_UNCONFIRMED", "Codex stop is unconfirmed");
+                if (!this.sharedStopConfirmed) {
+                    const sharedOwnershipRecorded = [...this.activeJobs.values()].some(job => job.executionOwned !== true);
+                    if (!this.codex && (sharedOwnershipRecorded || this.state?.codexPid || this.state?.codexProcessIdentity)) {
+                        sharedError = new SidecarError("CODEX_STOP_UNCONFIRMED", "Codex execution ownership remains without a process handle");
+                    } else {
+                        try {
+                            const stopping = this.codex
+                                ? this.codex.stop({ suppressClosed: true })
+                                : Promise.resolve({ confirmed: true });
+                            const result = await stopping;
+                            if (result?.confirmed !== true) {
+                                sharedError = new SidecarError("CODEX_STOP_UNCONFIRMED", "Codex stop is unconfirmed");
+                            } else {
+                                this.sharedStopConfirmed = true;
+                            }
+                        } catch (error) {
+                            sharedError = error instanceof SidecarError
+                                ? error
+                                : new SidecarError("CODEX_STOP_FAILED", "Codex stop did not converge");
+                        }
+                    }
+                }
+                const providerStops = await Promise.allSettled(
+                    ownedProviderJobs.map(job => this._stopOwnedExecution(job))
+                );
+                const providerError = providerStops.find(result => result.status === "rejected")?.reason || null;
+                if (sharedError || providerError || !this.sharedStopConfirmed) {
+                    throw sharedError || providerError || new SidecarError("CODEX_STOP_UNCONFIRMED", "Codex stop is unconfirmed");
+                }
                 this.stopConfirmed = true;
                 this.resolveStopGate();
             }
@@ -1708,11 +2029,35 @@ class SidecarServer extends EventEmitter {
         return this.stopPromise;
     }
 
-    _handleProtocolError(error) {
+    _handleProtocolError(error, source = this.codex) {
+        if (source !== this.codex) {
+            const jobs = [...this.activeJobs.values()].filter(job =>
+                job.executionOwned === true && job.execution === source && !job.terminal && !job.executionStopRequested
+            );
+            for (const job of jobs) {
+                this._enqueueJobEvent(job, async () => {
+                    if (job.terminal || job.executionStopRequested) return;
+                    await this._finishJob(job, "failed", 1, PROVIDER_PROCESS_ERROR_CODE, PROVIDER_PROCESS_ERROR_CODE);
+                });
+            }
+            return Promise.resolve();
+        }
         return this._stopInstance("CODEX_PROTOCOL_ERROR", error);
     }
 
-    _handleCodexClosed() {
+    _handleCodexClosed(info, source = this.codex) {
+        if (source !== this.codex) {
+            const jobs = [...this.activeJobs.values()].filter(job =>
+                job.executionOwned === true && job.execution === source && !job.terminal && !job.executionStopRequested
+            );
+            for (const job of jobs) {
+                this._enqueueJobEvent(job, async () => {
+                    if (job.terminal || job.executionStopRequested) return;
+                    await this._finishJob(job, "failed", 1, PROVIDER_CLOSED_ERROR_CODE, PROVIDER_CLOSED_ERROR_CODE);
+                });
+            }
+            return Promise.resolve();
+        }
         return this._stopInstance("CODEX_APP_SERVER_EXITED", { code: "CODEX_APP_SERVER_EXITED" });
     }
 
@@ -1815,6 +2160,36 @@ class SidecarServer extends EventEmitter {
         return mapped;
     }
 
+    async _markProviderFinalizationIncomplete(job, error) {
+        if (job.finalizationFailed && job.finalizationError) return job.finalizationError;
+        const mapped = error instanceof SidecarError && error.code === PROVIDER_FINALIZATION_ERROR_CODE
+            ? error
+            : this._providerFinalizationError();
+        job.finalizationFailed = true;
+        job.finalizationError = mapped;
+        job.state = "finalizationFailed";
+        job.terminal = true;
+        this._clearJobTimers(job);
+        if (this.state) {
+            this.state.status = "degraded";
+            try { writeJsonAtomic(this.paths.statePath, this.state); } catch {}
+        }
+        if (!this.stopGate) {
+            try {
+                await this._updateMeta(job, meta => {
+                    meta.state = "finalizationFailed";
+                    meta.exitCode = 1;
+                    meta.completedAt = new Date().toISOString();
+                    meta.errorCode = mapped.code;
+                    meta.exitReason = mapped.code;
+                });
+            } catch {}
+        }
+        try { this.emit("protocolError", mapped); } catch {}
+        job.resolveTerminal({ state: job.state, errorCode: mapped.code });
+        return mapped;
+    }
+
     async _updatePatchMeta(job, updater, failureCode = "META_WRITE_FAILED") {
         try {
             await this._guardJobMeta(job, meta => {
@@ -1858,6 +2233,14 @@ class SidecarServer extends EventEmitter {
             state = "failed";
             exitCode = 1;
             reason = errorCode = this.stopReason;
+        }
+        if (job.executionOwned) {
+            try {
+                await this._stopOwnedExecution(job);
+            } catch (error) {
+                const finalizationError = await this._markProviderFinalizationIncomplete(job, error);
+                throw finalizationError;
+            }
         }
         if (job.kind === "patch" && !(await this._closePatchResources(job, {
             verifyBaseline: false
@@ -1907,6 +2290,7 @@ class SidecarServer extends EventEmitter {
             job.finalizationFailed = true;
             job.finalizationError = finalizeError;
             job.state = "finalizationFailed";
+            if (job.executionOwned) job.terminal = true;
             if (this.state) {
                 this.state.status = "degraded";
                 try { writeJsonAtomic(this.paths.statePath, this.state); } catch {}

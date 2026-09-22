@@ -3,6 +3,7 @@
 const { SidecarServer } = require("./sidecarServer");
 const { resolveFrameLimit } = require("./frameTransport");
 const { APP_SERVER_MAX_CONCURRENCY, loadWriteRuntimeConfig } = require("./writeRuntimeConfig");
+const { loadProviderRuntimeConfig } = require("./providerRuntimeConfig");
 
 function parseArgs(argv) {
     const result = {
@@ -48,6 +49,7 @@ function parseArgs(argv) {
 async function main() {
     const options = parseArgs(process.argv.slice(2));
     const writeRuntime = loadWriteRuntimeConfig(options.pluginDir);
+    const providerRuntime = loadProviderRuntimeConfig(options);
     const server = new SidecarServer({
         ...options,
         writeEnabled: writeRuntime.enabled,
@@ -55,7 +57,9 @@ async function main() {
         writeAllowedProjectRoots: writeRuntime.allowedProjectRoots,
         writeWorkspaceBaseRoot: writeRuntime.workspaceBaseRoot,
         writeValidationRunner: writeRuntime.validationRunner,
-        writeValidationProfile: writeRuntime.validationProfile
+        writeValidationProfile: writeRuntime.validationProfile,
+        providerRouteCatalog: providerRuntime.catalog,
+        providerCodexFactory: providerRuntime.factory
     });
     let signalPromise = null;
     const onSignal = () => {

@@ -30,6 +30,15 @@ const {
     isWriteProtocolProof,
     projectWriteProtocolStatus
 } = require("./writeRuntimeConfig");
+const {
+    PROVIDER_ERROR_CODES,
+    assertNoIpcRawProviderFields,
+    assertProviderRoutingProof,
+    isPlainObject,
+    isProviderAlias,
+    providerErrorResult,
+    providerRoutingStatus
+} = require("./providerRoutes");
 
 const OWNED_CHILD_TERMINATION_PROOFS = new WeakSet();
 const SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION = 1;
@@ -38,6 +47,57 @@ function hasExplicitServiceTierOverride(params) {
     if (!params || !Object.prototype.hasOwnProperty.call(params, "serviceTier")) return false;
     const value = params.serviceTier;
     return value !== undefined && value !== null && String(value).trim() !== "";
+}
+
+function providerSidecarError(error, fallbackCode = PROVIDER_ERROR_CODES.REQUEST_INVALID) {
+    const result = providerErrorResult(error, fallbackCode);
+    return new SidecarError(result.errorCode, result.error);
+}
+
+function providerRoutingStatusForLiveState(state, statusResult) {
+    if (!state || !statusResult || statusResult.instanceId !== state.instanceId) {
+        return providerRoutingStatus(null);
+    }
+    return providerRoutingStatus(statusResult);
+}
+
+function classifyProviderSubmission(method, params) {
+    if (!isPlainObject(params)) return { requiresProviderProof: false };
+
+    try {
+        assertNoIpcRawProviderFields(params);
+    } catch (error) {
+        throw providerSidecarError(error);
+    }
+
+    const hasOwn = key => Object.prototype.hasOwnProperty.call(params, key);
+    const hasRoute = hasOwn("providerRouteId") || hasOwn("providerRouteRevision");
+    const hasModel = hasOwn("model");
+    const model = hasModel ? params.model : undefined;
+    const isAlias = typeof model === "string" && isProviderAlias(model.trim());
+
+    if (method !== "submitAnalyzeJob") {
+        if (hasRoute || isAlias) {
+            throw providerSidecarError(null, PROVIDER_ERROR_CODES.MODE_UNSUPPORTED);
+        }
+        return { requiresProviderProof: false };
+    }
+
+    if (hasRoute && hasModel) {
+        throw providerSidecarError(null, PROVIDER_ERROR_CODES.ROUTE_MODEL_CONFLICT);
+    }
+    if (isAlias && !hasRoute) {
+        throw providerSidecarError(null, PROVIDER_ERROR_CODES.ROUTE_REQUIRED);
+    }
+    return { requiresProviderProof: hasRoute };
+}
+
+function assertProviderSubmissionProof(state) {
+    try {
+        assertProviderRoutingProof(state);
+    } catch (error) {
+        throw providerSidecarError(error);
+    }
 }
 
 function getSafeIdentityCwd() {
@@ -168,13 +228,17 @@ class SidecarClient {
     }
 
     async submitAnalyzeJob(params) {
+        const providerSubmission = classifyProviderSubmission("submitAnalyzeJob", params);
         const state = await this.ensure();
+        if (providerSubmission.requiresProviderProof) assertProviderSubmissionProof(state);
         this._assertFrameLimitsCompatible(state);
         this._assertServiceTierOverrideCompatible(state, params);
         return this._callWithState(state, "submitAnalyzeJob", params);
     }
 
     async submitPatchJob(params = {}) {
+        const providerSubmission = classifyProviderSubmission("submitPatchJob", params);
+        if (providerSubmission.requiresProviderProof) throw providerSidecarError(null, PROVIDER_ERROR_CODES.MODE_UNSUPPORTED);
         const jobId = assertJobId(params.jobId);
         const fixedPaths = jobPaths(this.jobRoot, jobId);
         const state = await this.ensure();
@@ -209,6 +273,8 @@ class SidecarClient {
     }
 
     async submitWriteJob(params = {}) {
+        const providerSubmission = classifyProviderSubmission("submitWriteJob", params);
+        if (providerSubmission.requiresProviderProof) throw providerSidecarError(null, PROVIDER_ERROR_CODES.MODE_UNSUPPORTED);
         const jobId = assertJobId(params.jobId);
         const fixedPaths = jobPaths(this.jobRoot, jobId);
         const state = await this.ensure();
@@ -267,7 +333,8 @@ class SidecarClient {
                 activeJobs: 0,
                 maxConcurrency: this.maxConcurrency,
                 ...projectPatchProtocolProof(null),
-                ...projectWriteProtocolStatus(null)
+                ...projectWriteProtocolStatus(null),
+                ...providerRoutingStatus(null)
             };
             const lockStatus = this._inspectStartupLock(lock);
             return {
@@ -277,6 +344,7 @@ class SidecarClient {
                 maxConcurrency: this.maxConcurrency,
                 ...projectPatchProtocolProof(null),
                 ...projectWriteProtocolStatus(null),
+                ...providerRoutingStatus(null),
                 ...(lockStatus.errorCode ? { errorCode: lockStatus.errorCode } : {})
             };
         }
@@ -347,7 +415,8 @@ class SidecarClient {
             activeJobs: 0,
             maxConcurrency: this.maxConcurrency,
             ...projectPatchProtocolProof(null),
-            ...projectWriteProtocolStatus(null)
+            ...projectWriteProtocolStatus(null),
+            ...providerRoutingStatus(null)
         };
 
         try {
@@ -366,7 +435,8 @@ class SidecarClient {
                     maxConcurrency: this.maxConcurrency,
                     reconciled: true,
                     ...projectPatchProtocolProof(null),
-                    ...projectWriteProtocolStatus(null)
+                    ...projectWriteProtocolStatus(null),
+                    ...providerRoutingStatus(null)
                 };
         } catch (error) {
             const replacement = this._readState();
@@ -393,7 +463,8 @@ class SidecarClient {
         return {
             ...status,
             ...projectPatchProtocolProof(status),
-            ...projectWriteProtocolStatus(status)
+            ...projectWriteProtocolStatus(status),
+            ...providerRoutingStatusForLiveState(state, status)
         };
     }
 
@@ -458,6 +529,7 @@ class SidecarClient {
         Object.assign(result, projectWriteProtocolStatus(
             statusResult === null || statusResult === undefined ? state : statusResult
         ));
+        Object.assign(result, providerRoutingStatusForLiveState(state, statusResult));
         if (statusResult?.errorCode) result.errorCode = statusResult.errorCode;
         if (warnings) result.warnings = [warnings];
         return result;
@@ -686,6 +758,7 @@ class SidecarClient {
         }
         return {
             ...state,
+            ...providerRoutingStatusForLiveState(state, status),
             frameLimits: status?.frameLimits || null,
             serviceTierOverrideProtocolVersion:
                 status?.serviceTierOverrideProtocolVersion === SERVICE_TIER_OVERRIDE_PROTOCOL_VERSION
