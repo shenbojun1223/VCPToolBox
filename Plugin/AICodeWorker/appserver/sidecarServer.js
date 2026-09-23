@@ -1536,7 +1536,7 @@ class SidecarServer extends EventEmitter {
         const execution = job.execution;
         job.executionStopRequested = true;
         let timer = null;
-        const timeoutMs = Math.max(250, Number(this.drainTimeoutMs || 2500));
+        const timeoutMs = Math.max(250, Number(this.drainTimeoutMs || 10000));
         const stopOperation = execution && typeof execution.stop === "function"
             ? Promise.resolve().then(() => execution.stop({ suppressClosed: true }))
             : Promise.reject(this._providerFinalizationError());
