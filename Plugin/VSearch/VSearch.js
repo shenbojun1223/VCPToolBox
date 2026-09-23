@@ -32,27 +32,9 @@ const {
 
 const CONCURRENCY = parseInt(MAX_CONCURRENT, 10) || 5;
 const TOKENS = parseInt(MAX_TOKENS, 10) || 50000;
-const SUMMARY_TOKENS = Math.min(Math.max(parseInt(process.env.SummaryMaxToken, 10) || 2200, 512), 6000);
-const SUMMARY_TARGET_CHARS = Math.min(Math.max(parseInt(process.env.SummaryTargetChars, 10) || 2400, 800), 8000);
-const SUMMARY_HARD_MAX_CHARS = Math.min(Math.max(parseInt(process.env.SummaryHardMaxChars, 10) || 5000, 1500), 12000);
-const TAVILY_MAX_RESULTS = Math.min(Math.max(parseInt(process.env.TavilyMaxResults, 10) || 5, 1), 10);
-const RAW_FALLBACK_MAX_CHARS = Math.min(Math.max(parseInt(process.env.RawFallbackMaxChars, 10) || 12000, 2000), 30000);
 const KIMI_MAX_RESULTS = Math.min(Math.max(parseInt(KIMI_SEARCH_MAX_RESULTS, 10) || 5, 1), 20);
 const KIMI_INCLUDE_CONTENT = KIMI_SEARCH_INCLUDE_CONTENT === 'true';
 const DEFAULT_PLUGIN_TIMEOUT_MS = 300000;
-
-const truncateWithNotice = (text, maxChars, label) => {
-    const value = String(text || '');
-    if (value.length <= maxChars) return value;
-    const head = value.slice(0, maxChars);
-    const paragraphBreak = head.lastIndexOf('\n\n');
-    const sentenceBreak = head.lastIndexOf('。');
-    const breakAt = Math.max(paragraphBreak, sentenceBreak);
-    const clipped = breakAt >= Math.floor(maxChars * 0.7)
-        ? head.slice(0, breakAt + 1)
-        : head;
-    return `${clipped}\n\n...[${label}已截断；原始长度 ${value.length} 字符]`;
-};
 const MIN_SAFE_REPLY_MARGIN_MS = 5000;
 const MAX_SAFE_REPLY_MARGIN_MS = 15000;
 const GROK_MAX_RETRIES = 3;
@@ -178,19 +160,8 @@ const resolveRedirect = async (url, signal) => {
     }
 };
 
-const getGeminiRelayUrl = () => {
-    const raw = (API_URL || '').trim();
-    if (!raw) {
-        throw new Error('VSearchUrl 未配置。');
-    }
-
-    const normalized = raw.replace(/\/+$/, '');
-    const relayBase = normalized.replace(/\/v1\/chat\/completions$/i, '');
-    return `${relayBase}/v1beta/models/${MODEL}:generateContent`;
-};
-
 /**
- * Grounding 模式 (New API Gemini Relay)
+ * Grounding 模式 (Google Search)
  */
 const callGroundingMode = async (topic, keyword, showURL = false, deadline, signal) => {
     const now = new Date();
@@ -210,26 +181,34 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
         ? '- 包含 [核心发现]、[关键数据/事实] 和 [参考来源] 三部分。'
         : '- 包含 [核心发现] 和 [关键数据/事实] 两部分。';
 
-    const userMessage = `【检索目标主题】：${topic}\n【当前检索关键词】：${keyword}\n\n请调用搜索工具获取最新信息，并按要求结构化输出。`;
+    const fullSystemPrompt = `${systemPrompt}\n\n输出要求：\n- 针对该关键词，提供一个结构化的总结。\n${outputRequirements}`;
+
+    const userMessage = `【检索目标主题】：${topic}\n【当前检索关键词】：${keyword}`;
 
     const payload = {
-        systemInstruction: {
-            parts: [{ text: `${systemPrompt}\n\n输出要求：\n- 针对该关键词，提供一个结构化的总结。\n${outputRequirements}` }]
-        },
-        contents: [
-            {
-                role: 'user',
-                parts: [{ text: userMessage }]
-            }
+        model: MODEL,
+        messages: [
+            { role: 'system', content: fullSystemPrompt },
+            { role: 'user', content: userMessage }
         ],
-        tools: [
-            {
-                google_search: {}
+        stream: false,
+        max_tokens: TOKENS,
+        // NewAPI 的 /v1/chat/completions 兼容层对 Gemini Grounding 的处理更接近
+        // OpenAI-compatible tool 外壳：保留原先可识别的 function/googleSearch 声明，
+        // 但显式关闭 function_calling_config，避免 tool_choice: "auto" 触发
+        // "Function calling config is set without function_declarations."
+        tools: [{
+            type: "function",
+            function: {
+                name: "googleSearch",
+                description: "从谷歌搜索引擎获取实时信息。",
+                parameters: { type: "object", properties: { query: { type: "string" } } }
             }
-        ],
-        generationConfig: {
-            temperature: 0.2,
-            maxOutputTokens: TOKENS
+        }],
+        tool_config: {
+            function_calling_config: {
+                mode: "NONE"
+            }
         }
     };
 
@@ -239,46 +218,28 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
             return `[搜索超时] 关键词: ${keyword}。已到达插件安全截止时间，跳过该关键词。`;
         }
 
-        const relayUrl = getGeminiRelayUrl();
-        log(`[Grounding] 正在通过 Gemini Relay 搜索关键词: "${keyword}"，剩余安全时间 ${remaining}ms...`);
-        const response = await axios.post(relayUrl, payload, {
+        log(`[Grounding] 正在搜索关键词: "${keyword}"，剩余安全时间 ${remaining}ms...`);
+        const response = await axios.post(API_URL, payload, {
             headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
             timeout: Math.min(180000, remaining),
             signal,
-            proxy: false
+            proxy: false  // 禁用代理，代理仅用于 URL 重定向解析
         });
-
-        const candidate = response.data?.candidates?.[0];
-        const parts = candidate?.content?.parts || [];
-        let content = parts
-            .map(part => part.text)
-            .filter(Boolean)
-            .join('\n')
-            .trim();
-
-        if (!content) {
-            content = '[搜索完成，但未返回可解析的文本内容]';
-        }
+        let content = response.data.choices[0].message.content;
 
         // 尝试解析并替换 Vertex 代理 URL
         try {
-            const groundingMetadata = candidate?.groundingMetadata
-                || candidate?.grounding_metadata
-                || response.data?.groundingMetadata
-                || response.data?.grounding_metadata;
-            const groundingChunks = groundingMetadata?.groundingChunks
-                || groundingMetadata?.grounding_chunks
-                || [];
+            const metadata = response.data.choices[0].message?.grounding_metadata || response.data.choices[0]?.grounding_metadata;
 
             // 1. 提取正文中所有可能的 Vertex 重定向 URL (包括没有协议头的)
             // 修复：[a-zA-Z0-9_=-] 中的 _=- 会被解释为无效范围，改为 [\w\-=]+
             const vertexUrlRegex = /(?:https?:\/\/)?vertexaisearch\.cloud\.google\.com\/grounding-api-redirect\/[\w\-=]+/g;
             const foundUrls = content.match(vertexUrlRegex) || [];
 
-            // 2. 提取 groundingMetadata 中的 URL
-            const metadataUrls = groundingChunks
-                .map(chunk => chunk?.web?.uri)
-                .filter(Boolean);
+            // 2. 提取 grounding_metadata 中的 URL
+            const metadataUrls = (metadata && metadata.grounding_chunks)
+                ? metadata.grounding_chunks.filter(chunk => chunk.web).map(chunk => chunk.web.uri)
+                : [];
 
             // 合并并去重
             const allVertexUrls = [...new Set([...foundUrls, ...metadataUrls])];
@@ -300,24 +261,23 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
             }
 
             // 4. 构建引证来源列表 (仅在要求 showURL 时使用 metadata)
-            if (showURL && groundingChunks.length > 0) {
-                const citations = groundingChunks
+            if (showURL && metadata && metadata.grounding_chunks) {
+                const citations = metadata.grounding_chunks
                     .map((chunk, index) => {
-                        if (chunk?.web?.uri) {
+                        if (chunk.web) {
                             const realUrl = urlMap.get(chunk.web.uri) || chunk.web.uri;
-                            const title = chunk.web.title || `Source ${index + 1}`;
-                            return `[cite: ${index + 1}] ${title}: ${realUrl}`;
+                            return `[cite: ${index + 1}] ${chunk.web.title}: ${realUrl}`;
                         }
                         return null;
                     })
-                    .filter(Boolean);
+                    .filter(c => c !== null);
 
                 if (citations.length > 0) {
                     content += `\n\n**API 自动引证来源 (已解析真实URL):**\n${citations.join('\n')}`;
                 }
             }
         } catch (metaError) {
-            log(`解析 groundingMetadata/重定向URL时出错: ${metaError.message}`);
+            log(`解析引证元数据/重定向URL时出错: ${metaError.message}`);
         }
 
         return content;
@@ -514,7 +474,7 @@ const callTavilySearch = async (query, tavilyKeyStr) => {
     const response = await tvly.search(query, {
         search_depth: 'advanced',
         topic: 'general',
-        max_results: TAVILY_MAX_RESULTS,
+        max_results: 10,
         include_answer: false,
         include_images: false,
     });
@@ -537,7 +497,7 @@ const callTavilySearch = async (query, tavilyKeyStr) => {
 /**
  * Tavily 模式 (直接调用 Tavily SDK 并发搜索 + 单次整体总结)
  */
-const callTavilyMode = async (topic, keywordList, tavilyKeyStr, showURL = false) => {
+const callTavilyMode = async (topic, keywordList, tavilyKeyStr) => {
     // === 阶段1: 并发搜索 ===
     let combinedResults = '';
     try {
@@ -579,11 +539,11 @@ const callTavilyMode = async (topic, keywordList, tavilyKeyStr, showURL = false)
             messages: [
                 {
                     role: 'system',
-                    content: `你是一个严谨、克制的信息整合专家。请围绕【研究主题：${topic}】把多组搜索结果整合成可直接交付的紧凑报告。\n正文目标不超过 ${SUMMARY_TARGET_CHARS} 个中文字符。优先输出明确结论、关键证据、重要分歧与限制；禁止逐条复述结果、重复背景、资料堆砌或讨论本次搜索流程。\n${showURL ? '最多保留 5 个最重要的来源 URL。' : '不要展示完整 URL；必要时仅写来源名称。'}`
+                    content: `你是一个顶级信息整合专家。你会收到一份关于多个关键词的原始搜索结果汇总。\n你的任务是结合【研究主题：${topic}】，将这些零散的信息提炼成一份高质量、结构化、具有深度洞察的研究报告。\n请保留重要的 URL 链接，并确保报告逻辑严密。`
                 },
                 { role: 'user', content: `原始搜索结果汇总如下：\n\n${combinedResults}` }
             ],
-            max_tokens: SUMMARY_TOKENS
+            max_tokens: TOKENS
         };
 
         const summaryAxiosConfig = {
@@ -595,25 +555,21 @@ const callTavilyMode = async (topic, keywordList, tavilyKeyStr, showURL = false)
         const summaryResponse = await axios.post(summaryUrl, summaryPayload, summaryAxiosConfig);
 
         log(`[Tavily] 阶段2/2 完成: 总结成功`);
-        const summaryText = summaryResponse.data?.choices?.[0]?.message?.content || '';
-        if (!summaryText.trim()) {
-            throw new Error('总结模型返回空内容');
-        }
-        return truncateWithNotice(summaryText, SUMMARY_HARD_MAX_CHARS, '二阶总结');
+        return summaryResponse.data.choices[0].message.content;
     } catch (summaryError) {
         const statusCode = summaryError.response?.status || 'N/A';
         const errorDetail = summaryError.response?.data ? JSON.stringify(summaryError.response.data).substring(0, 500) : summaryError.message;
         log(`[Tavily] 阶段2 总结失败 (HTTP ${statusCode}): ${errorDetail}`);
 
         // 总结失败时，回退返回原始搜索结果而不是完全失败
-        return `[总结阶段失败 (HTTP ${statusCode}): ${summaryError.message}]\n\n**以下为受长度保护的原始搜索结果（未经整合）：**\n\n${truncateWithNotice(combinedResults, RAW_FALLBACK_MAX_CHARS, '原始搜索结果')}`;
+        return `[总结阶段失败 (HTTP ${statusCode}): ${summaryError.message}]\n\n**以下为原始搜索结果（未经整合）：**\n\n${combinedResults}`;
     }
 };
 
 /**
  * 单次调用 Kimi Search API
  */
-const callKimiSearch = async (query, apiKey, baseUrl, maxResults, includeContent, showURL = false) => {
+const callKimiSearch = async (query, apiKey, baseUrl, maxResults, includeContent) => {
     const url = baseUrl.endsWith('/search') ? baseUrl : `${baseUrl.replace(/\/$/, '')}/search`;
     try {
         log(`[KimiSearch] 正在搜索: "${query}"...`);
@@ -640,7 +596,7 @@ const callKimiSearch = async (query, apiKey, baseUrl, maxResults, includeContent
         let markdown = '';
         results.forEach((item, index) => {
             markdown += `${index + 1}. **${item.title}**\n`;
-            if (showURL && item.url) markdown += `   URL: ${item.url}\n`;
+            markdown += `   URL: ${item.url}\n`;
             if (item.date) markdown += `   Date: ${item.date}\n`;
             if (item.site_name) markdown += `   Source: ${item.site_name}\n`;
             markdown += `   Summary: ${item.snippet}\n`;
@@ -660,13 +616,13 @@ const callKimiSearch = async (query, apiKey, baseUrl, maxResults, includeContent
 /**
  * KimiSearch 模式 (并发搜索 + 可选 LLM 总结)
  */
-const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResults, includeContent, showURL = false) => {
+const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResults, includeContent) => {
     // === 阶段1: 并发搜索 ===
     let combinedResults = '';
     try {
         log(`[KimiSearch] 阶段1/2: 正在并发获取 ${keywordList.length} 个关键词的搜索结果...`);
         const searchPromises = keywordList.map(async (kw) => {
-            const result = await callKimiSearch(kw, apiKey, baseUrl, maxResults, includeContent, showURL);
+            const result = await callKimiSearch(kw, apiKey, baseUrl, maxResults, includeContent);
             log(`[KimiSearch] 关键词 "${kw}" 搜索完成`);
             return `### 关键词: ${kw}\n${result}`;
         });
@@ -684,8 +640,8 @@ const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResult
     const summaryModel = SUMMARY_MODEL || MODEL || "claude-sonnet-4-6";
 
     if (!summaryKey || !summaryUrl) {
-        log(`[KimiSearch] 未配置总结用 LLM API（SummaryKey/SummaryUrl 或 VSearchKey/VSearchUrl），返回受长度保护的原始结果`);
-        return truncateWithNotice(combinedResults, RAW_FALLBACK_MAX_CHARS, 'KimiSearch 原始结果');
+        log(`[KimiSearch] 未配置总结用 LLM API（SummaryKey/SummaryUrl 或 VSearchKey/VSearchUrl），跳过总结阶段，直接返回原始结果`);
+        return combinedResults;
     }
 
     try {
@@ -695,11 +651,11 @@ const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResult
             messages: [
                 {
                     role: 'system',
-                    content: `你是一个严谨、克制的信息整合专家。请围绕【研究主题：${topic}】把多组 KimiSearch 结果整合成可直接交付的紧凑报告。\n正文目标不超过 ${SUMMARY_TARGET_CHARS} 个中文字符。优先输出明确结论、关键证据、重要分歧与限制；禁止逐条复述结果、重复背景、资料堆砌或讨论搜索流程。\n${showURL ? '最多保留 5 个最重要的来源 URL。' : '不要展示完整 URL；必要时仅写来源名称。'}`
+                    content: `你是一个顶级信息整合专家。你会收到一份关于多个关键词的原始搜索结果汇总。\n你的任务是结合【研究主题：${topic}】，将这些零散的信息提炼成一份高质量、结构化、具有深度洞察的研究报告。\n请保留重要的 URL 链接，并确保报告逻辑严密。`
                 },
                 { role: 'user', content: `原始搜索结果汇总如下：\n\n${combinedResults}` }
             ],
-            max_tokens: SUMMARY_TOKENS
+            max_tokens: TOKENS
         };
 
         const summaryResponse = await axios.post(summaryUrl, summaryPayload, {
@@ -709,31 +665,32 @@ const callKimiSearchMode = async (topic, keywordList, apiKey, baseUrl, maxResult
         });
 
         log(`[KimiSearch] 阶段2/2 完成: 总结成功`);
-        const summaryText = summaryResponse.data?.choices?.[0]?.message?.content || '';
-        if (!summaryText.trim()) {
-            throw new Error('KimiSearch 总结模型返回空内容');
-        }
-        return truncateWithNotice(summaryText, SUMMARY_HARD_MAX_CHARS, 'KimiSearch 二阶总结');
+        return summaryResponse.data.choices[0].message.content;
     } catch (summaryError) {
         const statusCode = summaryError.response?.status || 'N/A';
         const errorDetail = summaryError.response?.data ? JSON.stringify(summaryError.response.data).substring(0, 500) : summaryError.message;
         log(`[KimiSearch] 阶段2 总结失败 (HTTP ${statusCode}): ${errorDetail}`);
-        return `[总结阶段失败 (HTTP ${statusCode}): ${summaryError.message}]\n\n**以下为受长度保护的 KimiSearch 原始结果（未经整合）：**\n\n${truncateWithNotice(combinedResults, RAW_FALLBACK_MAX_CHARS, 'KimiSearch 原始结果')}`;
+        return `[总结阶段失败 (HTTP ${statusCode}): ${summaryError.message}]\n\n**以下为原始搜索结果（未经整合）：**\n\n${combinedResults}`;
     }
 };
 
 async function main(request) {
-    const { SearchTopic, Keywords, ShowURL,
+    const { SearchTopic, Keywords, ShowURL, 
         SearchMode = process.env.SearchMode || 'kimisearch' } = request;
     const showURL = ShowURL === true || ShowURL === 'true';
 
-    if (!SearchTopic || !Keywords) {
-        return sendResponse({ status: "error", error: "缺少必需参数: SearchTopic 和 Keywords。" });
+    if (!SearchTopic || typeof SearchTopic !== 'string' || !SearchTopic.trim()) {
+        return sendResponse({ status: "error", error: "缺少必需参数: SearchTopic。" });
     }
 
-    const keywordList = Keywords.split(/[,\n，]/).map(k => k.trim()).filter(k => k.length > 0);
+    // Keywords 是可选的高级分支控制参数。简单搜索未提供有效关键词时，
+    // 直接使用 SearchTopic 作为唯一搜索词，让后续搜索 AI 自行理解和扩展意图。
+    const keywordList = typeof Keywords === 'string'
+        ? Keywords.split(/[,\n，]/).map(k => k.trim()).filter(k => k.length > 0)
+        : [];
     if (keywordList.length === 0) {
-        return sendResponse({ status: "error", error: "未识别到有效的关键词。" });
+        keywordList.push(SearchTopic.trim());
+        log(`未提供有效 Keywords，使用 SearchTopic 作为唯一搜索词`);
     }
 
     const { deadline } = await createDeadlineContext();
@@ -766,7 +723,7 @@ async function main(request) {
         if (!tavilyKeyStr) {
             return sendResponse({ status: "error", error: "Tavily 模式需要在根目录 config.env 中配置 TavilyKey。" });
         }
-        const result = await callTavilyMode(SearchTopic, keywordList, tavilyKeyStr, showURL);
+        const result = await callTavilyMode(SearchTopic, keywordList, tavilyKeyStr);
         const reportText = `## VSearch 检索报告 [模式: Tavily]\n\n**研究主题**: ${SearchTopic}\n\n${result}`;
         return sendResponse({ status: "success", result: buildAiFriendlyResult(reportText) });
     }
@@ -779,7 +736,7 @@ async function main(request) {
         if (!KIMI_SEARCH_URL) {
             return sendResponse({ status: "error", error: "KimiSearch 模式需要在 config.env 中配置 KimiSearchUrl。" });
         }
-        const result = await callKimiSearchMode(SearchTopic, keywordList, KIMI_SEARCH_KEY, KIMI_SEARCH_URL, KIMI_MAX_RESULTS, KIMI_INCLUDE_CONTENT, showURL);
+        const result = await callKimiSearchMode(SearchTopic, keywordList, KIMI_SEARCH_KEY, KIMI_SEARCH_URL, KIMI_MAX_RESULTS, KIMI_INCLUDE_CONTENT);
         const reportText = `## VSearch 检索报告 [模式: KimiSearch]\n\n**研究主题**: ${SearchTopic}\n\n${result}`;
         return sendResponse({ status: "success", result: buildAiFriendlyResult(reportText) });
     }

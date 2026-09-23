@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const webSocketServer = require('../WebSocketServer');
 const pluginManager = require('../Plugin');
+const { createDefaultExecutionBridgeRegistry } = require('../modules/pluginBridgeRegistry');
 
 const { distributedServers } = webSocketServer.__testing;
 
@@ -96,6 +97,32 @@ test('uses a sole online provider when no source match is available', () => {
 
   assert.equal(route.serverId, 'work');
   assert.equal(route.reason, 'sole_provider');
+});
+
+test('execution bridge routes distributed calls using the request source', async () => {
+  const routedCalls = [];
+  const registry = createDefaultExecutionBridgeRegistry();
+  const plugin = { name: 'PowerShellExecutor', isDistributed: true, serverId: 'work' };
+  const context = {
+    toolName: 'PowerShellExecutor',
+    requestIp: '203.0.113.10',
+    debugLog() {},
+    webSocketServer: {
+      resolveDistributedToolServer(toolName, requestIp, preferredServerId) {
+        assert.deepEqual([toolName, requestIp, preferredServerId],
+          ['PowerShellExecutor', '203.0.113.10', 'work']);
+        return { serverId: 'home', reason: 'source_ip' };
+      },
+      async executeDistributedTool(serverId, toolName, args) {
+        routedCalls.push([serverId, toolName, args]);
+        return { status: 'success', result: 'ok' };
+      }
+    }
+  };
+
+  const result = await registry.execute(plugin, { command: 'Get-Date' }, context);
+  assert.deepEqual(routedCalls, [['home', 'PowerShellExecutor', { command: 'Get-Date' }]]);
+  assert.deepEqual(result, { result: { status: 'success', result: 'ok' } });
 });
 
 test('PluginManager keeps duplicate providers and fails over the logical manifest', () => {
