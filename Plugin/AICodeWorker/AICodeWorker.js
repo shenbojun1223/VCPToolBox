@@ -542,15 +542,8 @@ function readCodexModelsCache() {
     return result;
 }
 
-function canonicalCodexModelName(modelName) {
-    const raw = String(modelName || "").trim();
-    const lower = raw.toLowerCase();
-    if (lower === "gpt-6-luna" || lower === "gpt-6") return "gpt-6-astra";
-    return raw;
-}
-
 function findCodexModelEntry(models, modelName) {
-    const target = String(canonicalCodexModelName(modelName) || "").trim().toLowerCase();
+    const target = String(modelName || "").trim().toLowerCase();
     if (!target) return null;
 
     return (models || []).find(model => {
@@ -588,7 +581,7 @@ function resolveCodexModelCapabilities(taskModel = "") {
     let modelSource = "unknown";
 
     if (taskModelValue) {
-        model = canonicalCodexModelName(taskModelValue);
+        model = taskModelValue;
         modelSource = "task_override";
     } else if (CFG.codexModel) {
         model = CFG.codexModel;
