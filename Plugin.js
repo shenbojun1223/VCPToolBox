@@ -18,6 +18,7 @@ const {
     createDefaultDependencyBridgeRegistry,
     createDefaultExecutionBridgeRegistry
 } = require('./modules/pluginBridgeRegistry');
+const { IncrementalJsonObjectParser } = require('./modules/incrementalJsonObjectParser');
 
 const PLUGIN_DIR = path.join(__dirname, 'Plugin');
 const manifestFileName = 'plugin-manifest.json';
@@ -1638,11 +1639,21 @@ class PluginManager extends EventEmitter {
             });
 
 
-            let outputBuffer = ''; // Buffer to accumulate data chunks
-            let errorOutput = '';
+            let outputBuffer = null;
+            const stdoutChunks = [];
+            let errorOutput = null;
+            const stderrChunks = [];
+            let stdoutPreview = '';
+            let stdoutEnded = false;
+            let stderrEnded = false;
+            let closeResult = null;
+            let closeHandled = false;
             let processExited = false;
             let initialResponseSent = false; // Flag for async plugins
+            let promiseSettled = false;
+            let timeoutTriggered = false;
             const isAsyncPlugin = plugin.pluginType === 'asynchronous';
+            const responseParser = isAsyncPlugin ? new IncrementalJsonObjectParser() : null;
             const isArcheryNoReply = isAsyncPlugin && executionOptions?.archeryNoReply === true;
             const noReplyGraceMs = Number.isFinite(Number(executionOptions?.archeryNoReplyGraceMs))
                 ? Math.max(0, Number(executionOptions.archeryNoReplyGraceMs))
@@ -1650,17 +1661,57 @@ class PluginManager extends EventEmitter {
 
             const timeoutDuration = plugin.communication.timeout || (isAsyncPlugin ? 1800000 : 60000); // Use manifest timeout, or 30min for async, 1min for sync
 
-            const timeoutId = setTimeout(() => {
+            let timeoutId = null;
+            let noReplyTimerId = null;
+
+            const clearExecutionTimers = () => {
+                if (timeoutId) clearTimeout(timeoutId);
+                if (noReplyTimerId) clearTimeout(noReplyTimerId);
+            };
+
+            const resolveOnce = value => {
+                if (promiseSettled) return false;
+                promiseSettled = true;
+                resolve(value);
+                return true;
+            };
+
+            const rejectOnce = error => {
+                if (promiseSettled) return false;
+                promiseSettled = true;
+                reject(error);
+                return true;
+            };
+
+            const appendStdoutPreview = text => {
+                if (stdoutPreview.length >= 200) return;
+                stdoutPreview += text.substring(0, 200 - stdoutPreview.length);
+            };
+
+            const getFinalStdout = () => {
+                if (outputBuffer === null) outputBuffer = stdoutChunks.join('');
+                return outputBuffer;
+            };
+
+            const getFinalStderr = () => {
+                if (errorOutput === null) errorOutput = stderrChunks.join('');
+                return errorOutput;
+            };
+
+            timeoutId = setTimeout(() => {
                 if (!processExited && !initialResponseSent && isAsyncPlugin) {
                     // For async, if initial response not sent by timeout, it's an error for that phase
+                    timeoutTriggered = true;
+                    if (noReplyTimerId) clearTimeout(noReplyTimerId);
                     console.error(`[PluginManager executePlugin Internal] Async plugin "${pluginName}" initial response timed out after ${timeoutDuration}ms.`);
                     this._killProcessTree(pluginProcess.pid, pluginName);
-                    reject(new Error(`Plugin "${pluginName}" initial response timed out.`));
+                    rejectOnce(new Error(`Plugin "${pluginName}" initial response timed out.`));
                 } else if (!processExited && !isAsyncPlugin) {
                     // For sync plugins, or if async initial response was sent but process hangs
+                    timeoutTriggered = true;
                     console.error(`[PluginManager executePlugin Internal] Plugin "${pluginName}" execution timed out after ${timeoutDuration}ms.`);
                     this._killProcessTree(pluginProcess.pid, pluginName);
-                    reject(new Error(`Plugin "${pluginName}" execution timed out.`));
+                    rejectOnce(new Error(`Plugin "${pluginName}" execution timed out.`));
                 } else if (!processExited && isAsyncPlugin && initialResponseSent) {
                     // Async plugin's initial response was sent, but the process is still running (e.g. for background tasks)
                     // We let it run, but log if it exceeds the overall timeout.
@@ -1670,12 +1721,13 @@ class PluginManager extends EventEmitter {
             }, timeoutDuration);
 
             const resolveArcheryNoReplySilent = (reason) => {
-                if (!isArcheryNoReply || processExited || initialResponseSent) return false;
+                if (!isArcheryNoReply || processExited || timeoutTriggered || initialResponseSent) return false;
                 initialResponseSent = true;
+                if (noReplyTimerId) clearTimeout(noReplyTimerId);
                 if (this.debugMode) {
                     console.log(`[PluginManager executePlugin Internal] Async no-reply plugin "${pluginName}" resolved silently. reason=${reason}`);
                 }
-                resolve({
+                resolveOnce({
                     status: "success",
                     __vcpArcheryNoReplySilent: true,
                     result: {
@@ -1689,119 +1741,105 @@ class PluginManager extends EventEmitter {
                 return true;
             };
 
-            const noReplyTimerId = isArcheryNoReply ? setTimeout(() => {
+            noReplyTimerId = isArcheryNoReply ? setTimeout(() => {
                 resolveArcheryNoReplySilent(`no_response_after_${noReplyGraceMs}ms`);
             }, noReplyGraceMs) : null;
 
             pluginProcess.stdout.setEncoding('utf8');
             pluginProcess.stdout.on('data', (data) => {
-                if (processExited || (isAsyncPlugin && initialResponseSent)) {
+                const text = typeof data === 'string' ? data : data.toString('utf8');
+                if (processExited || timeoutTriggered || (isAsyncPlugin && initialResponseSent)) {
                     // If async and initial response sent, or process exited, ignore further stdout for this Promise.
                     // The plugin's background task might still log to its own stdout, but we don't collect it here.
-                    if (this.debugMode && isAsyncPlugin && initialResponseSent) console.log(`[PluginManager executePlugin Internal] Async plugin ${pluginName} (initial response sent) produced more stdout: ${data.substring(0, 100)}...`);
+                    if (this.debugMode && isAsyncPlugin && initialResponseSent) console.log(`[PluginManager executePlugin Internal] Async plugin ${pluginName} (initial response sent) produced more stdout: ${text.substring(0, 100)}...`);
                     return;
                 }
-                outputBuffer += data;
-                try {
-                    // Try to parse a complete JSON object from the buffer.
-                    // This is a simple check; for robust streaming JSON, a more complex parser is needed.
-                    // We assume the first complete JSON is the one we want for async initial response.
-                    const potentialJsonMatch = outputBuffer.match(/(\{[\s\S]*?\})(?:\s|$)/);
-                    if (potentialJsonMatch && potentialJsonMatch[1]) {
-                        const jsonString = potentialJsonMatch[1];
-                        const parsedOutput = JSON.parse(jsonString);
-
-                        if (parsedOutput && (parsedOutput.status === "success" || parsedOutput.status === "error")) {
-                            if (isAsyncPlugin) {
-                                if (!initialResponseSent) {
-                                    if (noReplyTimerId) clearTimeout(noReplyTimerId);
-                                    if (isArcheryNoReply && parsedOutput.status === "success") {
-                                        resolveArcheryNoReplySilent('initial_success_json');
-                                        return;
-                                    }
-                                    if (this.debugMode) console.log(`[PluginManager executePlugin Internal] Async plugin "${pluginName}" sent initial JSON response. Resolving promise.`);
-                                    initialResponseSent = true;
-                                    // For async, we resolve with the first valid JSON and let the process continue if it has non-daemon threads.
-                                    // We don't clear the main timeout here for async, as the process might still need to be killed if it misbehaves badly later.
-                                    // However, the primary purpose of this promise is fulfilled.
-                                    resolve(parsedOutput);
-                                    // We don't return or clear outputBuffer here, as more data might be part of a *synchronous* plugin's single large JSON output.
-                                }
-                            } else { // Synchronous plugin
-                                // For sync plugins, we wait for 'exit' to ensure all output is collected.
-                                // This block within 'data' event is more for validating if the output *looks* like our expected JSON.
-                                // The actual resolve for sync plugins happens in 'exit'.
-                                if (this.debugMode) console.log(`[PluginManager executePlugin Internal] Sync plugin "${pluginName}" current output buffer contains a potential JSON.`);
-                            }
-                        }
-                    }
-                } catch (e) {
-                    // Incomplete JSON or invalid JSON, wait for more data or 'exit' event.
-                    if (this.debugMode && outputBuffer.length > 2) console.log(`[PluginManager executePlugin Internal] Plugin "${pluginName}" stdout buffer not yet a complete JSON or invalid. Buffer: ${outputBuffer.substring(0, 100)}...`);
+                if (!isAsyncPlugin) {
+                    // Synchronous plugins are parsed once, after close confirms stdout has drained.
+                    stdoutChunks.push(text);
+                    return;
                 }
+
+                appendStdoutPreview(text);
+                const parsedOutput = responseParser.push(text);
+                if (parsedOutput && !initialResponseSent) {
+                    if (noReplyTimerId) clearTimeout(noReplyTimerId);
+                    if (isArcheryNoReply && parsedOutput.status === "success") {
+                        resolveArcheryNoReplySilent('initial_success_json');
+                        return;
+                    }
+                    if (this.debugMode) console.log(`[PluginManager executePlugin Internal] Async plugin "${pluginName}" sent initial JSON response. Resolving promise.`);
+                    initialResponseSent = true;
+                    // Resolve on the first complete protocol object; later stdout belongs to the background task.
+                    resolveOnce(parsedOutput);
+                }
+            });
+
+            pluginProcess.stdout.once('end', () => {
+                stdoutEnded = true;
+                finalizeAfterClose();
             });
 
             pluginProcess.stderr.setEncoding('utf8');
             pluginProcess.stderr.on('data', (data) => {
-                errorOutput += data;
-                if (this.debugMode) console.warn(`[PluginManager executePlugin Internal stderr] Plugin "${pluginName}": ${data.trim()}`);
+                const text = typeof data === 'string' ? data : data.toString('utf8');
+                stderrChunks.push(text);
+                if (this.debugMode) console.warn(`[PluginManager executePlugin Internal stderr] Plugin "${pluginName}": ${text.trim()}`);
             });
 
+            pluginProcess.stderr.once('end', () => {
+                stderrEnded = true;
+                finalizeAfterClose();
+            });
             pluginProcess.on('error', (err) => {
-                processExited = true; clearTimeout(timeoutId);
-                if (noReplyTimerId) clearTimeout(noReplyTimerId);
-                if (!initialResponseSent) { // Only reject if initial response (for async) or any response (for sync) hasn't been sent
-                    reject(new Error(`Failed to start plugin "${pluginName}": ${err.message}`));
+                processExited = true;
+                clearExecutionTimers();
+                if (!initialResponseSent && !promiseSettled) { // Only reject if no response has been sent
+                    rejectOnce(new Error(`Failed to start plugin "${pluginName}": ${err.message}`));
                 } else if (this.debugMode) {
                     console.error(`[PluginManager executePlugin Internal] Error after initial response for async plugin "${pluginName}": ${err.message}. Process might have been expected to continue.`);
                 }
             });
 
-            pluginProcess.on('exit', (code, signal) => {
-                processExited = true;
-                clearTimeout(timeoutId); // Clear the main timeout once the process exits.
-                if (noReplyTimerId) clearTimeout(noReplyTimerId);
+            pluginProcess.once('exit', (code, signal) => {
+                // exit can precede stdio drain. close below is the only event that finalizes parsing.
+                if (this.debugMode && isAsyncPlugin && initialResponseSent) {
+                    console.log(`[PluginManager executePlugin Internal] Async plugin "${pluginName}" exit observed with code ${code}, signal ${signal}; waiting for close.`);
+                }
+            });
 
-                if (isAsyncPlugin && initialResponseSent) {
-                    // For async plugins where initial response was already sent, log exit but don't re-resolve/reject.
-                    if (this.debugMode) console.log(`[PluginManager executePlugin Internal] Async plugin "${pluginName}" process exited with code ${code}, signal ${signal} after initial response was sent.`);
+            const finalizeAfterClose = () => {
+                if (!closeResult || closeHandled) return;
+                const streamDrainConfirmed = stdoutEnded && stderrEnded;
+                if (!promiseSettled && !isAsyncPlugin && closeResult.signal === null && closeResult.code === 0 && !streamDrainConfirmed) {
+                    closeHandled = true;
+                    clearExecutionTimers();
+                    rejectOnce(new Error(`Plugin "${pluginName}" closed before stdout/stderr streams drained.`));
                     return;
                 }
 
-                // If we are here, it's either a sync plugin, or an async plugin whose initial response was NOT sent before exit.
+                closeHandled = true;
+                clearExecutionTimers();
+
+                const { code, signal } = closeResult;
+                if (isAsyncPlugin && initialResponseSent) {
+                    if (this.debugMode) console.log(`[PluginManager executePlugin Internal] Async plugin "${pluginName}" process closed with code ${code}, signal ${signal} after initial response was sent.`);
+                    return;
+                }
+                if (promiseSettled) return;
 
                 if (signal === 'SIGKILL' || signal === 'SIGTERM') { // Typically means timeout killed it
-                    if (!initialResponseSent) reject(new Error(`Plugin "${pluginName}" execution timed out or was killed.`));
+                    if (!initialResponseSent) rejectOnce(new Error(`Plugin "${pluginName}" execution timed out or was killed.`));
                     return;
                 }
 
-                try {
-                    const parsedOutput = JSON.parse(outputBuffer.trim()); // Use accumulated outputBuffer
-                    if (parsedOutput && (parsedOutput.status === "success" || parsedOutput.status === "error")) {
-                        if (code !== 0 && parsedOutput.status === "success" && this.debugMode) {
-                            console.warn(`[PluginManager executePlugin Internal] Plugin "${pluginName}" exited with code ${code} but reported success in JSON. Trusting JSON.`);
-                        }
-                        if (code === 0 && parsedOutput.status === "error" && this.debugMode) {
-                            console.warn(`[PluginManager executePlugin Internal] Plugin "${pluginName}" exited with code 0 but reported error in JSON. Trusting JSON.`);
-                        }
-                        if (errorOutput.trim()) parsedOutput.pluginStderr = errorOutput.trim();
-
-                        if (!initialResponseSent) resolve(parsedOutput); // Ensure resolve only once
-                        else if (this.debugMode) console.log(`[PluginManager executePlugin Internal] Plugin ${pluginName} exited, initial async response already sent.`);
-                        return;
-                    }
-                    if (this.debugMode) console.warn(`[PluginManager executePlugin Internal] Plugin "${pluginName}" final stdout was not in the expected JSON format: ${outputBuffer.trim().substring(0, 100)}`);
-                } catch (e) {
-                    if (this.debugMode) console.warn(`[PluginManager executePlugin Internal] Failed to parse final stdout JSON from plugin "${pluginName}". Error: ${e.message}. Stdout: ${outputBuffer.trim().substring(0, 100)}`);
-                }
-
-                if (!initialResponseSent) { // Only reject if no response has been sent yet
+                if (isAsyncPlugin) {
                     if (isArcheryNoReply && code === 0) {
                         initialResponseSent = true;
                         if (this.debugMode) {
                             console.log(`[PluginManager executePlugin Internal] Async no-reply plugin "${pluginName}" exited with code 0 before initial JSON. Resolving silently.`);
                         }
-                        resolve({
+                        resolveOnce({
                             status: "success",
                             __vcpArcheryNoReplySilent: true,
                             result: {
@@ -1814,14 +1852,71 @@ class PluginManager extends EventEmitter {
                         });
                     } else if (code !== 0) {
                         let detailedError = `Plugin "${pluginName}" exited with code ${code}.`;
-                        if (outputBuffer.trim()) detailedError += ` Stdout: ${outputBuffer.trim().substring(0, 200)}`;
-                        if (errorOutput.trim()) detailedError += ` Stderr: ${errorOutput.trim().substring(0, 200)}`;
-                        reject(new Error(detailedError));
+                        if (stdoutPreview.trim()) detailedError += ` Stdout: ${stdoutPreview.trim().substring(0, 200)}`;
+                        const finalStderr = getFinalStderr();
+                        if (finalStderr.trim()) detailedError += ` Stderr: ${finalStderr.trim().substring(0, 200)}`;
+                        rejectOnce(new Error(detailedError));
+                    } else {
+                        rejectOnce(new Error(`Plugin "${pluginName}" exited successfully but did not provide a valid initial JSON response. Stdout: ${stdoutPreview.trim().substring(0, 200)}`));
+                    }
+                    return;
+                }
+
+                const finalStdout = getFinalStdout();
+                const finalStderr = getFinalStderr();
+                try {
+                    const parsedOutput = JSON.parse(finalStdout.trim());
+                    if (parsedOutput && (parsedOutput.status === "success" || parsedOutput.status === "error")) {
+                        if (code !== 0 && parsedOutput.status === "success" && this.debugMode) {
+                            console.warn(`[PluginManager executePlugin Internal] Plugin "${pluginName}" exited with code ${code} but reported success in JSON. Trusting JSON.`);
+                        }
+                        if (code === 0 && parsedOutput.status === "error" && this.debugMode) {
+                            console.warn(`[PluginManager executePlugin Internal] Plugin "${pluginName}" exited with code 0 but reported error in JSON. Trusting JSON.`);
+                        }
+                        if (finalStderr.trim()) parsedOutput.pluginStderr = finalStderr.trim();
+
+                        if (!initialResponseSent) resolveOnce(parsedOutput); // Ensure resolve only once
+                        else if (this.debugMode) console.log(`[PluginManager executePlugin Internal] Plugin ${pluginName} exited, initial async response already sent.`);
+                        return;
+                    }
+                    if (this.debugMode) console.warn(`[PluginManager executePlugin Internal] Plugin "${pluginName}" final stdout was not in the expected JSON format: ${finalStdout.trim().substring(0, 100)}`);
+                } catch (e) {
+                    if (this.debugMode) console.warn(`[PluginManager executePlugin Internal] Failed to parse final stdout JSON from plugin "${pluginName}". Error: ${e.message}. Stdout: ${finalStdout.trim().substring(0, 100)}`);
+                }
+
+                if (!initialResponseSent) { // Only reject if no response has been sent yet
+                    if (isArcheryNoReply && code === 0) {
+                        initialResponseSent = true;
+                        if (this.debugMode) {
+                            console.log(`[PluginManager executePlugin Internal] Async no-reply plugin "${pluginName}" exited with code 0 before initial JSON. Resolving silently.`);
+                        }
+                        resolveOnce({
+                            status: "success",
+                            __vcpArcheryNoReplySilent: true,
+                            result: {
+                                status: "success",
+                                noReply: true,
+                                __vcpArcheryNoReplySilent: true,
+                                toolName: pluginName,
+                                message: `Async no-reply tool "${pluginName}" exited successfully before initial JSON.`
+                            }
+                        });
+                    } else if (code !== 0) {
+                        let detailedError = `Plugin "${pluginName}" exited with code ${code}.`;
+                        if (finalStdout.trim()) detailedError += ` Stdout: ${finalStdout.trim().substring(0, 200)}`;
+                        if (finalStderr.trim()) detailedError += ` Stderr: ${finalStderr.trim().substring(0, 200)}`;
+                        rejectOnce(new Error(detailedError));
                     } else {
                         // Exit code 0, but no valid initial JSON response was sent/parsed.
-                        reject(new Error(`Plugin "${pluginName}" exited successfully but did not provide a valid initial JSON response. Stdout: ${outputBuffer.trim().substring(0, 200)}`));
+                        rejectOnce(new Error(`Plugin "${pluginName}" exited successfully but did not provide a valid initial JSON response. Stdout: ${finalStdout.trim().substring(0, 200)}`));
                     }
                 }
+            };
+
+            pluginProcess.once('close', (code, signal) => {
+                processExited = true;
+                closeResult = { code, signal };
+                finalizeAfterClose();
             });
 
             try {
@@ -1832,7 +1927,8 @@ class PluginManager extends EventEmitter {
             } catch (e) {
                 console.error(`[PluginManager executePlugin Internal] Stdin write error for "${pluginName}": ${e.message}`);
                 if (!initialResponseSent) { // Only reject if no response has been sent yet
-                    reject(new Error(`Stdin write error for "${pluginName}": ${e.message}`));
+                    if (noReplyTimerId) clearTimeout(noReplyTimerId);
+                    rejectOnce(new Error(`Stdin write error for "${pluginName}": ${e.message}`));
                 }
             }
         });

@@ -76,13 +76,6 @@ function classifyProviderSubmission(method, params) {
     const model = hasModel ? params.model : undefined;
     const isAlias = typeof model === "string" && isProviderAlias(model.trim());
 
-    if (method !== "submitAnalyzeJob") {
-        if (hasRoute || isAlias) {
-            throw providerSidecarError(null, PROVIDER_ERROR_CODES.MODE_UNSUPPORTED);
-        }
-        return { requiresProviderProof: false };
-    }
-
     if (hasRoute && hasModel) {
         throw providerSidecarError(null, PROVIDER_ERROR_CODES.ROUTE_MODEL_CONFLICT);
     }
@@ -238,10 +231,10 @@ class SidecarClient {
 
     async submitPatchJob(params = {}) {
         const providerSubmission = classifyProviderSubmission("submitPatchJob", params);
-        if (providerSubmission.requiresProviderProof) throw providerSidecarError(null, PROVIDER_ERROR_CODES.MODE_UNSUPPORTED);
         const jobId = assertJobId(params.jobId);
         const fixedPaths = jobPaths(this.jobRoot, jobId);
         const state = await this.ensure();
+        if (providerSubmission.requiresProviderProof) assertProviderSubmissionProof(state);
         this._assertFrameLimitsCompatible(state);
         this._assertServiceTierOverrideCompatible(state, params);
         try {
@@ -274,10 +267,10 @@ class SidecarClient {
 
     async submitWriteJob(params = {}) {
         const providerSubmission = classifyProviderSubmission("submitWriteJob", params);
-        if (providerSubmission.requiresProviderProof) throw providerSidecarError(null, PROVIDER_ERROR_CODES.MODE_UNSUPPORTED);
         const jobId = assertJobId(params.jobId);
         const fixedPaths = jobPaths(this.jobRoot, jobId);
         const state = await this.ensure();
+        if (providerSubmission.requiresProviderProof) assertProviderSubmissionProof(state);
         this._assertFrameLimitsCompatible(state);
         this._assertWriteSubmissionCompatible(state);
         this._assertServiceTierOverrideCompatible(state, params);

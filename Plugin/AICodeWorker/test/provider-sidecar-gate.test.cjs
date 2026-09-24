@@ -345,9 +345,7 @@ test("direct Sidecar submit methods reject provider routing before execution", a
                     const params = preparedParams(environment, mode, { model });
                     await expectSidecarError(
                         environment,
-                        mode === "analyze"
-                            ? PROVIDER_ERROR_CODES.ROUTE_REQUIRED
-                            : PROVIDER_ERROR_CODES.MODE_UNSUPPORTED,
+                        PROVIDER_ERROR_CODES.ROUTE_REQUIRED,
                         () => environment.server[`_submit${mode[0].toUpperCase()}${mode.slice(1)}Job`](params)
                     );
                 }
@@ -512,9 +510,7 @@ test("real dispatch reaches the same provider guard for all three modes", async 
             const params = preparedParams(environment, mode, { model: `  ${ALIASES[0]}  ` });
             await expectSidecarError(
                 environment,
-                mode === "analyze"
-                    ? PROVIDER_ERROR_CODES.ROUTE_REQUIRED
-                    : PROVIDER_ERROR_CODES.MODE_UNSUPPORTED,
+                PROVIDER_ERROR_CODES.ROUTE_REQUIRED,
                 () => environment.server._dispatch(methods[mode], params)
             );
         }

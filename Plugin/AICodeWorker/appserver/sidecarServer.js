@@ -68,7 +68,8 @@ const TERMINAL_STATES = new Set(["completed", "cancelled", "failed", "timeout"])
 const SAFE_WRITE_VALIDATION_PROFILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const WRITE_REQUEST_FIELDS = new Set([
     "jobId", "projectPath", "text", "model", "effort", "serviceTier", "timeoutSec",
-    "metaPath", "outputPath", "codexOutputPath"
+    "metaPath", "outputPath", "codexOutputPath",
+    "providerRouteId", "providerRouteRevision"
 ]);
 const UNCERTAIN_WRITE_CANDIDATE_CODES = new Set([
     "WORKTREE_CANDIDATE_OUTCOME_UNKNOWN",
@@ -493,9 +494,6 @@ class SidecarServer extends EventEmitter {
 
         const hasProviderAlias = typeof model === "string" && isProviderAlias(model.trim());
         if (!hasRouteField && !hasProviderAlias) return;
-        if (mode !== "analyze") {
-            throw providerRoutingRejection({ code: PROVIDER_ERROR_CODES.MODE_UNSUPPORTED });
-        }
         if (!hasRouteField) {
             throw providerRoutingRejection({ code: PROVIDER_ERROR_CODES.ROUTE_REQUIRED });
         }
@@ -652,7 +650,7 @@ class SidecarServer extends EventEmitter {
     }
 
     async _submitWriteJob(params) {
-        this._assertProviderRoutingRequest(params, "write");
+        const providerPlan = this._assertProviderRoutingRequest(params, "write");
         if (!this._writeConfigured || !this._writeAdapter || !this._writeValidationRunner || !this._writeValidationProfile) {
             throw new SidecarError("AICW_WRITE_NOT_CONFIGURED", "Sidecar write Jobs are not configured");
         }
@@ -684,7 +682,7 @@ class SidecarServer extends EventEmitter {
         if (this.activeJobs.size >= this.maxConcurrency) throw new SidecarError("CONCURRENCY_LIMIT", "Sidecar concurrency limit reached");
         const jobId = assertJobId(params.jobId);
         const projectPath = assertAllowedWriteProject(params.projectPath, this._writeAllowedProjectRoots);
-        const serviceTier = validateServiceTierOverride(params.serviceTier);
+        const serviceTier = providerPlan ? providerPlan.serviceTier : validateServiceTierOverride(params.serviceTier);
         const timeoutSec = params.timeoutSec === undefined ? 600 : Number(params.timeoutSec);
         if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutSec > 86400) {
             throw new SidecarError("INVALID_TIMEOUT_SEC", "timeoutSec must be a finite number greater than 0 and at most 86400");
@@ -704,6 +702,14 @@ class SidecarServer extends EventEmitter {
             model: params.model,
             effort: params.effort,
             paths,
+            providerPlan,
+            providerExclusive: Boolean(providerPlan),
+            execution: this.codex,
+            executionOwned: false,
+            executionListeners: null,
+            executionStopPromise: null,
+            executionStopRequested: false,
+            executionStopConfirmed: false,
             outputBytes: 0,
             timeoutSec,
             timeoutTimer: null,
@@ -771,28 +777,42 @@ class SidecarServer extends EventEmitter {
                 metaValue.jobPhase = "running";
             });
 
+            if (providerPlan) this._bindProviderExecution(job, this._createProviderExecution(job));
             job.resolveSetup();
-            const threadOutcome = await this._awaitStartOrTerminal(job, this._codexRequest("startThread", {
-                projectPath: opened.handle.worktreePath,
-                model: params.model,
-                serviceTier,
-                writeMode: true
-            }));
+            if (job.executionOwned) {
+                const startOutcome = await this._awaitStartOrTerminal(
+                    job,
+                    this._jobExecutionRequest(job, "start", {})
+                );
+                if (startOutcome.terminal) return this._terminalSubmissionResult(job, startOutcome.terminal);
+            }
+            const threadParams = job.providerExclusive
+                ? { projectPath: opened.handle.worktreePath, ...providerPlanToThreadParams(providerPlan), writeMode: true }
+                : { projectPath: opened.handle.worktreePath, model: params.model, serviceTier, writeMode: true };
+            const threadOutcome = await this._awaitStartOrTerminal(
+                job,
+                this._jobExecutionRequest(job, "startThread", threadParams)
+            );
             if (threadOutcome.terminal) return this._terminalSubmissionResult(job, threadOutcome.terminal);
             const thread = threadOutcome.value;
+            if (job.providerExclusive) this._assertProviderThreadIdentity(job, thread);
             job.threadId = thread.id;
             await this._updateMeta(job, metaValue => {
                 metaValue.threadId = job.threadId;
+                if (job.providerExclusive) {
+                    metaValue.providerRouteId = providerPlan.routeId;
+                    metaValue.providerRouteRevision = providerPlan.revision;
+                }
                 metaValue.jobPhase = "running";
             });
-            const turnOutcome = await this._awaitStartOrTerminal(job, this._codexRequest("startTurn", {
+            const turnOutcome = await this._awaitStartOrTerminal(job, this._jobExecutionRequest(job, "startTurn", {
                 threadId: job.threadId,
                 text: params.text,
-                effort: params.effort,
-                serviceTier,
+                effort: job.providerExclusive ? providerPlan.reasoningEffort : params.effort,
+                serviceTier: job.providerExclusive ? providerPlan.serviceTier : serviceTier,
                 writeMode: true,
                 projectPath: opened.handle.worktreePath,
-                model: params.model
+                model: job.providerExclusive ? providerPlan.model : params.model
             }));
             if (turnOutcome.terminal) return this._terminalSubmissionResult(job, turnOutcome.terminal);
             const turn = turnOutcome.value;
@@ -828,7 +848,8 @@ class SidecarServer extends EventEmitter {
                     ...(job.terminal ? { terminalState: job.state } : {})
                 };
             }
-            const errorCode = safeWriteErrorCode(error);
+            const safeProviderError = job.providerExclusive ? this._safeProviderStartError(error) : null;
+            const errorCode = job.providerExclusive ? safeProviderError.code : safeWriteErrorCode(error);
             if (job.terminalClaim === "timeout" || job.timeoutRequested) {
                 await this._finishJob(job, "timeout", null, "JOB_TIMEOUT", "JOB_TIMEOUT");
             } else if (job.terminalClaim === "cancelled" || job.cancelRequested) {
@@ -836,7 +857,7 @@ class SidecarServer extends EventEmitter {
             } else {
                 await this._finishJob(job, "failed", 1, errorCode, errorCode);
             }
-            throw error instanceof SidecarError ? error : new SidecarError(errorCode, "Write Job could not start");
+            throw safeProviderError || (error instanceof SidecarError ? error : new SidecarError(errorCode, "Write Job could not start"));
         }
     }
 
@@ -998,7 +1019,7 @@ class SidecarServer extends EventEmitter {
     }
 
     async _submitPatchJob(params) {
-        this._assertProviderRoutingRequest(params, "patch");
+        const providerPlan = this._assertProviderRoutingRequest(params, "patch");
         if (this.draining || this.state?.status !== "ready") throw new SidecarError("SIDECAR_NOT_READY", "Sidecar is not ready");
         if (this.activeJobs.size >= this.maxConcurrency) throw new SidecarError("CONCURRENCY_LIMIT", "Sidecar concurrency limit reached");
         if (!this.codex?.isPatchVersionAllowed?.()) {
@@ -1006,9 +1027,9 @@ class SidecarServer extends EventEmitter {
         }
         const jobId = assertJobId(params.jobId);
         const projectPath = assertAbsolutePath(params.projectPath, "projectPath");
-        const model = validatePatchModel(params.model);
-        const effort = validatePatchEffort(params.effort);
-        const serviceTier = validateServiceTierOverride(params.serviceTier);
+        const model = providerPlan ? providerPlan.upstreamModel : validatePatchModel(params.model);
+        const effort = providerPlan ? providerPlan.reasoningEffort : validatePatchEffort(params.effort);
+        const serviceTier = providerPlan ? providerPlan.serviceTier : validateServiceTierOverride(params.serviceTier);
         const timeoutSec = params.timeoutSec === undefined ? 600 : Number(params.timeoutSec);
         if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutSec > 86400) {
             throw new SidecarError("INVALID_TIMEOUT_SEC", "timeoutSec must be a finite number greater than 0 and at most 86400");
@@ -1054,6 +1075,14 @@ class SidecarServer extends EventEmitter {
             patchArtifactNonce,
             patchArtifactDirectoryIdentity,
             gitChildren: new Set(),
+            providerPlan,
+            providerExclusive: Boolean(providerPlan),
+            execution: this.codex,
+            executionOwned: false,
+            executionListeners: null,
+            executionStopPromise: null,
+            executionStopRequested: false,
+            executionStopConfirmed: false,
             timeoutSec,
             timeoutTimer: null,
             timeoutFinalizeTimer: null,
@@ -1131,23 +1160,35 @@ class SidecarServer extends EventEmitter {
             });
             await job.baselineMonitor.assertStable();
 
+            if (providerPlan) this._bindProviderExecution(job, this._createProviderExecution(job));
             job.resolveSetup();
+            if (job.executionOwned) {
+                const startOutcome = await this._awaitStartOrTerminal(
+                    job,
+                    this._jobExecutionRequest(job, "start", {})
+                );
+                if (startOutcome.terminal) return this._terminalSubmissionResult(job, startOutcome.terminal);
+            }
+            const threadParams = job.providerExclusive
+                ? { projectPath: job.projectPath, ...providerPlanToThreadParams(providerPlan) }
+                : { projectPath: job.projectPath, model, serviceTier };
             const threadOutcome = await this._awaitStartOrTerminal(
                 job,
-                this._codexRequest("startThread", {
-                    projectPath: job.projectPath,
-                    model,
-                    serviceTier
-                })
+                this._jobExecutionRequest(job, "startThread", threadParams)
             );
             if (threadOutcome.terminal) return this._terminalSubmissionResult(job, threadOutcome.terminal);
             const thread = threadOutcome.value;
+            if (job.providerExclusive) this._assertProviderThreadIdentity(job, thread);
             job.threadId = thread.id;
             await this._updatePatchMeta(job, metaValue => {
                 metaValue.threadId = job.threadId;
+                if (job.providerExclusive) {
+                    metaValue.providerRouteId = providerPlan.routeId;
+                    metaValue.providerRouteRevision = providerPlan.revision;
+                }
                 metaValue.jobPhase = "running";
             });
-            const turnOutcome = await this._awaitStartOrTerminal(job, this._codexRequest("startTurn", {
+            const turnOutcome = await this._awaitStartOrTerminal(job, this._jobExecutionRequest(job, "startTurn", {
                 threadId: job.threadId,
                 text: params.text,
                 effort,
@@ -1190,7 +1231,8 @@ class SidecarServer extends EventEmitter {
                     ...(job.terminal ? { terminalState: job.state } : {})
                 };
             }
-            const errorCode = error?.code || "CODEX_JOB_START_FAILED";
+            const safeProviderError = job.providerExclusive ? this._safeProviderStartError(error) : null;
+            const errorCode = job.providerExclusive ? safeProviderError.code : (error?.code || "CODEX_JOB_START_FAILED");
             if (job.terminalClaim === "timeout" || job.timeoutRequested) {
                 await this._finishJob(job, "timeout", null, "JOB_TIMEOUT", "JOB_TIMEOUT");
             } else if (job.terminalClaim === "cancelled" || job.cancelRequested) {
@@ -1198,7 +1240,7 @@ class SidecarServer extends EventEmitter {
             } else {
                 await this._finishJob(job, "failed", 1, errorCode, errorCode);
             }
-            throw error instanceof SidecarError ? error : new SidecarError("CODEX_JOB_START_FAILED", "Patch Job could not start");
+            throw safeProviderError || (error instanceof SidecarError ? error : new SidecarError("CODEX_JOB_START_FAILED", "Patch Job could not start"));
         }
     }
 

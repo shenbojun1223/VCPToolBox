@@ -328,36 +328,56 @@ test("provider fields and aliases are rejected before ensure for the correct ope
             return { accepted: true };
         };
 
-        const earlyCases = [
+        const preEnsureCases = [
             ["analyze alias", "submitAnalyzeJob", {
                 jobId: "analyze-alias",
                 model: " deepseek-4.1-flash "
+            }, "AICW_PROVIDER_ROUTE_REQUIRED"],
+            ["patch alias", "submitPatchJob", {
+                jobId: "patch-alias",
+                model: "deepseek-4.1-flash"
+            }, "AICW_PROVIDER_ROUTE_REQUIRED"],
+            ["write alias", "submitWriteJob", {
+                jobId: "write-alias",
+                model: "deepseek-4.1-flash-commandcode"
             }, "AICW_PROVIDER_ROUTE_REQUIRED"],
             ["analyze route and model", "submitAnalyzeJob", {
                 jobId: "analyze-conflict",
                 providerRouteId: "deepseek-official",
                 model: "Luna"
             }, "AICW_PROVIDER_ROUTE_MODEL_CONFLICT"],
-            ["patch alias", "submitPatchJob", {
-                jobId: "patch-alias",
-                model: "deepseek-4.1-flash"
-            }, "AICW_PROVIDER_MODE_UNSUPPORTED"],
-            ["write alias", "submitWriteJob", {
-                jobId: "write-alias",
-                model: "deepseek-4.1-flash-commandcode"
-            }, "AICW_PROVIDER_MODE_UNSUPPORTED"],
+            ["patch route and model", "submitPatchJob", {
+                jobId: "patch-conflict",
+                providerRouteId: "deepseek-official",
+                model: "Luna"
+            }, "AICW_PROVIDER_ROUTE_MODEL_CONFLICT"],
+            ["write route and model", "submitWriteJob", {
+                jobId: "write-conflict",
+                providerRouteRevision: "official-r1",
+                model: "Luna"
+            }, "AICW_PROVIDER_ROUTE_MODEL_CONFLICT"]
+        ];
+        for (const [, method, params, code] of preEnsureCases) {
+            await expectProviderError(() => fixture.client[method](params), code);
+        }
+        assert.equal(ensureCalls, 0, "pre-ensure rejections must not consult the Sidecar");
+        assert.equal(rpcCalls, 0);
+
+        const routeProofCases = [
             ["patch route", "submitPatchJob", {
                 jobId: "patch-route",
                 providerRouteId: "deepseek-official"
-            }, "AICW_PROVIDER_MODE_UNSUPPORTED"],
+            }],
             ["write route", "submitWriteJob", {
                 jobId: "write-route",
                 providerRouteRevision: null
-            }, "AICW_PROVIDER_MODE_UNSUPPORTED"]
+            }]
         ];
-        for (const [, method, params, code] of earlyCases) {
-            await expectProviderError(() => fixture.client[method](params), code);
+        for (const [, method, params] of routeProofCases) {
+            await expectProviderError(() => fixture.client[method](params), "AICW_PROVIDER_PROTOCOL_UNSUPPORTED");
         }
+        assert.equal(ensureCalls, routeProofCases.length, "provider routes must consult the Sidecar proof");
+        assert.equal(rpcCalls, 0);
 
         for (const field of ["modelProvider", "providerRuntime", "routeCatalog", "providerPlan", "dependencies"]) {
             await expectProviderError(
@@ -365,7 +385,7 @@ test("provider fields and aliases are rejected before ensure for the correct ope
                 "AICW_PROVIDER_RESERVED_FIELD"
             );
         }
-        assert.equal(ensureCalls, 0);
+        assert.equal(ensureCalls, routeProofCases.length);
         assert.equal(rpcCalls, 0);
     });
 });

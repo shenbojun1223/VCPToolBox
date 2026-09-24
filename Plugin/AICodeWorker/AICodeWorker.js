@@ -186,8 +186,14 @@ function loadTrustedProviderCatalog() {
     }
 }
 
+function isCodexAppServerProviderRoute(worker, mode) {
+    return isCodexAppServerAnalyzeRoute(worker, mode) ||
+        isCodexAppServerPatchRoute(worker, mode) ||
+        isCodexAppServerWriteRoute(worker, mode);
+}
+
 function resolveProviderAnalyzePlan(aliasInfo, worker, mode, options = {}) {
-    if (!CFG.enableCodex || !isCodexAppServerAnalyzeRoute(worker, mode)) {
+    if (!CFG.enableCodex || !isCodexAppServerProviderRoute(worker, mode)) {
         return providerErrorResult({ code: PROVIDER_ERROR_CODES.MODE_UNSUPPORTED });
     }
     const catalog = loadTrustedProviderCatalog();
@@ -3191,9 +3197,14 @@ async function cmdRunAppServerPatch(prepared, dependencies = {}) {
         });
     }
 
-    const patchModel = prepared.reasoningMetadata.codexModel;
-    const patchEffort = prepared.reasoningMetadata.reasoningEffortEffective;
-    if (!patchModel || !patchEffort || !PATCH_REASONING_EFFORTS.has(patchEffort)) {
+    const patchModel = prepared.providerPlan
+        ? prepared.providerPlan.upstreamModel
+        : prepared.reasoningMetadata.codexModel;
+    const patchEffort = prepared.providerPlan
+        ? prepared.providerPlan.reasoningEffort
+        : prepared.reasoningMetadata.reasoningEffortEffective;
+    if (!patchModel || !patchEffort ||
+        (!prepared.providerPlan && !PATCH_REASONING_EFFORTS.has(patchEffort))) {
         return appServerErrorResult(null, {
             error: "Codex app-server patch 需要可验证的 model 与 minimal/low/medium/high/xhigh reasoning effort。",
             errorCode: "AICW_APP_SERVER_PATCH_UNSUPPORTED"
@@ -3328,11 +3339,15 @@ async function cmdRunAppServerPatch(prepared, dependencies = {}) {
             codexOutputPath: p.codexOutput,
             patchPath: p.patch,
             timeoutSec: timeoutS,
-            model: patchModel,
-            effort: patchEffort,
-            ...(prepared.serviceTierOverride
-                ? { serviceTier: prepared.serviceTierOverride }
-                : {}),
+            ...(prepared.providerPlan
+                ? providerPlanToIpc(prepared.providerPlan)
+                : {
+                    model: patchModel,
+                    effort: patchEffort,
+                    ...(prepared.serviceTierOverride
+                        ? { serviceTier: prepared.serviceTierOverride }
+                        : {})
+                }),
             patchContractVersion: PATCH_CONTRACT_VERSION
         });
     } catch (error) {
@@ -3474,9 +3489,13 @@ async function cmdRunAppServerWrite(prepared, dependencies = {}) {
             projectPath,
             text: wrapTask(prepared.task, "write"),
             timeoutSec: timeoutS,
-            model: prepared.codexCapabilities?.model || undefined,
-            effort: prepared.normalizedReasoningEffort || undefined,
-            ...(prepared.serviceTierOverride ? { serviceTier: prepared.serviceTierOverride } : {})
+            ...(prepared.providerPlan
+                ? providerPlanToIpc(prepared.providerPlan)
+                : {
+                    model: prepared.codexCapabilities?.model || undefined,
+                    effort: prepared.normalizedReasoningEffort || undefined,
+                    ...(prepared.serviceTierOverride ? { serviceTier: prepared.serviceTierOverride } : {})
+                })
         });
     } catch (error) {
         const current = readMeta(jobId) || meta;
