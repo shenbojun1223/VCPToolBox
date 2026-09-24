@@ -123,7 +123,7 @@ Codex 适合作为“VCP 外层大脑 + Codex 下层执行器”架构中的代�
 - **外层无感调用**：外层调用者与 Agent **严禁且无需指定 Profile 文件**，直接传入模型别名：
   - `deepseek-4.1-flash`：DeepSeek 官方直连通道（原生 Responses API，支持 low/high/max）。底层自动挂载物理隔离沙箱，**官方 ChatGPT 订阅零污染、零冲突**。
   - `deepseek-4.1-flash-commandcode`：CommandCode 渠道，自动经由本地轻量固化 relay 网关转译。
-  - `gpt-5.6-luna`：官方 ChatGPT 订阅原生直连，零中间件。
+  - `gpt-6-luna`：官方 ChatGPT 订阅原生直连，零中间件。
 - **并发与 Worktree 统一安全**：所有通道的 Worktree 创建、文件锁、验证门禁与 CAS Commit，由唯一的 Sidecar 统筹调度，彻底杜绝 Git 文件锁冲突与状态撕裂。
 
 配置示例：
@@ -285,7 +285,7 @@ task: 请只读分析指定模块，不修改文件。
 
 `reasoningEffort` 按本次实际 Codex 模型动态校验，不再由插件固定成三档。
 
-当前 `gpt-5.6-sol` 支持：
+当前 `gpt-6-sol` / `gpt-6-luna` 支持：
 
 | reasoningEffort | 建议场景 |
 |---|---|
@@ -296,7 +296,7 @@ task: 请只读分析指定模块，不修改文件。
 | `max` | 最困难问题的最大推理深度 |
 | `ultra` | 最大推理并自动委托子任务；使用量可能显著增加 |
 
-不传 reasoningEffort 时继承当前 Codex 配置，未覆盖时使用模型默认值；实际默认与合法档位用 capabilities 针对所选 model 查询，不在说明中写死。上述表格是档位一般含义，不覆盖本部署选型：纯搬砖任务显式使用 gpt-5.6-luna / max，并显式 fastMode=false。
+不传 reasoningEffort 时继承当前 Codex 配置，未覆盖时使用模型默认值；实际默认与合法档位用 capabilities 针对所选 model 查询，不在说明中写死。上述表格是档位一般含义，不覆盖本部署选型：显式使用 gpt-6-luna / max，并显式 fastMode=false（默认主力仍为 deepseek-4.1-flash-commandcode / high）。
 
 插件会按以下优先级确定实际模型：
 1. 单次调用的 `model`

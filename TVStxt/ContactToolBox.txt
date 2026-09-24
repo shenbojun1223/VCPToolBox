@@ -33,10 +33,11 @@ expression:「始」您要计算的完整数学表达式「末」
 
 [===vcp_fold:0.4===]
 
-## 4. 主动创建话题 (AgentTopicCreator)
-主动对用户发起一个全新的Vchat聊天话题上下文。
-tool_name:「始」AgentTopicCreator「末」,
+## 4. 主动创建话题 (TopicSponsor)
+主动对用户发起一个全新的VChat聊天话题上下文。
+tool_name:「始」TopicSponsor「末」,
 command:「始」CreateTopic「末」,
+maid:「始」你的中文名「末」, // (必需) 发起话题的Agent中文名 (如：赞妮、小克、Nova等)
 topic_name:「始」话题标题「末」,
 initial_message:「始」初始话题内容，也就是你的第一条发言来发起话题「末」
 

@@ -254,7 +254,8 @@ async function main() {
             }
             const isAuthRequiredByConfig = securityResult.needsAuth || securityResult.requiresReview;
             if (isAuthRequiredByConfig) {
-                console.error(`[ServerPowerShellExecutor] 命令需要授权：${securityResult.reason}`);
+                // Actionable first line so truncation never hides the required action.
+                console.error(`[ServerPowerShellExecutor] 需要验证码授权（${securityResult.decision}/${securityResult.matchedKeyword}）：请向用户索取当前最新动态验证码，重新调用并在参数中携带 tool_password。`);
             }
 
             let command;
@@ -286,7 +287,7 @@ async function main() {
 
             // 验证码验证逻辑
             if (isAuthRequiredByConfig && !toolPassword) {
-                throw securityError('此操作涉及敏感指令，需要验证码授权，但未提供 tool_password。', securityResult);
+                throw securityError('此命令需要【动态验证码】授权。请立即向用户索取当前最新验证码，然后重新调用本工具并在参数中携带 tool_password（验证码）。不要放弃或改用其他工具规避。', securityResult);
             }
 
             if (toolPassword) {
@@ -295,7 +296,7 @@ async function main() {
                     throw securityError('无法获取验证码。请确保主服务器配置正确。', securityResult);
                 }
                 if (String(toolPassword) !== realCode) {
-                    throw securityError('验证码错误。', securityResult);
+                    throw securityError('【验证码错误】当前验证码可能已刷新，请向用户索取最新动态验证码后重新调用本工具。', securityResult);
                 }
             }
 

@@ -25,6 +25,7 @@
 
 系统工具列表与指南：{{VarToolList}},
 {{VCPFileToolBox}}
+{{JevToolCall}}
 记忆管理器：
 {{VarDailyNoteGuide}}
 ---

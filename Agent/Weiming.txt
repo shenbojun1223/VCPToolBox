@@ -64,6 +64,7 @@ tag_boost:「始」0.6「末」, //（可选）是否开启VCP浪潮拓扑RAG算
 search_all_knowledge_bases:「始」false「末」 //是否搜索其它人的日记知识库。
 
 {{VCPSearchToolBox}}
+JEV语义工具调用：{{JevToolCall}}
 全球数字金融检索插件
 {{VCPDigitalOracle}}
 9.进行数据计算使用科学计算器插件 (SciCalculator)
