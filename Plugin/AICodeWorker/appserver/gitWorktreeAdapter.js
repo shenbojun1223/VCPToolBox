@@ -239,6 +239,33 @@ function candidateChangedFiles(entries) {
         });
     }));
 }
+function normalizeWipMessage(value, jobId) {
+    if (value === undefined || value === null || value === "") {
+        return `wip(timeout): preserved changes for ${jobId}`;
+    }
+    if (typeof value !== "string" || value.includes("\0") || /[\r\n]/.test(value) ||
+        Buffer.byteLength(value, "utf8") > 512) {
+        fail("WORKTREE_WIP_MESSAGE_INVALID", "message must be a bounded single-line string");
+    }
+    return value;
+}
+function wipChangedFiles(entries) {
+    return Object.freeze(entries.map(entry => {
+        if (!["A", "M", "D", "R", "C", "T"].includes(entry.status)) {
+            fail("WORKTREE_WIP_DIFF_INVALID", "WIP diff contained an unsupported status");
+        }
+        const moved = entry.status === "R" || entry.status === "C";
+        return Object.freeze({
+            status: entry.status,
+            score: moved ? entry.score : null,
+            path: entry.path,
+            oldPath: moved ? entry.oldPath : null
+        });
+    }));
+}
+function wipEntryKeys(entries) {
+    return entries.map(entry => `${entry.status}:${entry.path}:${entry.oldPath === null ? "" : entry.oldPath}`);
+}
 function outputText(value) {
     return Buffer.from(value || "").toString("utf8").trim();
 }
@@ -956,6 +983,160 @@ class GitWorktreeAdapter {
                 }
                 throw error;
             }
+        });
+    }
+    async createWipCommitExpected(options = {}) {
+        if (!options || typeof options !== "object" || Array.isArray(options)) {
+            fail("WORKTREE_OPTION_INVALID", "createWipCommitExpected options are invalid");
+        }
+        const baseRoot = this.assertPinnedWorkspaceBaseRoot(options.workspaceBaseRoot);
+        const expected = normalizeExpectedCandidate(options.expected);
+        const baseRevision = normalizeBaseRevision(options.base?.baseRevision);
+        const message = normalizeWipMessage(options.message, expected.jobId);
+        const root = await this.#repo(options.repoRoot, true);
+        return withMutationGate(root, async () => {
+            const target = safeWorktreePath(expected.path, baseRoot, "expected.path", true, false);
+            await this.#assertCandidateIdentity(root, target, expected, expected.head);
+            await this.#assertCandidateFiltersClosed(target);
+            await this.#assertNoCandidateUnmerged(target);
+            const beforeStatus = (await this.#runCandidate(
+                ["status", "--porcelain=v1", "-z", "--untracked-files=all"], target,
+                "WORKTREE_WIP_STATUS_FAILED", "WIP Worktree status could not be read"
+            )).stdout;
+            if (beforeStatus.length === 0) {
+                return Object.freeze({ created: false, reason: "clean" });
+            }
+            await this.#runCandidate(
+                ["add", "-A", "--", "."], target,
+                "WORKTREE_WIP_STAGE_FAILED", "WIP changes could not be staged"
+            );
+            await this.#assertNoCandidateUnmerged(target);
+            const stagedRaw = (await this.#runCandidate(
+                [
+                    "diff", "--no-ext-diff", "--no-textconv", "--cached", "--raw", "-z", "--no-abbrev", "--find-renames",
+                    "--"
+                ],
+                target, "WORKTREE_WIP_DIFF_FAILED", "WIP staged diff could not be read"
+            )).stdout;
+            const stagedEntries = parseRawDiffZ(stagedRaw);
+            if (stagedEntries.length === 0) {
+                fail("WORKTREE_WIP_EMPTY", "WIP Worktree reported changes that could not be staged");
+            }
+            const changedFiles = wipChangedFiles(stagedEntries);
+            const stagedKeys = wipEntryKeys(stagedEntries);
+            const wipTree = await this.#candidateObjectId(
+                ["write-tree"], target,
+                "WORKTREE_WIP_WRITE_TREE_FAILED", "WIP tree could not be written"
+            );
+            const wipCommit = await this.#candidateObjectId(
+                ["commit-tree", wipTree, "-p", expected.head, "-m", message],
+                target, "WORKTREE_WIP_COMMIT_TREE_FAILED", "WIP commit could not be created"
+            );
+            await this.#assertCandidateIdentity(root, target, expected, expected.head);
+            const branchRef = `refs/heads/${expected.branch}`;
+            let updateResult;
+            try {
+                updateResult = await this.#runCandidate(
+                    ["update-ref", branchRef, wipCommit, expected.head], root,
+                    "WORKTREE_WIP_REF_CAS_FAILED", "WIP branch compare-and-swap failed", true
+                );
+            } catch (error) {
+                throw new GitWorktreeError(
+                    "WORKTREE_WIP_OUTCOME_UNKNOWN",
+                    "WIP branch update outcome is unknown",
+                    { cause: typeof error?.code === "string" ? error.code : "UNKNOWN" }
+                );
+            }
+            if (updateResult.code !== 0) {
+                let observedRef;
+                try {
+                    observedRef = await this.#candidateObjectId(
+                        ["rev-parse", "--verify", branchRef], root,
+                        "WORKTREE_WIP_OUTCOME_UNKNOWN", "WIP branch state could not be confirmed"
+                    );
+                } catch (error) {
+                    throw new GitWorktreeError(
+                        "WORKTREE_WIP_OUTCOME_UNKNOWN",
+                        "WIP branch update outcome is unknown",
+                        { cause: typeof error?.code === "string" ? error.code : "UNKNOWN" }
+                    );
+                }
+                if (observedRef !== expected.head) {
+                    throw new GitWorktreeError(
+                        "WORKTREE_WIP_OUTCOME_UNKNOWN",
+                        "WIP branch update outcome is unknown"
+                    );
+                }
+                fail("WORKTREE_WIP_REF_CAS_FAILED", "WIP branch compare-and-swap failed");
+            }
+            try {
+                const observedRef = await this.#candidateObjectId(
+                    ["rev-parse", "--verify", branchRef], root,
+                    "WORKTREE_WIP_POST_VERIFY_FAILED", "WIP branch could not be verified"
+                );
+                if (observedRef !== wipCommit) {
+                    fail("WORKTREE_WIP_POST_VERIFY_FAILED", "WIP branch does not identify the WIP commit");
+                }
+                const linkedHead = await this.#candidateObjectId(
+                    ["rev-parse", "--verify", "HEAD"], target,
+                    "WORKTREE_WIP_POST_VERIFY_FAILED", "WIP Worktree HEAD could not be verified"
+                );
+                if (linkedHead !== wipCommit) {
+                    fail("WORKTREE_WIP_POST_VERIFY_FAILED", "WIP Worktree HEAD does not identify the WIP commit");
+                }
+                const parentLine = outputText((await this.#runCandidate(
+                    ["rev-list", "--parents", "-n", "1", wipCommit], root,
+                    "WORKTREE_WIP_POST_VERIFY_FAILED", "WIP parent could not be verified"
+                )).stdout).toLowerCase().split(/\s+/);
+                if (parentLine.length !== 2 || parentLine[0] !== wipCommit || parentLine[1] !== expected.head) {
+                    fail("WORKTREE_WIP_POST_VERIFY_FAILED", "WIP parent does not match the expected HEAD");
+                }
+                const committedTree = await this.#candidateObjectId(
+                    ["rev-parse", "--verify", `${wipCommit}^{tree}`], root,
+                    "WORKTREE_WIP_POST_VERIFY_FAILED", "WIP tree could not be verified"
+                );
+                if (committedTree !== wipTree) {
+                    fail("WORKTREE_WIP_POST_VERIFY_FAILED", "WIP tree does not match the written tree");
+                }
+                const cleanStatus = (await this.#runCandidate(
+                    ["status", "--porcelain=v1", "-z", "--untracked-files=all"], target,
+                    "WORKTREE_WIP_POST_VERIFY_FAILED", "WIP Worktree cleanliness could not be verified"
+                )).stdout;
+                if (cleanStatus.length !== 0) {
+                    fail("WORKTREE_WIP_POST_VERIFY_FAILED", "WIP Worktree is not clean at the WIP commit");
+                }
+                await this.#assertCandidateIdentity(root, target, expected, wipCommit);
+                const committedRaw = (await this.#runCandidate(
+                    [
+                        "diff", "--no-ext-diff", "--no-textconv", "--raw", "-z", "--no-abbrev", "--find-renames",
+                        expected.head, wipCommit, "--"
+                    ],
+                    root, "WORKTREE_WIP_POST_VERIFY_FAILED", "WIP committed paths could not be read"
+                )).stdout;
+                const committedKeys = wipEntryKeys(parseRawDiffZ(committedRaw));
+                if (committedKeys.join("|") !== stagedKeys.join("|")) {
+                    fail("WORKTREE_WIP_POST_VERIFY_FAILED", "WIP committed paths do not match the staged paths");
+                }
+            } catch (error) {
+                if (error?.code === "WORKTREE_WIP_OUTCOME_UNKNOWN") throw error;
+                throw new GitWorktreeError(
+                    "WORKTREE_WIP_OUTCOME_UNKNOWN",
+                    "WIP branch advanced but post-verification was not proven",
+                    { cause: typeof error?.code === "string" ? error.code : "UNKNOWN" }
+                );
+            }
+            return Object.freeze({
+                schemaVersion: 1,
+                jobId: expected.jobId,
+                worktreePath: target,
+                branch: expected.branch,
+                baseRevision,
+                wipCommit,
+                wipTree,
+                changedFiles,
+                worktreeClean: true,
+                locked: true
+            });
         });
     }
     async repair(repoRoot, paths = [], workspaceBaseRoot) {

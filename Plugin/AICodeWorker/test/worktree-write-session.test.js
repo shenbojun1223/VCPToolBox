@@ -716,6 +716,133 @@ test("unknown candidate outcome latches uncertainty and leaves only inspect avai
     assert.equal(snapshot.head, handle.base.baseRevision);
 });
 
+test("commitWip preserves new and modified files on the session branch with the default message", async () => {
+    const fixture = createFixture();
+    const jobId = `wip-commit-${fixture.number}`;
+    const session = makeSession(fixture, jobId);
+    const handle = await session.open();
+    const primaryHead = gitText(fixture.repoRoot, ["rev-parse", "HEAD"]);
+    const primaryStatus = git(fixture.repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout;
+    fs.appendFileSync(path.join(handle.worktreePath, "tracked.txt"), "wip edit\n", "utf8");
+    fs.writeFileSync(path.join(handle.worktreePath, "added.txt"), "wip added\n", "utf8");
+
+    const wip = await session.commitWip();
+
+    assert.equal(Object.isFrozen(wip), true);
+    assert.equal(wip.schemaVersion, 1);
+    assert.equal(wip.jobId, jobId);
+    assert.equal(wip.branch, handle.branch);
+    assert.equal(samePath(wip.worktreePath, handle.worktreePath), true);
+    assert.equal(wip.baseRevision, handle.base.baseRevision);
+    assert.equal(wip.worktreeClean, true);
+    assert.equal(wip.locked, true);
+    assert.notEqual(wip.wipCommit, wip.baseRevision);
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", handle.branch]), wip.wipCommit);
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", `${wip.wipCommit}^`]), wip.baseRevision);
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", `${wip.wipCommit}^{tree}`]), wip.wipTree);
+    assert.equal(gitText(fixture.repoRoot, ["log", "-1", "--pretty=%s", wip.wipCommit]),
+        `wip(timeout): preserved changes for ${jobId}`);
+    assert.deepEqual(
+        wip.changedFiles.map(entry => `${entry.status}:${entry.path}`).sort(),
+        ["A:added.txt", "M:tracked.txt"]
+    );
+    assert.equal(wip.changedFiles.every(entry => Object.isFrozen(entry)), true);
+    assert.equal(git(handle.worktreePath, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout.length, 0);
+    assert.equal(fs.readFileSync(path.join(handle.worktreePath, "added.txt"), "utf8"), "wip added\n");
+    assert.equal(fs.readFileSync(path.join(handle.worktreePath, "tracked.txt"), "utf8"), "alpha\nbeta\nwip edit\n");
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", "HEAD"]), primaryHead);
+    assert.equal(git(fixture.repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout.equals(primaryStatus), true);
+});
+
+test("commitWip accepts a caller message, reports a clean Worktree, and advances from the previous WIP commit", async () => {
+    const fixture = createFixture();
+    const jobId = `wip-message-${fixture.number}`;
+    const session = makeSession(fixture, jobId);
+    const handle = await session.open();
+
+    const clean = await session.commitWip();
+    assert.equal(Object.isFrozen(clean), true);
+    assert.equal(clean.created, false);
+    assert.equal(clean.reason, "clean");
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", handle.branch]), handle.base.baseRevision);
+
+    fs.writeFileSync(path.join(handle.worktreePath, "added.txt"), "first wip\n", "utf8");
+    const first = await session.commitWip({ message: "wip: explicit preservation" });
+    assert.equal(first.created, undefined);
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", `${first.wipCommit}^`]), handle.base.baseRevision);
+    assert.equal(gitText(fixture.repoRoot, ["log", "-1", "--pretty=%s", first.wipCommit]), "wip: explicit preservation");
+
+    fs.writeFileSync(path.join(handle.worktreePath, "added.txt"), "second wip\n", "utf8");
+    fs.writeFileSync(path.join(handle.worktreePath, "second.txt"), "second file\n", "utf8");
+    const second = await session.commitWip();
+    assert.notEqual(second.wipCommit, first.wipCommit);
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", `${second.wipCommit}^`]), first.wipCommit);
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", handle.branch]), second.wipCommit);
+    assert.deepEqual(
+        second.changedFiles.map(entry => `${entry.status}:${entry.path}`).sort(),
+        ["A:second.txt", "M:added.txt"]
+    );
+    assert.equal(git(handle.worktreePath, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout.length, 0);
+});
+
+test("WIP commits leave the Worktree clean and keep inspect, verify, retain, and discard safe", async () => {
+    const fixture = createFixture();
+    const jobId = `wip-clean-${fixture.number}`;
+    const session = makeSession(fixture, jobId);
+    const handle = await session.open();
+    const edited = path.join(handle.worktreePath, "tracked.txt");
+    fs.appendFileSync(edited, "wip clean state\n", "utf8");
+
+    const wip = await session.commitWip();
+
+    assert.equal(git(handle.worktreePath, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout.length, 0);
+    assert.equal(fs.readFileSync(edited, "utf8").endsWith("wip clean state\n"), true);
+    const entry = officialEntry(fixture, handle.worktreePath);
+    assert.equal(entry.head, wip.wipCommit);
+    assert.equal(entry.locked, true);
+    assert.equal(entry.lockReason, handle.lockReason);
+    assert.deepEqual(await session.inspect(), entry);
+    assert.strictEqual(await session.verify(), handle);
+    assert.strictEqual(await session.retain(), handle);
+    assert.deepEqual(await session.inspect(), entry);
+
+    await session.discard();
+
+    assert.equal(officialEntry(fixture, handle.worktreePath), null);
+    assert.equal(fs.existsSync(handle.worktreePath), false);
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", handle.branch]), wip.wipCommit);
+    assert.equal(await session.inspect(), null);
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", "HEAD"]), handle.base.baseRevision);
+});
+
+test("commitWip is refused without a proven handle, after discard, and for unusable messages", async () => {
+    const fixture = createFixture();
+    const jobId = `wip-refusal-${fixture.number}`;
+    const session = makeSession(fixture, jobId);
+    await rejectsCode(() => session.commitWip(), "WORKTREE_SESSION_WIP_NOT_ALLOWED");
+    await rejectsCode(() => session.commitWip([]), "WORKTREE_SESSION_WIP_OPTIONS_INVALID");
+
+    const handle = await session.open();
+    let adapterCalls = 0;
+    const originalCreateWip = fixture.adapter.createWipCommitExpected.bind(fixture.adapter);
+    fixture.adapter.createWipCommitExpected = async (...args) => {
+        adapterCalls += 1;
+        return originalCreateWip(...args);
+    };
+    await rejectsCode(() => session.commitWip({ message: "bad\nmessage" }), "WORKTREE_WIP_MESSAGE_INVALID");
+    await rejectsCode(() => session.commitWip({ message: "x".repeat(600) }), "WORKTREE_WIP_MESSAGE_INVALID");
+    assert.equal(adapterCalls, 2);
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", handle.branch]), handle.base.baseRevision);
+    assert.equal(git(fixture.repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]).stdout.length, 0);
+
+    fs.writeFileSync(path.join(handle.worktreePath, "added.txt"), "wip before discard\n", "utf8");
+    const preserved = await session.commitWip();
+    assert.equal(gitText(fixture.repoRoot, ["rev-parse", handle.branch]), preserved.wipCommit);
+    await session.discard();
+    assert.equal(officialEntry(fixture, handle.worktreePath), null);
+    await rejectsCode(() => session.commitWip(), "WORKTREE_SESSION_WIP_NOT_ALLOWED");
+    await rejectsCode(() => session.commitWip({ message: "late" }), "WORKTREE_SESSION_WIP_NOT_ALLOWED");
+});
 test("retain requested before discard completes first and the final state is discarded", async () => {
     const fixture = createFixture();
     const session = makeSession(fixture, `retain-before-discard-${fixture.number}`);
@@ -882,7 +1009,7 @@ const { WorktreeWriteSession } = require("./Plugin/AICodeWorker/appserver/worktr
 });
 `;
     const child = spawnSync(process.execPath, ["-e", childCode], {
-        cwd: process.cwd(),
+        cwd: path.resolve(__dirname, "../../.."),
         shell: false,
         windowsHide: true,
         encoding: "utf8",

@@ -8,6 +8,7 @@ const {
 
 const BRANCH_PREFIX = "vcp/aicw/";
 const LOCK_REASON_PREFIX = "AICodeWorker write session ";
+const WIP_COMMIT_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
 class WorktreeWriteSessionError extends Error {
     constructor(code, message, details) {
@@ -68,6 +69,7 @@ class WorktreeWriteSession {
     #handle = null;
     #expectedHead = null;
     #openPromise = null;
+    #wipPromise = null;
     #candidatePromise = null;
     #candidateResult = null;
     #discardPromise = null;
@@ -336,6 +338,86 @@ class WorktreeWriteSession {
         const operation = this.#enqueue(() => this.#commitCandidateOnce());
         this.#candidatePromise = operation.then(result => result);
         return this.#candidatePromise;
+    }
+
+    #wipAllowed() {
+        return !this.#uncertain && !this.#discardRequested && Boolean(this.#handle) &&
+            (this.#state === "open" || this.#state === "retained" || this.#state === "failed");
+    }
+
+    #wipNotAllowed() {
+        return new WorktreeWriteSessionError(
+            "WORKTREE_SESSION_WIP_NOT_ALLOWED",
+            "WIP commit is not allowed for this session"
+        );
+    }
+
+    async #commitWipOnce(message) {
+        const handle = this.#handle;
+        let result;
+        try {
+            result = await this.#adapter.createWipCommitExpected({
+                repoRoot: this.#repoRoot,
+                workspaceBaseRoot: this.#workspaceBaseRoot,
+                base: handle.base,
+                expected: {
+                    path: handle.worktreePath,
+                    branch: handle.branch,
+                    head: this.#expectedHead,
+                    locked: true,
+                    lockReason: handle.lockReason
+                },
+                message
+            });
+        } catch (error) {
+            if (error?.code === "WORKTREE_WIP_OUTCOME_UNKNOWN" ||
+                error?.code === "WORKTREE_SESSION_OUTCOME_UNCERTAIN") {
+                this.#uncertain = true;
+                this.#state = "uncertain";
+            }
+            throw error;
+        }
+        if (result && typeof result === "object" && Object.isFrozen(result) && result.created === false) {
+            if (result.reason !== "clean") {
+                fail("WORKTREE_SESSION_WIP_OUTCOME_UNKNOWN", "WIP result was not proven");
+            }
+            return result;
+        }
+        if (!result || typeof result !== "object" || result.schemaVersion !== 1 ||
+            result.jobId !== this.#jobId || !samePath(result.worktreePath, handle.worktreePath) ||
+            result.branch !== this.#branch || result.baseRevision !== handle.base.baseRevision ||
+            typeof result.wipCommit !== "string" || !WIP_COMMIT_RE.test(result.wipCommit) ||
+            typeof result.wipTree !== "string" || !WIP_COMMIT_RE.test(result.wipTree) ||
+            !Array.isArray(result.changedFiles) || result.changedFiles.length === 0 ||
+            result.worktreeClean !== true || result.locked !== true || !Object.isFrozen(result)) {
+            this.#uncertain = true;
+            this.#state = "uncertain";
+            fail("WORKTREE_SESSION_WIP_OUTCOME_UNKNOWN", "WIP result was not proven");
+        }
+        this.#expectedHead = result.wipCommit;
+        return result;
+    }
+
+    commitWip(options = {}) {
+        if (!options || typeof options !== "object" || Array.isArray(options)) {
+            return Promise.reject(new WorktreeWriteSessionError(
+                "WORKTREE_SESSION_WIP_OPTIONS_INVALID",
+                "Worktree write session WIP options are invalid"
+            ));
+        }
+        const message = options.message;
+        if (this.#wipPromise) return this.#wipPromise;
+        if (!this.#wipAllowed()) return Promise.reject(this.#wipNotAllowed());
+        const operation = this.#enqueue(async () => {
+            if (!this.#wipAllowed()) throw this.#wipNotAllowed();
+            return this.#commitWipOnce(message);
+        });
+        this.#wipPromise = operation;
+        const settle = () => {
+            if (this.#wipPromise === operation) this.#wipPromise = null;
+        };
+        operation.then(settle, settle);
+        return operation;
     }
 
     async #discardOnce() {
