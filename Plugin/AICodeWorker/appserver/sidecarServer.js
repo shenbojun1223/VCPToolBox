@@ -2301,6 +2301,21 @@ class SidecarServer extends EventEmitter {
                 : job.kind === "write"
                     ? updater => this._updateWriteMeta(job, updater)
                     : updater => this._updateMeta(job, updater);
+            let wipResult = null;
+            if (job.kind === "write" && (state === "timeout" || state === "cancelled") && job.session) {
+                try {
+                    wipResult = await job.session.commitWip({
+                        message: `wip(${state}): preserve workspace before teardown [job: ${job.jobId}]`
+                    });
+                } catch (wipError) {
+                    // commitWip failure during abort teardown shouldn't block metadata finalization unless uncertain
+                    if (wipError?.code === "WORKTREE_SESSION_OUTCOME_UNCERTAIN" || wipError?.code === "WORKTREE_WIP_OUTCOME_UNKNOWN") {
+                        const uncertainError = new SidecarError("AICW_WRITE_FINALIZATION_UNCERTAIN", "Write WIP commit outcome is uncertain", { cause: wipError?.code });
+                        this._markWriteFinalizationIncomplete(job, uncertainError);
+                        throw uncertainError;
+                    }
+                }
+            }
             await updateMeta(meta => {
                 meta.state = state;
                 if (job.kind === "patch") {
@@ -2311,6 +2326,15 @@ class SidecarServer extends EventEmitter {
                 } else if (job.kind === "write") {
                     meta.jobPhase = state;
                     meta.candidateAvailable = false;
+                    if (wipResult && wipResult.created !== false && wipResult.wipCommit) {
+                        meta.wipAvailable = true;
+                        meta.wipCommit = wipResult.wipCommit;
+                        meta.wipTree = wipResult.wipTree;
+                        meta.wipBranch = wipResult.branch;
+                        meta.wipChangedFiles = wipResult.changedFiles;
+                    } else {
+                        meta.wipAvailable = false;
+                    }
                 }
                 meta.exitCode = exitCode;
                 meta.completedAt = new Date().toISOString();
