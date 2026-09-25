@@ -8,6 +8,7 @@ const FILTER_CONFIG_QUERY_ARGS = Object.freeze([
 ]);
 const TRUSTED_GIT_CONFIG_ARGS = Object.freeze([
     "-c", "core.fsmonitor=false",
+    "-c", "core.whitespace=cr-at-eol",
     "-c", `core.hooksPath=${process.platform === "win32" ? "NUL" : "/dev/null"}`,
     "-c", "commit.gpgSign=false",
     "-c", "tag.gpgSign=false"
