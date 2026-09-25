@@ -1009,7 +1009,7 @@ const { WorktreeWriteSession } = require("./Plugin/AICodeWorker/appserver/worktr
 });
 `;
     const child = spawnSync(process.execPath, ["-e", childCode], {
-        cwd: path.resolve(__dirname, "../../.."),
+        cwd: process.cwd(),
         shell: false,
         windowsHide: true,
         encoding: "utf8",

@@ -1490,8 +1490,10 @@ class SidecarServer extends EventEmitter {
         }));
         if (job.kind === "write") {
             job.eventChain = job.eventChain.catch(error => {
-                const mapped = this._markWriteFinalizationIncomplete(job, error);
-                throw mapped;
+                if (!job.timeoutRequested && !job.cancelRequested) {
+                    const mapped = this._markWriteFinalizationIncomplete(job, error);
+                    throw mapped;
+                }
             });
         }
         if (job.cancelRequested || job.timeoutRequested) {
@@ -2280,8 +2282,10 @@ class SidecarServer extends EventEmitter {
             try {
                 await this._stopOwnedExecution(job);
             } catch (error) {
-                const finalizationError = await this._markProviderFinalizationIncomplete(job, error);
-                throw finalizationError;
+                if (state !== "timeout" && state !== "cancelled") {
+                    const finalizationError = await this._markProviderFinalizationIncomplete(job, error);
+                    throw finalizationError;
+                }
             }
         }
         if (job.kind === "patch" && !(await this._closePatchResources(job, {
