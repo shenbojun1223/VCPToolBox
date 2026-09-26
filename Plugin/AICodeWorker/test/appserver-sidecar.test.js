@@ -1388,10 +1388,44 @@ test("write cancel retains the locked Worktree and does not create a candidate",
         const meta = readJsonOrNull(paths.metaPath);
         assert.equal(meta.candidateAvailable, false);
         assert.equal(meta.validationPassed, false);
+        assert.equal(meta.wipAvailable, false);
         assert.equal(Object.prototype.hasOwnProperty.call(meta, "resultCommit"), false);
         assert.equal(fs.existsSync(meta.worktreePath), true);
         const official = environment.worktrees().find(entry => path.resolve(entry.path) === path.resolve(meta.worktreePath));
         assert.ok(official);
+        assert.equal(official.locked, true);
+    } finally {
+        await environment.close();
+    }
+});
+
+test("write cancel with modified workspace preserves wip commit and injects metadata", async () => {
+    const environment = await createDormantWriteEnvironment();
+    const jobId = "write_cancel_wip";
+    const paths = environment.createWriteMeta(jobId);
+    const baseHead = gitFixture(environment.projectRoot, ["rev-parse", "HEAD"]);
+    try {
+        const submission = await environment.submitWrite(jobId, "[[DELAY_MS=5000]]", paths);
+        assert.equal(submission.accepted, true);
+        await waitFor(() => Boolean(readJsonOrNull(paths.metaPath)?.worktreePath));
+        const worktreePath = readJsonOrNull(paths.metaPath).worktreePath;
+        fs.writeFileSync(path.join(worktreePath, "wip-file.txt"), "wip cancel content\n", "utf8");
+        await environment.server._cancel({ jobId });
+        await waitFor(() => readJsonOrNull(paths.metaPath)?.state === "cancelled", 10000);
+        const meta = readJsonOrNull(paths.metaPath);
+        assert.equal(meta.candidateAvailable, false);
+        assert.equal(meta.validationPassed, false);
+        assert.equal(meta.wipAvailable, true);
+        assert.match(meta.wipCommit, /^[0-9a-f]{40,64}$/);
+        assert.match(meta.wipTree, /^[0-9a-f]{40,64}$/);
+        assert.equal(meta.wipBranch, `vcp/aicw/${jobId}`);
+        assert.deepEqual(meta.wipChangedFiles, [{ status: "A", score: null, path: "wip-file.txt", oldPath: null }]);
+        assert.equal(gitFixture(environment.projectRoot, ["rev-parse", `${meta.wipCommit}^`]), baseHead);
+        assert.equal(gitFixture(environment.projectRoot, ["show", `${meta.wipCommit}:wip-file.txt`]), "wip cancel content");
+        assert.equal(fs.existsSync(meta.worktreePath), true);
+        const official = environment.worktrees().find(entry => path.resolve(entry.path) === path.resolve(meta.worktreePath));
+        assert.ok(official);
+        assert.equal(official.head, meta.wipCommit);
         assert.equal(official.locked, true);
     } finally {
         await environment.close();
@@ -1408,10 +1442,43 @@ test("write timeout retains the locked Worktree and does not create a candidate"
         const meta = readJsonOrNull(paths.metaPath);
         assert.equal(meta.candidateAvailable, false);
         assert.equal(meta.validationPassed, false);
+        assert.equal(meta.wipAvailable, false);
         assert.equal(Object.prototype.hasOwnProperty.call(meta, "resultCommit"), false);
         assert.equal(fs.existsSync(meta.worktreePath), true);
         const official = environment.worktrees().find(entry => path.resolve(entry.path) === path.resolve(meta.worktreePath));
         assert.ok(official);
+        assert.equal(official.locked, true);
+    } finally {
+        await environment.close();
+    }
+});
+
+test("write timeout with modified workspace preserves wip commit and injects metadata", async () => {
+    const environment = await createDormantWriteEnvironment();
+    const jobId = "write_timeout_wip";
+    const paths = environment.createWriteMeta(jobId);
+    const baseHead = gitFixture(environment.projectRoot, ["rev-parse", "HEAD"]);
+    try {
+        const submission = environment.submitWrite(jobId, "[[DELAY_MS=5000]]", paths, { timeoutSec: 0.8 });
+        await waitFor(() => Boolean(readJsonOrNull(paths.metaPath)?.worktreePath));
+        const worktreePath = readJsonOrNull(paths.metaPath).worktreePath;
+        fs.writeFileSync(path.join(worktreePath, "wip-timeout.txt"), "wip timeout content\n", "utf8");
+        await waitFor(() => readJsonOrNull(paths.metaPath)?.state === "timeout", 10000);
+        await submission.catch(() => {});
+        const meta = readJsonOrNull(paths.metaPath);
+        assert.equal(meta.candidateAvailable, false);
+        assert.equal(meta.validationPassed, false);
+        assert.equal(meta.wipAvailable, true);
+        assert.match(meta.wipCommit, /^[0-9a-f]{40,64}$/);
+        assert.match(meta.wipTree, /^[0-9a-f]{40,64}$/);
+        assert.equal(meta.wipBranch, `vcp/aicw/${jobId}`);
+        assert.deepEqual(meta.wipChangedFiles, [{ status: "A", score: null, path: "wip-timeout.txt", oldPath: null }]);
+        assert.equal(gitFixture(environment.projectRoot, ["rev-parse", `${meta.wipCommit}^`]), baseHead);
+        assert.equal(gitFixture(environment.projectRoot, ["show", `${meta.wipCommit}:wip-timeout.txt`]), "wip timeout content");
+        assert.equal(fs.existsSync(meta.worktreePath), true);
+        const official = environment.worktrees().find(entry => path.resolve(entry.path) === path.resolve(meta.worktreePath));
+        assert.ok(official);
+        assert.equal(official.head, meta.wipCommit);
         assert.equal(official.locked, true);
     } finally {
         await environment.close();
