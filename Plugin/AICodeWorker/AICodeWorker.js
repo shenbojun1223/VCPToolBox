@@ -2128,6 +2128,8 @@ function buildWriteResultProjection(jobId, meta) {
     const resultCommit = safeWriteHash(meta.resultCommit);
     const candidateAvailable = Boolean(meta.state === "completed" && meta.validationPassed === true &&
         meta.candidateAvailable === true && baseRevision && resultCommit && worktreeRetained);
+    const wipCommit = safeWriteHash(meta.wipCommit);
+    const wipAvailable = Boolean(meta.wipAvailable === true && wipCommit && worktreeRetained);
     const validationSteps = Array.isArray(meta.validationSteps)
         ? meta.validationSteps.slice(0, 64).map(step => ({
             name: typeof step?.name === "string" ? step.name.slice(0, 64) : "unknown",
@@ -2141,6 +2143,11 @@ function buildWriteResultProjection(jobId, meta) {
         baseRevision,
         resultCommit: candidateAvailable ? resultCommit : null,
         changedFiles: candidateAvailable ? safeWriteChangedFiles(meta.changedFiles) : [],
+        wipAvailable,
+        wipCommit: wipAvailable ? wipCommit : null,
+        wipTree: wipAvailable ? safeWriteHash(meta.wipTree) : null,
+        wipBranch: wipAvailable && typeof meta.wipBranch === "string" ? meta.wipBranch : null,
+        wipChangedFiles: wipAvailable ? safeWriteChangedFiles(meta.wipChangedFiles) : [],
         validation: {
             profile: typeof meta.validationProfile === "string" ? meta.validationProfile.slice(0, 64) : null,
             passed: meta.validationPassed === true,
