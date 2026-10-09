@@ -172,6 +172,35 @@ class KnowledgeBaseManager {
                     : 0.05;
             })(),
             // 兼容仍读取该字段的旧代码；两种枚举模式都表示启用 Tag 索引落地。
+            // 单 Agent 日记 Chunk 索引落地模式（单一枚举配置）：
+            // - always：传统模式，每次防抖窗口结束均重写完整 usearch。
+            // - generational：推荐模式，加载双槽基线并仅由 SQLite 回放 Chunk 差分，
+            //   仅当累计实际差异达到阈值时发布新一代 usearch。
+            // - none：完全禁止落盘（纯内存重建）。
+            chunkIndexPersistenceMode: (() => {
+                const raw = String(
+                    process.env.KNOWLEDGEBASE_PERSIST_CHUNK_INDEX
+                    || 'generational'
+                ).trim().toLowerCase();
+                if (raw === 'always' || raw === 'true') return 'always';
+                if (raw === 'none' || raw === 'off') return 'none';
+                if (raw === 'generational' || raw === 'false' || !raw) {
+                    return 'generational';
+                }
+                console.warn(
+                    `[KnowledgeBase] Invalid KNOWLEDGEBASE_PERSIST_CHUNK_INDEX="${raw}"; ` +
+                    'falling back to recommended mode "generational".'
+                );
+                return 'generational';
+            })(),
+            chunkIndexBaselineDeltaRatio: (() => {
+                const value = Number(
+                    process.env.KNOWLEDGEBASE_CHUNK_INDEX_BASELINE_DELTA_RATIO
+                );
+                return Number.isFinite(value) && value > 0 && value <= 1
+                    ? value
+                    : 0.05;
+            })(),
             persistTagIndex: true,
             // 🌟 是否默认持久化索引（建议 false，仅在内存重建以保证原子性）
             persistDefault: (process.env.KNOWLEDGEBASE_PERSIST_DEFAULT || 'false').toLowerCase() === 'true',
@@ -223,6 +252,7 @@ class KnowledgeBaseManager {
         this.lastJsWriteFinishedAt = 0;
         this.lastRustWriteFinishedAt = 0;
         this._rustLeaseWaitLogAt = 0;
+        this.lastActivityAt = Date.now();
 
         // 🧭 外部文件写入协调器（DailyNote 等常驻服务使用）
         // 文件变更本身不直接写 SQLite，但必须与 watcher 批处理、Rust SQLite 恢复形成单一时序。
@@ -276,6 +306,9 @@ class KnowledgeBaseManager {
                 this._unregisterNativeDiaryIndex(diaryName),
             onRecoveryStateChange: active => {
                 this.indexRecoveryActive = active;
+                if (active) {
+                    this.touchActivity();
+                }
             },
             onRecoveryTailChange: tail => {
                 this._indexRecoveryTail = tail;
@@ -308,10 +341,18 @@ class KnowledgeBaseManager {
 
         const dbPath = path.join(this.config.storePath, 'knowledge_base.sqlite');
         this.dbPath = dbPath;
+        const tDb0 = Date.now();
         this.db = this._openDatabaseWithRecovery(dbPath); // 同步连接
+        const tDb = Date.now() - tDb0;
 
+        const tSchema0 = Date.now();
         this._initSchema();
+        const tSchema = Date.now() - tSchema0;
+
+        console.log(`[KnowledgeBaseProbe] ⏱️ DB open: ${tDb}ms, Schema init: ${tSchema}ms. Entering _cleanupDatabaseOrphans...`);
+        const tOrphan0 = Date.now();
         this._cleanupDatabaseOrphans();
+        console.log(`[KnowledgeBaseProbe] ⏱️ _cleanupDatabaseOrphans complete in ${Date.now() - tOrphan0}ms. Ready to restore Global Tag baseline.`);
 
         // 1. 初始化全局 Tag 索引。
         // tags 是唯一权威真相；磁盘 usearch 只是允许落后的双槽基线。
@@ -804,6 +845,9 @@ class KnowledgeBaseManager {
     _delay(ms) {
         return this.databaseCoordinator.delay(ms);
     }
+    touchActivity() {
+        this.lastActivityAt = Date.now();
+    }
 
     async _waitForDatabaseCoordinatorIdle(options = {}) {
         return this.databaseCoordinator.waitForIdle(options);
@@ -937,17 +981,26 @@ class KnowledgeBaseManager {
         try {
             const affectedDiaries = new Set();
 
-            const missingFiles = this.db.prepare('SELECT id, path, diary_name FROM files').all()
-                .filter(row => !fsSync.existsSync(path.join(this.config.rootPath, row.path)));
+            const tQueryFiles0 = Date.now();
+            const allFiles = this.db.prepare('SELECT id, path, diary_name FROM files').all();
+            const tQueryFiles = Date.now() - tQueryFiles0;
+
+            const tExists0 = Date.now();
+            const missingFiles = allFiles.filter(row => !fsSync.existsSync(path.join(this.config.rootPath, row.path)));
+            const tExists = Date.now() - tExists0;
 
             missingFiles.forEach(row => affectedDiaries.add(row.diary_name));
 
+            const tOrphanChunk0 = Date.now();
             const orphanChunkCount = this.db.prepare(`
                 SELECT COUNT(*) as count
                 FROM chunks c
                 LEFT JOIN files f ON c.file_id = f.id
                 WHERE f.id IS NULL
             `).get().count || 0;
+            const tOrphanChunk = Date.now() - tOrphanChunk0;
+
+            console.log(`[KnowledgeBaseProbe] 🔍 Orphan detail: ${allFiles.length} files queried (${tQueryFiles}ms), ${allFiles.length} existsSync checks (${tExists}ms), orphan chunk count query (${tOrphanChunk}ms). Missing files: ${missingFiles.length}`);
 
             const cleanupTransaction = this.db.transaction(() => {
                 for (const row of missingFiles) {
@@ -1558,7 +1611,13 @@ class KnowledgeBaseManager {
                         maxOutputNodes:
                             options.maxObservationNodes ?? 0,
                         maxOutputEdges:
-                            options.maxObservationEdges ?? 0
+                            options.maxObservationEdges ?? 0,
+                        maxTransitionRecords: Math.max(
+                            0,
+                            Math.min(16000, Math.floor(
+                                Number(options.maxTransitionRecords) || 0
+                            ))
+                        )
                     }
                 }
             }),
@@ -2486,6 +2545,150 @@ candidates = await this.deduplicateResults(
                 nativeJointQuery: false
             }
         );
+    }
+
+    /**
+     * 元思考无 Sense 时的原生并发候选召回。
+     * 仅执行 NativeKnowledgeRuntime 的多日记索引 ANN，不伪造河网、
+     * 不触发二次 JS search，也不需要 observationHandle。
+     */
+    async searchNativeDiaryCandidates(diaryName, queryVector, options = {}) {
+        const names = [...new Set(
+            (Array.isArray(diaryName) ? diaryName : [diaryName])
+                .map(name => String(name || '').trim())
+                .filter(Boolean)
+        )];
+        const vector = queryVector instanceof Float32Array
+            ? queryVector
+            : new Float32Array(queryVector || []);
+        if (
+            names.length === 0
+            || vector.length !== this.config.dimension
+            || !this.nativeKnowledgeRuntime
+            || typeof this.nativeKnowledgeRuntime.searchDiaryIndices !== 'function'
+        ) {
+            return [];
+        }
+
+        await Promise.all(names.map(name => this._getOrLoadDiaryIndex(name)));
+        const perIndexK = Math.max(
+            1,
+            Math.min(1000, Math.floor(Number(options.perIndexK) || 64))
+        );
+        const globalK = Math.max(
+            1,
+            Math.min(2000, Math.floor(Number(options.globalK) || perIndexK))
+        );
+        const payload = await this.nativeKnowledgeRuntime.searchDiaryIndices(
+            names,
+            vector,
+            perIndexK,
+            globalK
+        );
+        const parsed = typeof payload === 'string' ? JSON.parse(payload) : payload;
+        const ids = (Array.isArray(parsed?.results) ? parsed.results : [])
+            .map(item => Number(item?.id))
+            .filter(id => Number.isSafeInteger(id) && id > 0);
+        if (ids.length === 0 || !this.db?.prepare) return [];
+
+        const placeholders = ids.map(() => '?').join(',');
+        const rows = this.db.prepare(`
+            SELECT c.id, c.content AS text, c.vector, f.path AS sourceFile,
+                   f.diary_name AS diaryName, f.id AS fileId
+            FROM chunks c
+            JOIN files f ON f.id = c.file_id
+            WHERE c.id IN (${placeholders})
+        `).all(...ids);
+        const byId = new Map(rows.map(row => [Number(row.id), row]));
+        return ids.map(id => {
+            const row = byId.get(id);
+            const native = parsed.results.find(item => Number(item?.id) === id) || {};
+            return row ? {
+                ...row,
+                id,
+                chunkId: id,
+                fullPath: row.sourceFile,
+                score: Number(native.score) || 0,
+                vectorScore: Number(native.vectorScore) || Number(native.score) || 0,
+                source: 'native_ann'
+            } : null;
+        }).filter(Boolean);
+    }
+
+    /**
+     * 元思考只读构链：消费调用方的同一次 Sense，不创建第二份查询观测。
+     * Rust 对每个候选再次检查其所属思维簇；正文仅按已验证 ID 回填。
+     */
+    async planRiverThinking(prepared, stages, options = {}) {
+        if (
+            !prepared?.observationHandle
+            || !prepared?.artifact?.artifactSig
+            || typeof this.tagIndex?.planMemoThinking !== 'function'
+        ) {
+            throw new Error('River thinking native ABI or observation unavailable');
+        }
+        if (!Array.isArray(stages) || stages.length === 0 || stages.length > 32) {
+            throw new Error('Invalid River thinking stages');
+        }
+        const normalized = stages.map(stage => {
+            const k = Number(stage.k);
+            if (!Number.isSafeInteger(k) || k < 0 || k > 32) {
+                throw new Error('River thinking K outside native budget');
+            }
+            return {
+                diaryName: String(stage.diaryName || '').trim(),
+                k,
+                candidateIds: [...new Set((stage.candidates || [])
+                    .map(item => Number(item.chunkId ?? item.id))
+                    .filter(id => Number.isSafeInteger(id) && id > 0))]
+                    .slice(0, 256)
+            };
+        });
+        const payload = await this.tagIndex.planMemoThinking(
+            this.dbPath,
+            prepared.artifact.artifactSig,
+            JSON.stringify({
+                observationHandle: prepared.observationHandle,
+                stages: normalized,
+                minClosure: options.minClosure ?? 0.2
+            })
+        );
+        const plan = JSON.parse(payload);
+        if (
+            plan.schema !== 'vcp-river-thinking-plan-v1'
+            || plan.artifactSig !== prepared.artifact.artifactSig
+            || plan.observationHandle !== prepared.observationHandle
+            || !Array.isArray(plan.stages)
+            || plan.stages.length !== stages.length
+        ) {
+            throw new Error('Invalid River thinking result');
+        }
+        const selectedIds = new Set();
+        plan.stages.forEach((stage, index) => {
+            const requested = normalized[index];
+            const originals = new Map(stages[index].candidates.map(item => [
+                Number(item.chunkId ?? item.id), item
+            ]));
+            if (
+                stage.diaryName !== requested.diaryName
+                || stage.k !== requested.k
+                || !Array.isArray(stage.results)
+                || stage.results.length > requested.k
+            ) throw new Error('Invalid River thinking stage result');
+            stage.results = stage.results.map(item => {
+                const id = Number(item.chunkId);
+                if (!originals.has(id) || selectedIds.has(id)) {
+                    throw new Error('River thinking returned an unexpected candidate');
+                }
+                if (!Array.isArray(item.parents)
+                    || item.parents.some(parent => !selectedIds.has(parent))) {
+                    throw new Error('River thinking returned an invalid dependency');
+                }
+                selectedIds.add(id);
+                return { ...originals.get(id), riverThinking: item };
+            });
+        });
+        return plan;
     }
 
     /**
