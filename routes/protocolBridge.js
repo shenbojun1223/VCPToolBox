@@ -14,6 +14,7 @@ const {
 const DEBUG_MODE = (process.env.DebugMode || 'False').toLowerCase() === 'true';
 const RESPONSE_RETRY_SUPPRESSION_WINDOW_MS = parseInt(process.env.PROTOCOL_BRIDGE_RETRY_SUPPRESSION_MS || '15000', 10);
 const recentResponsesRequests = new Map();
+const CHAT_REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 
 // ============================================================
 // 消息提取工具函数（从各协议格式提取为统一 messages 数组）
@@ -175,6 +176,18 @@ function attachProtectedToolFields(chatBody, originalBody) {
     }
 
     return chatBody;
+}
+
+function resolveChatReasoningEffort(model, originalBody) {
+    // Fixed-effort GPT-6.1 Sol aliases must win over a client's default (usually medium).
+    const fixedAliasMatch = /^gpt-6\.1-sol-(low|medium|high|xhigh|max)$/i.exec(String(model || '').trim());
+    if (fixedAliasMatch) return fixedAliasMatch[1].toLowerCase();
+
+    // Responses uses reasoning.effort; Chat Completions uses reasoning_effort.
+    const requestedEffort = originalBody?.reasoning?.effort ?? originalBody?.reasoning_effort;
+    if (typeof requestedEffort !== 'string') return undefined;
+    const normalizedEffort = requestedEffort.trim().toLowerCase();
+    return CHAT_REASONING_EFFORTS.has(normalizedEffort) ? normalizedEffort : undefined;
 }
 
 // ============================================================
@@ -629,7 +642,7 @@ function buildResponsesFunctionCallOutput(toolCall, index) {
     };
 }
 
-function buildResponsesApiOutput(chatResponse) {
+function buildResponsesApiOutput(chatResponse, reasoningEffort) {
     const message = chatResponse?.choices?.[0]?.message || {};
     const choice = chatResponse?.choices?.[0] || {};
     const content = typeof message.content === 'string' ? message.content : normalizeTextContent(message.content);
@@ -677,7 +690,7 @@ function buildResponsesApiOutput(chatResponse) {
         });
     }
 
-    return {
+    const response = {
         id: chatResponse?.id || `resp_${Date.now()}`,
         object: 'response',
         created_at: chatResponse?.created || Math.floor(Date.now() / 1000),
@@ -687,6 +700,8 @@ function buildResponsesApiOutput(chatResponse) {
         output_text: content,
         usage: buildResponsesUsage(chatResponse?.usage)
     };
+    if (reasoningEffort !== undefined) response.reasoning = { effort: reasoningEffort };
+    return response;
 }
 
 /**
@@ -752,8 +767,8 @@ function buildResponsesUsage(usage) {
     };
 }
 
-function buildBaseResponsesEnvelope(model) {
-    return {
+function buildBaseResponsesEnvelope(model, reasoningEffort) {
+    const response = {
         id: `resp_${Date.now()}`,
         object: 'response',
         created_at: Math.floor(Date.now() / 1000),
@@ -776,6 +791,8 @@ function buildBaseResponsesEnvelope(model) {
         output_text: '',
         usage: buildResponsesUsage(null)
     };
+    if (reasoningEffort !== undefined) response.reasoning = { effort: reasoningEffort };
+    return response;
 }
 
 /**
@@ -783,8 +800,8 @@ function buildBaseResponsesEnvelope(model) {
  * 结构对齐原始 hackserver.js 的 Responses envelope：同一个 responsePayload 持续更新，
  * 最终 response.completed/response.failed 都携带完整 payload，避免 Codex 判定“无终态断流”。
  */
-function createResponsesStreamTransformer(res, model) {
-    const responsePayload = buildBaseResponsesEnvelope(model);
+function createResponsesStreamTransformer(res, model, reasoningEffort) {
+    const responsePayload = buildBaseResponsesEnvelope(model, reasoningEffort);
     responsePayload.output = [];
     const responseId = responsePayload.id;
     let headersSent = false;
@@ -968,6 +985,7 @@ function createResponsesStreamTransformer(res, model) {
                     created_at: responsePayload.created_at,
                     status: 'in_progress',
                     model: responsePayload.model,
+                    ...(responsePayload.reasoning && { reasoning: responsePayload.reasoning }),
                     usage: buildResponsesUsage(null)
                 }
             });
@@ -1250,6 +1268,8 @@ async function forwardToChatCompletions(req, res, {
     if (typeof temperature !== 'undefined') chatBody.temperature = temperature;
     if (typeof topP !== 'undefined') chatBody.top_p = topP;
     if (typeof maxTokens !== 'undefined') chatBody.max_tokens = maxTokens;
+    const reasoningEffort = resolveChatReasoningEffort(chatBody.model, originalBody);
+    if (reasoningEffort !== undefined) chatBody.reasoning_effort = reasoningEffort;
 
     // 原生 function tools 字段不参与 messages/RAG/变量处理；在转发本地 chat 链路前作为受保护字段加回。
     attachProtectedToolFields(chatBody, originalBody);
@@ -1266,6 +1286,7 @@ async function forwardToChatCompletions(req, res, {
             temperature: chatBody.temperature,
             top_p: chatBody.top_p,
             max_tokens: chatBody.max_tokens,
+            reasoning_effort: chatBody.reasoning_effort,
             stream: chatBody.stream
         });
     }
@@ -1303,7 +1324,7 @@ async function forwardToChatCompletions(req, res, {
             let outputPayload;
             switch (outputFormat) {
                 case 'responses':
-                    outputPayload = buildResponsesApiOutput(rawJson);
+                    outputPayload = buildResponsesApiOutput(rawJson, reasoningEffort);
                     break;
                 case 'anthropic':
                     outputPayload = buildAnthropicApiOutput(rawJson);
@@ -1327,7 +1348,7 @@ async function forwardToChatCompletions(req, res, {
         let transformer;
         switch (outputFormat) {
             case 'responses':
-                transformer = createResponsesStreamTransformer(res, chatBody.model);
+                transformer = createResponsesStreamTransformer(res, chatBody.model, reasoningEffort);
                 activeTransformer = transformer;
                 break;
             case 'anthropic':
@@ -1443,6 +1464,8 @@ router.post('/v1/responses', async (req, res) => {
             temperature: body.temperature,
             top_p: body.top_p,
             max_tokens: body.max_output_tokens || body.max_tokens,
+            reasoning: body.reasoning,
+            reasoning_effort: body.reasoning_effort,
             stream: wantsStream
         });
     }
