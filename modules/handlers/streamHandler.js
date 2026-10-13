@@ -9,6 +9,7 @@ const {
   normalizeReasoningTag,
   shouldConvertReasoningForModel
 } = require('../reasoningContentAdapter.js');
+const { createRollKeeper } = require('../vcpLoop/rollKeeper');
 
 class StreamHandler {
   constructor(context) {
@@ -71,6 +72,7 @@ class StreamHandler {
     const maxRecursion = Number.isFinite(parsedMaxRecursion) && parsedMaxRecursion > 0
       ? parsedMaxRecursion
       : 20;
+    const rollKeeper = createRollKeeper({ maxRecursion });
     let currentAIContentForLoop = '';
     let chatLogs = [];
     let oneRingAssistantTurnParts = [];
@@ -416,6 +418,11 @@ class StreamHandler {
         break;
       }
 
+      const rollInjection = rollKeeper.evaluate({ recursionDepth });
+      if (rollInjection && rollInjection.kind && rollInjection.content) {
+        currentMessagesForLoop.push({ role: 'system', content: rollInjection.content });
+      }
+
       let assistantMessages = [{ role: 'assistant', content: currentAIContentForLoop }];
       if (enableRoleDivider && enableRoleDividerInLoop) {
         assistantMessages = roleDivider.process(assistantMessages, {
@@ -523,7 +530,7 @@ class StreamHandler {
         }
 
         throwIfAborted(abortController.signal);
-        if (res.writableEnded || res.destroyed) return;
+        if (res.writableEnded || res.destroyed) { rollKeeper.reset(); return; }
         const nextAiAPIResponse = await fetchWithRetry(
           `${apiUrl}/v1/chat/completions`,
           {
@@ -579,6 +586,13 @@ class StreamHandler {
 
       // 执行普通调用
       const toolResults = await toolExecutor.executeAll(normalCalls, clientIp, currentMessagesForLoop);
+      for (let i = 0; i < normalCalls.length; i++) {
+        rollKeeper.record({
+          name: normalCalls[i].name,
+          args: normalCalls[i].args,
+          success: !!(toolResults[i] && toolResults[i].success)
+        });
+      }
       const combinedToolResultsForAI = toolResults.map(r => r.content).flat();
       if (archeryErrorContents.length > 0) combinedToolResultsForAI.push(...archeryErrorContents);
 
@@ -744,6 +758,7 @@ class StreamHandler {
       // Tool execution and projection may yield while the user cancels.
       // Do not invoke another upstream request after cancellation or disconnect.
       if (abortController?.signal.aborted || res.writableEnded || res.destroyed) {
+        rollKeeper.reset();
         return;
       }
 
@@ -780,6 +795,9 @@ class StreamHandler {
 
       recursionDepth++;
     } // toolcall loop end
+
+    // 轮数保真器：循环结束（正常退出 / break / 熔断分支）后释放本次会话状态。
+    rollKeeper.reset();
 
     // ★ 熔断收口前，将尾部未闭合的 VCP 工具块残片从 OneRing 记忆流中剥除，
     //   防止残片进入 Agent 长期记忆并污染未来的 RAG 检索。

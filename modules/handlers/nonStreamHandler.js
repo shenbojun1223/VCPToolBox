@@ -10,6 +10,7 @@ const {
   normalizeReasoningTag,
   shouldConvertReasoningForModel
 } = require('../reasoningContentAdapter.js');
+const { createRollKeeper } = require('../vcpLoop/rollKeeper');
 
 function hasVisibleContent(content) {
   if (typeof content === 'string') return content.trim().length > 0;
@@ -316,6 +317,7 @@ class NonStreamHandler {
     const maxRecursion = Number.isFinite(parsedMaxRecursion) && parsedMaxRecursion > 0
       ? parsedMaxRecursion
       : 20;
+    const rollKeeper = createRollKeeper({ maxRecursion });
     let conversationHistoryForClient = [];
     let currentAIContentForLoop = fullContentFromAI;
     // AICW 内层禁工具消费回执：仅记录本次请求真实发生的分支事实（是否跳过解析、
@@ -329,6 +331,11 @@ class NonStreamHandler {
       if (abortController && abortController.signal.aborted) {
         if (DEBUG_MODE) console.log('[VCP NonStream Loop] Abort detected, exiting loop.');
         break;
+      }
+
+      const rollInjection = rollKeeper.evaluate({ recursionDepth });
+      if (rollInjection && rollInjection.kind && rollInjection.content) {
+        currentMessagesForNonStreamLoop.push({ role: 'system', content: rollInjection.content });
       }
 
       let anyToolProcessedInCurrentIteration = false;
@@ -402,7 +409,7 @@ class NonStreamHandler {
           }
 
           throwIfAborted(abortController.signal);
-          if (res.writableEnded || res.destroyed) return;
+          if (res.writableEnded || res.destroyed) { rollKeeper.reset(); return; }
           const recursionBody = { ...originalBody, messages: currentMessagesForNonStreamLoop, stream: false };
           const recursionReadResult = await readNonStreamResponseWithSemanticRetry({
             fetchResponse: () => fetchNonStreamCompletion(recursionBody, `archery_error_depth_${recursionDepth}`),
@@ -461,6 +468,13 @@ class NonStreamHandler {
         currentMessagesForNonStreamLoop.push(...assistantMessages);
 
         const toolResults = await toolExecutor.executeAll(normalCalls, clientIp, currentMessagesForNonStreamLoop);
+        for (let i = 0; i < normalCalls.length; i++) {
+          rollKeeper.record({
+            name: normalCalls[i].name,
+            args: normalCalls[i].args,
+            success: !!(toolResults[i] && toolResults[i].success)
+          });
+        }
         const normalCallLogs = (() => {
           let logs = [];
           if (writeChatLog) {
@@ -637,6 +651,9 @@ class NonStreamHandler {
       if (!anyToolProcessedInCurrentIteration) break;
       recursionDepth++;
     } while (recursionDepth < maxRecursion && !(abortController && abortController.signal.aborted));
+
+    // 轮数保真器：循环结束（正常退出 / break / 熔断分支）后释放本次会话状态。
+    rollKeeper.reset();
 
     throwIfAborted(abortController.signal);
     if (res.writableEnded || res.destroyed) return;
