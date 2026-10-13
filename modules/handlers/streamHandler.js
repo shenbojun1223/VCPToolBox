@@ -1,3 +1,4 @@
+const { UpstreamError, assertResponseOk, throwIfAborted } = require('../upstreamErrors.js');
 // modules/handlers/streamHandler.js
 const { StringDecoder } = require('string_decoder');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
@@ -128,6 +129,7 @@ class StreamHandler {
 
     // 辅助函数：处理 AI 响应流 (优化版：直通转发 + 后台解析 + chunk 空闲超时保护)
     const processAIResponseStreamHelper = async (aiResponse, isInitialCall) => {
+      await assertResponseOk(aiResponse, { phase: isInitialCall ? 'initial' : 'tool_continuation' }, abortController.signal);
       return new Promise((resolve, reject) => {
         const decoder = new StringDecoder('utf8');
         let collectedContentThisTurn = '';
@@ -253,62 +255,47 @@ class StreamHandler {
 
         // 🌟 新增：chunk 级空闲超时保护
         // 如果连续 CHUNK_IDLE_TIMEOUT 毫秒未收到任何上游 data chunk，
-        // 则判定上游流已冻结，主动中止并 resolve，防止无限挂起
+        // 则终止读取并抛出安全错误，不允许把部分输出送入工具补救轮。
         const resetChunkIdleTimer = () => {
           if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
           chunkIdleTimer = setTimeout(() => {
             if (streamAborted) return;
             console.warn(`[Stream IdleTimeout] No upstream chunk received for ${CHUNK_IDLE_TIMEOUT / 1000}s. Assuming stream stalled. Forcing end.`);
-            streamAborted = true;
-            // 通知前端这次流异常结束
-            if (!res.writableEnded && !res.destroyed) {
-              try {
-                const stallPayload = {
-                  id: `chatcmpl-VCP-stall-${Date.now()}`,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: originalBody.model || 'unknown',
-                  choices: [{ index: 0, delta: { content: '\n[上游响应超时，流已中断]' }, finish_reason: 'stop' }],
-                };
-                res.write(`data: ${JSON.stringify(stallPayload)}\n\n`);
-                res.write('data: [DONE]\n\n');
-              } catch (e) { /* ignore */ }
-            }
-            if (aiResponse.body && !aiResponse.body.destroyed) {
-              aiResponse.body.destroy();
-            }
-            if (keepAliveTimer) clearInterval(keepAliveTimer);
-            if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
-            resolve(result());
+            failStream('upstream_timeout');
           }, CHUNK_IDLE_TIMEOUT);
         };
         resetChunkIdleTimer(); // 启动首次空闲计时
 
-        const abortHandler = () => {
-          streamAborted = true;
-          if (keepAliveTimer) clearInterval(keepAliveTimer);
-          if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
-          if (DEBUG_MODE) console.log('[Stream Abort] Abort signal received, stopping stream processing.');
-          if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
-          if (aiResponse.body && !aiResponse.body.destroyed) aiResponse.body.destroy();
-          resolve(result());
+        const cleanupStream = () => {
+          clearInterval(keepAliveTimer);
+          clearTimeout(chunkIdleTimer);
+          abortController?.signal.removeEventListener('abort', abortHandler);
+          aiResponse.body.removeListener('data', onData);
+          aiResponse.body.removeListener('end', onEnd);
+          aiResponse.body.removeListener('error', onError);
+          aiResponse.body.removeListener('close', onClose);
         };
-
-        if (abortController?.signal) {
-          abortController.signal.addEventListener('abort', abortHandler);
-          if (abortController.signal.aborted) abortHandler();
-        }
-
-        aiResponse.body.on('close', () => {
-          if (upstreamEnded) return;
+        const failStream = code => {
+          if (streamAborted) return;
           streamAborted = true;
-          if (keepAliveTimer) clearInterval(keepAliveTimer);
-          if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
-          if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
-          resolve(result());
-        });
+          cleanupStream();
+          if (!aiResponse.body.destroyed) {
+            // _destroy may report an asynchronous error before close.
+            const ignoreDestroyError = () => {};
+            aiResponse.body.on('error', ignoreDestroyError);
+            aiResponse.body.once('close', () => aiResponse.body.removeListener('error', ignoreDestroyError));
+            aiResponse.body.destroy();
+          }
+          reject(new UpstreamError({ status: aiResponse.status, code,
+            phase: isInitialCall ? 'initial' : 'tool_continuation' }));
+        };
+        const abortHandler = () => failStream('aborted');
+        const onClose = () => {
+          if (!aiResponse.body.readableEnded && !streamAborted) failStream('stream_error');
+        };
+        const onError = () => failStream(abortController?.signal.aborted ? 'aborted' : 'stream_error');
 
-        aiResponse.body.on('data', chunk => {
+        const onData = chunk => {
           if (streamAborted) return;
           resetChunkIdleTimer(); // 每收到一个 chunk 就重置空闲计时器
 
@@ -351,13 +338,14 @@ class StreamHandler {
                   res.write(line + '\n');
                 }
               } catch (writeError) {
-                streamAborted = true;
+                failStream('aborted');
+                return;
               }
             }
           }
-        });
+        };
 
-        aiResponse.body.on('end', () => {
+        const onEnd = () => {
           upstreamEnded = true;
           if (keepAliveTimer) clearInterval(keepAliveTimer);
           if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
@@ -398,28 +386,15 @@ class StreamHandler {
           }
 
           writeClientReasoningCloseChunk();
-          if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
+          cleanupStream();
           resolve(result());
-        });
-
-        aiResponse.body.on('error', streamError => {
-          if (keepAliveTimer) clearInterval(keepAliveTimer);
-          if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
-          if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
-          if (streamAborted || streamError.name === 'AbortError' || streamError.type === 'aborted') {
-            streamAborted = true;
-            resolve(result());
-            return;
-          }
-          console.error('Error reading AI response stream:', streamError);
-          if (!res.writableEnded) {
-            try {
-              res.write(`data: ${JSON.stringify({ error: 'STREAM_READ_ERROR', message: streamError.message })}\n\n`);
-              res.end();
-            } catch (e) { }
-          }
-          reject(streamError);
-        });
+        };
+        aiResponse.body.on('error', onError);
+        aiResponse.body.on('close', onClose);
+        aiResponse.body.on('end', onEnd);
+        abortController?.signal.addEventListener('abort', abortHandler, { once: true });
+        if (abortController?.signal.aborted) { abortHandler(); return; }
+        aiResponse.body.on('data', onData);
       });
     };
 
@@ -547,6 +522,8 @@ class StreamHandler {
           } catch (e) { }
         }
 
+        throwIfAborted(abortController.signal);
+        if (res.writableEnded || res.destroyed) return;
         const nextAiAPIResponse = await fetchWithRetry(
           `${apiUrl}/v1/chat/completions`,
           {
@@ -559,9 +536,10 @@ class StreamHandler {
             body: JSON.stringify({ ...originalBody, messages: currentMessagesForLoop, stream: true }),
             signal: abortController.signal,
           },
-          { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates }
+          { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates, phase: 'tool_continuation' }
         );
 
+        await assertResponseOk(nextAiAPIResponse, { phase: 'tool_continuation' }, abortController.signal);
         if (nextAiAPIResponse.ok) {
           let nextAIResponseData = await processAIResponseStreamHelper(nextAiAPIResponse, false);
           validUpstreamTurns = validUpstreamTurns && nextAIResponseData.completed;
@@ -766,8 +744,7 @@ class StreamHandler {
       // Tool execution and projection may yield while the user cancels.
       // Do not invoke another upstream request after cancellation or disconnect.
       if (abortController?.signal.aborted || res.writableEnded || res.destroyed) {
-        if (!res.writableEnded && !res.destroyed) res.end();
-        break;
+        return;
       }
 
       const nextAiAPIResponse = await fetchWithRetry(
@@ -782,10 +759,10 @@ class StreamHandler {
           body: JSON.stringify({ ...originalBody, messages: messagesForUpstream, stream: true }),
           signal: abortController.signal,
         },
-        { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates }
+        { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates, phase: 'tool_continuation' }
       );
 
-      if (!nextAiAPIResponse.ok) break;
+      await assertResponseOk(nextAiAPIResponse, { phase: 'tool_continuation' }, abortController.signal);
 
       let nextAIResponseData = await processAIResponseStreamHelper(nextAiAPIResponse, false);
       validUpstreamTurns = validUpstreamTurns && nextAIResponseData.completed;

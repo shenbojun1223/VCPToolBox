@@ -1,3 +1,4 @@
+const { UpstreamError, responseError, assertResponseOk, abortableDelay, abortError, throwIfAborted, safeErrorFields, sendFailure } = require('./upstreamErrors.js');
 // modules/chatCompletionHandler.js
 const messageProcessor = require('./messageProcessor.js');
 const vcpInfoHandler = require('../vcpInfoHandler.js');
@@ -9,6 +10,60 @@ const http = require('http');
 const https = require('https');
 const finalContextStore = require('./finalContextStore.js');
 const { appendBudgetNotice } = require('./softContextBudget.js');
+// AICW 内层禁工具消费回执（opt-in，本机控制头）：仅在显式控制头存在时启用，普通请求零影响。
+const { beginVcpToolForbiddenReceipt, emitVcpToolForbiddenReceipt } = require('./vcpToolForbiddenReceipt.js');
+
+// AICW inner tool-forbidden consumption receipt: the ONE fail-closed exit for an
+// explicit (opt-in) violation. Fixed codes only - the raw control header, the raw
+// body, the model and every credential are never echoed - and the reserved receipt
+// namespace is force-overwritten with `rejected:<code>`.
+const VCP_TFR_REFUSAL_MESSAGE = '[VCP_TFR] the local tool-forbidden receipt check failed; the request was stopped before model dispatch.';
+
+class VcpToolForbiddenRefusal extends Error {
+  constructor(receiptCode) {
+    const fixed = typeof receiptCode === 'string' && /^[a-z0-9_]{1,64}$/.test(receiptCode) ? receiptCode : 'control_invalid';
+    super('vcp_tfr_' + fixed);
+    this.name = 'VcpToolForbiddenRefusal';
+    this.receiptCode = fixed;
+    this.code = 'vcp_tfr_' + fixed;
+    this.status = 400;
+  }
+}
+
+// The ONE fail-closed writer: it answers with a fixed-code JSON error. Only fixed codes
+// leave this module - no raw control header, no raw body, no model and no credential is
+// ever echoed. The reserved receipt namespace was already force-overwritten by
+// refuseVcpToolForbiddenReceipt with `rejected:<code>`.
+function respondVcpToolForbiddenRefusal(res, refusal) {
+  if (!res || typeof res.json !== 'function' || typeof res.setHeader !== 'function') return false;
+  if (res.headersSent || res.writableEnded || res.destroyed) return false;
+  const status = refusal && refusal.status ? refusal.status : 400;
+  res.status(status).json({
+    error: { type: 'upstream_error', status, code: refusal && refusal.code ? refusal.code : 'vcp_tfr_control_invalid', message: VCP_TFR_REFUSAL_MESSAGE }
+  });
+  return true;
+}
+
+function refuseVcpToolForbiddenReceipt(res, binding, code) {
+  const refusal = new VcpToolForbiddenRefusal(code);
+  emitVcpToolForbiddenReceipt(res, {
+    binding,
+    markerConsumed: binding && binding.markerConsumed === true,
+    toolForbidden: false,
+    toolParsingSkipped: false,
+    toolsExecuted: 0,
+    responseText: ''
+  });
+  // The refused token is ALWAYS the fixed code of THIS refusal (the code is sanitised
+  // by VcpToolForbiddenRefusal): the single emission above cannot decide the token of an
+  // emission-time refusal (for example a valid binding whose real backend identity could
+  // not be observed), and the reserved namespace must never end up with a less specific
+  // refusal token than the answered error code.
+  if (res && typeof res.setHeader === 'function') {
+    res.setHeader('x-aicw-tfr-receipt', 'rejected:' + refusal.receiptCode);
+  }
+  return refusal;
+}
 
 // 多模态配置真相源（JSON 优先 + 热更新），用于在请求时动态拉取 MultiModalForceTranslateModels
 let multiModalConfigStore = null;
@@ -400,9 +455,22 @@ function applyModelFallbackForAttempt(options, candidates, attemptIndex, debugMo
     };
   } catch (error) {
     if (debugMode) {
-      console.warn(`[SemanticModelRouter] 无法为本次重试替换模型，继续使用原始请求体: ${error.message}`);
+      console.warn('[SemanticModelRouter] 无法为本次重试替换模型，继续使用原始请求体。');
     }
     return options;
+  }
+}
+
+// AICW R2: the model this attempt really serialises onto the wire, read from the
+// exact (possibly model-fallback-rewritten) body of the attempt - never from an
+// earlier routing snapshot and never from the client control document.
+function readDispatchedModel(options) {
+  if (!options || typeof options.body !== 'string') return null;
+  try {
+    const parsedBody = JSON.parse(options.body);
+    return parsedBody && typeof parsedBody.model === 'string' ? parsedBody.model : null;
+  } catch (_) {
+    return null;
   }
 }
 
@@ -411,138 +479,63 @@ function applyModelFallbackForAttempt(options, candidates, attemptIndex, debugMo
 async function fetchWithRetry(
   url,
   options,
-  { retries = 3, delay = 1000, debugMode = false, onRetry = null, onRequestSent = null, onResponseHeaders = null, connectionTimeout = 900000, modelFallbackCandidates = null } = {},
+  { retries = 3, delay = 1000, debugMode = false, onRetry = null, onRequestSent = null, onResponseHeaders = null, connectionTimeout = 900000, modelFallbackCandidates = null, phase = 'initial', onModelDispatched = null } = {},
 ) {
   const { default: fetch } = await import('node-fetch');
   const maxAttempts = Math.max(
     Number.isFinite(Number(retries)) && Number(retries) > 0 ? Math.floor(Number(retries)) : 1,
     Array.isArray(modelFallbackCandidates) ? modelFallbackCandidates.length : 0
   );
+  const externalSignal = options.signal;
   for (let i = 0; i < maxAttempts; i++) {
-    // 为每次尝试创建独立的中止控制器，用于超时保护
+    throwIfAborted(externalSignal);
     const attemptController = new AbortController();
     let didTimeout = false;
-    const externalSignal = options.signal;
-
-    // 将外部中止信号转发给本次尝试的控制器
-    let removeExternalListener = null;
-    if (externalSignal) {
-      if (externalSignal.aborted) {
-        throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
-      }
-      const forwardAbort = () => attemptController.abort();
-      externalSignal.addEventListener('abort', forwardAbort, { once: true });
-      removeExternalListener = () => externalSignal.removeEventListener('abort', forwardAbort);
-    }
-
-    // 设置连接超时
+    const forwardAbort = () => attemptController.abort();
+    externalSignal?.addEventListener('abort', forwardAbort, { once: true });
     const timeoutId = connectionTimeout > 0
       ? setTimeout(() => { didTimeout = true; attemptController.abort(); }, connectionTimeout)
       : null;
-
-    const cleanup = () => {
-      if (timeoutId) clearTimeout(timeoutId);
-      if (removeExternalListener) removeExternalListener();
-    };
-
+    let failure;
+    let response;
+    let attemptModel = null;
+    // Only the actual fetch is in the network-error catch. HTTP failures and
+    // observational callbacks must never be reclassified as network failures.
     try {
       const attemptOptions = applyModelFallbackForAttempt(options, modelFallbackCandidates, i, debugMode);
-      if (typeof onRequestSent === 'function') {
-        try {
-          onRequestSent();
-        } catch (_) {
-          // Diagnostic callbacks are observational and cannot alter the request.
-        }
-      }
-      const response = await fetch(url, {
-        ...attemptOptions,
-        agent: getFetchAgent, // 注入防御性长连接池
-        signal: attemptController.signal,
-      });
-      cleanup();
-
-      if (typeof onResponseHeaders === 'function') {
-        try {
-          onResponseHeaders(response.status);
-        } catch (_) {
-          // Diagnostic callbacks are observational and cannot alter the request.
-        }
-      }
-
-      let shouldRetryStatus = response.status === 500 || response.status === 503 || response.status === 429;
-      let retryMessage = response.statusText;
-
-      // Gemini / NewAPI 偶发特殊空回：上游可能以 401 返回包含 token 的错误文本
-      // 例如：{"error":{"message":"Invalid token ..."}}
-      // 这类并非 VCP 本地 Key 配置错误，而是上游瞬时 token 异常，可安全纳入重试。
-      if (response.status === 401) {
-        try {
-          const responseBodyText = await response.clone().text();
-          if (responseBodyText.toLowerCase().includes('token')) {
-            shouldRetryStatus = true;
-            retryMessage = responseBodyText || response.statusText;
-          }
-        } catch (bodyReadError) {
-          if (debugMode) {
-            console.warn(`[Fetch Retry] Failed to inspect 401 response body: ${bodyReadError.message}`);
-          }
-        }
-      }
-
-      if (shouldRetryStatus) {
-        const currentDelay = delay * (i + 1);
-        if (debugMode) {
-          console.warn(
-            `[Fetch Retry] Received status ${response.status}. Retrying in ${currentDelay}ms... (${i + 1}/${retries})`,
-          );
-        }
-        if (onRetry) {
-          await onRetry(i + 1, { status: response.status, message: retryMessage });
-        }
-        await new Promise(resolve => setTimeout(resolve, currentDelay));
-        continue;
-      }
-      return response;
-    } catch (error) {
-      cleanup();
-
-      // 区分超时中止和外部中止
-      if (error.name === 'AbortError') {
-        if (didTimeout) {
-          // 超时中止 → 视为可重试的网络错误
-          const msg = `Connection timed out after ${connectionTimeout / 1000}s`;
-          if (i === maxAttempts - 1) {
-            console.error(`[Fetch Retry] ${msg}. All retries exhausted.`);
-            throw new Error(msg);
-          }
-          if (debugMode) console.warn(`[Fetch Retry] ${msg}. Retrying... (${i + 1}/${retries})`);
-          if (onRetry) {
-            await onRetry(i + 1, { status: 'TIMEOUT', message: msg });
-          }
-          await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
-          continue;
-        }
-        // 外部中止（用户取消）→ 不重试
-        if (debugMode) console.log('[Fetch Retry] Request was aborted. No retries will be attempted.');
-        throw error;
-      }
-
-      if (i === maxAttempts - 1) {
-        console.error(`[Fetch Retry] All retries failed. Last error: ${error.message}`);
-        throw error;
-      }
-      if (debugMode) {
-        console.warn(
-          `[Fetch Retry] Fetch failed with error: ${error.message}. Retrying in ${delay}ms... (${i + 1}/${retries})`,
-        );
-      }
-      if (onRetry) {
-        await onRetry(i + 1, { status: 'NETWORK_ERROR', message: error.message });
-      }
-      await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
+      attemptModel = readDispatchedModel(attemptOptions);
+      try { onRequestSent?.(); } catch (_) { /* observational */ }
+      response = await fetch(url, { ...attemptOptions, agent: getFetchAgent, signal: attemptController.signal });
+    } catch (_) {
+      failure = externalSignal?.aborted ? abortError({ phase, attempt: i + 1 })
+        : new UpstreamError({ code: didTimeout ? 'upstream_timeout' : 'network_error', phase, attempt: i + 1 });
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+      externalSignal?.removeEventListener('abort', forwardAbort);
     }
+    if (response) {
+      try { onResponseHeaders?.(response.status); } catch (_) { /* observational */ }
+      if (response.ok) {
+        if (externalSignal?.aborted) {
+          response.body?.destroy();
+          throw abortError({ status: response.status, phase, attempt: i + 1 });
+        }
+        // The ACCEPTED attempt is the only source of the backend-identity fact: an
+        // observation callback only, it neither re-sends nor rewrites the request.
+        if (typeof onModelDispatched === 'function') {
+          try { onModelDispatched(attemptModel, i + 1); } catch (_) { /* observational only */ }
+        }
+        return response; // Success body belongs exclusively to the handler.
+      }
+      failure = await responseError(response, { phase, attempt: i + 1 }, { signal: externalSignal });
+    }
+    if (failure.name === 'AbortError') throw failure;
+    const retryable = failure.status === null || [500, 503, 429].includes(failure.status);
+    if (failure.code === 'sensitive_words_detected' || !retryable || i === maxAttempts - 1) throw failure;
+    if (debugMode) console.warn('[Fetch Retry]', safeErrorFields(failure));
+    if (onRetry) await onRetry(i + 1, safeErrorFields(failure));
+    await abortableDelay(delay * (i + 1), externalSignal);
   }
-  throw new Error('Fetch failed after all retries.');
 }
 
 // 剥离 Markdown 代码块，避免 VCP Refresh 误扫源码示例中的伪 RAG 标签
@@ -763,8 +756,27 @@ class ChatCompletionHandler {
       })
       : fetchWithRetry;
 
+
+    // AICW R2 (request-private, in-memory only): the model THIS request really sent on
+    // the attempt whose response was accepted. It is observed through a narrow callback
+    // bound to this request, never through a global mutable snapshot and never derived
+    // from the client control document. It stays unobserved until the real dispatch.
+    let dispatchedBackendModel = null;
+
     const id = req.body.requestId || req.body.messageId;
     let originalBody = req.body;
+    // AICW inner tool-forbidden consumption receipt: the entry pre-check runs FIRST -
+    // before the response-cache replay and before ANY processing that could change the
+    // bound message projection (sanitise/consume/prune/redirect). An absent control
+    // header keeps the ordinary request path byte-identical to the frozen source; a
+    // present header is an explicit opt-in, and every illegal / ambiguous /
+    // non-`stream:false` value fails closed before model dispatch, never a downgrade.
+    const vcpToolForbiddenReceipt = beginVcpToolForbiddenReceipt(req, originalBody);
+    if (vcpToolForbiddenReceipt !== null && vcpToolForbiddenReceipt.valid !== true) {
+      const refusal = refuseVcpToolForbiddenReceipt(res, vcpToolForbiddenReceipt, vcpToolForbiddenReceipt.code || 'control_invalid');
+      respondVcpToolForbiddenRefusal(res, refusal);
+      return;
+    }
     const vcpchatExtensions = originalBody && typeof originalBody === 'object'
       ? originalBody.vcpchatExtensions
       : null;
@@ -781,7 +793,12 @@ class ChatCompletionHandler {
     // 请求独享，PluginManager 浅拷贝配置时仍保留此对象引用。
     requestPreprocessorConfig.tavernInteraction = {};
     const isOriginalRequestStreaming = originalBody.stream === true;
-    const responseCacheKey = this.responseReplayCache.buildKey(clientIp, id);
+    // An explicit opt-in request never replays a cached response and is never cached:
+    // a cached body is not evidence of THIS run's consumption, so it must neither
+    // short-circuit the entry pre-check nor satisfy a fresh nonce.
+    const responseCacheKey = vcpToolForbiddenReceipt === null
+      ? this.responseReplayCache.buildKey(clientIp, id)
+      : null;
 
     if (responseCacheKey && this.responseReplayCache.replay(responseCacheKey, req, res)) {
       return;
@@ -815,28 +832,31 @@ class ChatCompletionHandler {
         aborted: false, // 修复 Bug #4: 添加中止标志
         abortReason: null
       });
+    }
 
+    {
       // 通用前端兼容：如果客户端没有显式调用 /v1/interrupt，
       // 但 HTTP/SSE 连接已经断开，则把传输层断联转换为同一条级联中止链路。
       // 注意：这里不能区分“用户点停止 / 刷新页面 / 网络断线 / 代理断开”，统一视为客户端不再等待响应。
       const triggerClientDisconnectAbort = (reason) => {
-        const requestData = activeRequests.get(id);
-        if (!requestData) return;
+        const requestData = id ? activeRequests.get(id) : null;
 
         // 正常完成的响应也会触发 close，此时不能误杀已经完成的请求。
         if (res.writableEnded) return;
 
-        if (requestData.aborted) return;
+        if (abortController.signal.aborted) return;
 
-        requestData.aborted = true;
-        requestData.abortReason = reason;
+        if (requestData) {
+          requestData.aborted = true;
+          requestData.abortReason = reason;
+        }
         clientDisconnectedAbortReason = reason;
 
         if (!abortController.signal.aborted) {
           abortController.abort();
         }
 
-        console.log(`[ClientDisconnect] Request ${id} aborted due to ${reason}. Upstream cascade abort triggered.`);
+        if (DEBUG_MODE) console.log('[ClientDisconnect] Upstream request aborted.');
       };
 
       const onReqAborted = () => triggerClientDisconnectAbort('request_aborted');
@@ -921,6 +941,17 @@ class ChatCompletionHandler {
       }
 
       const vcpToolUseForbidden = consumeVcpToolUseForbiddenPlaceholder(originalBody.messages);
+      // 回执只能来自本次真实消费结果：由冻结消费函数的布尔返回值派生，绝不硬填。
+      if (vcpToolForbiddenReceipt) {
+        vcpToolForbiddenReceipt.markerConsumed = vcpToolUseForbidden === true;
+      }
+      // Explicit opt-in but the marker was not really consumed by this entry: refuse
+      // before model dispatch and before any inner tool parsing/execution. The thrown
+      // fixed error is handled by the shared failure path, which keeps the already
+      // forced `rejected:<code>` receipt header.
+      if (vcpToolForbiddenReceipt !== null && vcpToolForbiddenReceipt.markerConsumed !== true) {
+        throw refuseVcpToolForbiddenReceipt(res, vcpToolForbiddenReceipt, 'marker_not_consumed');
+      }
       if (vcpToolUseForbidden && DEBUG_MODE) {
         console.log(`[VCPToolUse] Detected ${VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER} in top-level system prompt. Tool parsing/execution is disabled for this request.`);
       }
@@ -1284,6 +1315,9 @@ class ChatCompletionHandler {
           debugMode: DEBUG_MODE,
           connectionTimeout: apiConnectionTimeoutMs,
           modelFallbackCandidates: semanticModelFallbackCandidates,
+          // Observation only: the model the ACCEPTED attempt really serialised (after
+          // semantic routing and after any model-fallback rewrite). It adds no attempt.
+          onModelDispatched: model => { dispatchedBackendModel = typeof model === 'string' ? model : null; },
           onRetry: async (attempt, errorInfo) => {
             if (!res.headersSent && isOriginalRequestStreaming) {
               if (DEBUG_MODE)
@@ -1297,71 +1331,23 @@ class ChatCompletionHandler {
         },
       );
 
+      await assertResponseOk(firstAiAPIResponse, { phase: 'initial' }, abortController.signal);
+
+      // AICW R2: the backend-identity fact is taken at the ACTUAL dispatch boundary of
+      // the request that produced THIS response - after semantic routing and after any
+      // model-fallback attempt. An unobservable fact fails the opt-in request closed
+      // instead of being reported as "the same as the bound entry logical model".
+      if (vcpToolForbiddenReceipt !== null && vcpToolForbiddenReceipt.valid === true) {
+        if (typeof dispatchedBackendModel !== 'string' || dispatchedBackendModel.length === 0) {
+          throw refuseVcpToolForbiddenReceipt(res, vcpToolForbiddenReceipt, 'backend_identity_unobserved');
+        }
+        vcpToolForbiddenReceipt.backendModel = dispatchedBackendModel;
+      }
       const isUpstreamStreaming =
         willStreamResponse && firstAiAPIResponse.headers.get('content-type')?.includes('text/event-stream');
 
       if (!res.headersSent) {
         const upstreamStatus = firstAiAPIResponse.status;
-
-        if (isOriginalRequestStreaming && upstreamStatus !== 200) {
-          // If streaming was requested, but upstream returned a non-200 status (e.g., 400, 401, 502, 504),
-          // we must return 200 OK and stream the error as an SSE chunk to prevent client listener termination.
-          res.status(200);
-          res.setHeader('Content-Type', 'text/event-stream');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-
-          // Read the error body from the upstream response
-          const errorBodyText = await firstAiAPIResponse.text();
-
-          // Log the error
-          console.error(`[Upstream Error Stream Proxy] Upstream API returned status ${upstreamStatus}. Streaming error to client: ${errorBodyText}`);
-
-          // Construct the error message for the client
-          const errorContent = `[UPSTREAM_ERROR] 上游API返回状态码 ${upstreamStatus}，错误信息: ${errorBodyText}`;
-
-          // Send an error chunk
-          const errorPayload = {
-            id: `chatcmpl-VCP-upstream-error-${Date.now()}`,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: originalBody.model || 'unknown',
-            choices: [
-              {
-                index: 0,
-                delta: {
-                  content: errorContent,
-                },
-                finish_reason: 'stop',
-              },
-            ],
-          };
-          try {
-            res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
-            res.write('data: [DONE]\n\n', () => {
-              res.end();
-            });
-          } catch (writeError) {
-            console.error('[Upstream Error] Failed to write error to stream:', writeError.message);
-            if (!res.writableEnded) {
-              try {
-                res.end();
-              } catch (endError) {
-                console.error('[Upstream Error] Failed to end response:', endError.message);
-              }
-            }
-          }
-
-          if (writeChatLog) {
-            writeChatLog(originalBody,
-              [ {
-                request: originalBody,
-                response: { error: true, status: upstreamStatus, body: errorBodyText }
-              } ]);
-          }
-          // We are done with this request. Return early.
-          return;
-        }
 
         // Normal header setting for non-streaming or successful streaming responses
         res.status(upstreamStatus);
@@ -1394,6 +1380,7 @@ class ChatCompletionHandler {
         isToolResultError,
         formatToolResult,
         vcpToolUseForbidden,
+        vcpToolForbiddenReceipt,
         apiConnectionTimeoutMs,
         semanticModelFallbackCandidates,
         oneRingResponseMeta,
@@ -1409,96 +1396,30 @@ class ChatCompletionHandler {
       interactionOutcomeAccepted = true;
       interactionCompletion.accept(outcome);
     } catch (error) {
+      // Explicit opt-in refusal: fixed code only, answered BEFORE the generic failure
+      // path so the reserved receipt namespace and the HTTP status stay exact.
+      if (error instanceof VcpToolForbiddenRefusal) {
+        respondVcpToolForbiddenRefusal(res, error);
+        return;
+      }
       if (error.name === 'AbortError') {
-        requestDiagnostic?.error('aborted', res.statusCode);
+        if (error instanceof UpstreamError && error.status !== null && requestDiagnostic?.upstreamError) {
+          requestDiagnostic.upstreamError(error);
+        } else requestDiagnostic?.error('aborted', res.statusCode);
         // 显式 /v1/interrupt 或客户端断联都会走到这里。
         // 如果是客户端断联，响应通道通常已经不可写；如果是显式 interrupt，则由 interrupt 路由负责关闭响应流。
         // 这里仅停止后续处理，避免与中止链路竞态写入。
-        const abortReason = clientDisconnectedAbortReason || activeRequests.get(id)?.abortReason || 'explicit_interrupt_or_abort';
-        console.log(`[Abort] Caught AbortError for request ${id}. Execution halted. reason=${abortReason}`);
+        if (DEBUG_MODE) console.log('[Abort] Request processing stopped.');
         return; // Stop processing and allow the 'finally' block to clean up.
       }
-      const diagnosticErrorCode = error?.code === 'UND_ERR_HEADERS_TIMEOUT'
-        ? 'upstream_timeout'
-        : 'handler_error';
-      requestDiagnostic?.error(diagnosticErrorCode, res.statusCode || 500);
-      // Only log full stack trace for non-abort errors
-      console.error('处理请求或转发时出错:', error.message, error.stack);
-
-      if (!res.headersSent) {
-        if (isOriginalRequestStreaming) {
-          // If streaming was requested but failed before headers were sent (e.g., fetchWithRetry failed),
-          // send a 200 status and communicate the error via SSE chunks to prevent the client from stopping listening.
-          res.status(200);
-          res.setHeader('Content-Type', 'text/event-stream');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-
-          const errorContent = `[ERROR] 代理服务器在连接上游API时失败，可能已达到重试上限或网络错误: ${error.message}`;
-
-          // Send an error chunk
-          const errorPayload = {
-            id: `chatcmpl-VCP-error-${Date.now()}`,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: originalBody.model || 'unknown',
-            choices: [
-              {
-                index: 0,
-                delta: {
-                  content: errorContent,
-                },
-                finish_reason: 'stop',
-              },
-            ],
-          };
-          try {
-            res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
-            res.write('data: [DONE]\n\n', () => {
-              res.end();
-            });
-          } catch (writeError) {
-            console.error('[Error Handler Stream] Failed to write error:', writeError.message);
-            if (!res.writableEnded && !res.destroyed) {
-              try {
-                res.end();
-              } catch (endError) {
-                console.error('[Error Handler Stream] Failed to end response:', endError.message);
-              }
-            }
-          }
-        } else {
-          // Non-streaming failure
-          res.status(500).json({ error: 'Internal Server Error', details: error.message });
-        }
-        if (writeChatLog) {
-          writeChatLog(originalBody,
-            [ {
-              request: originalBody,
-              response: { error: true, message: error.message }
-            } ]);
-        }
-      } else if (!res.writableEnded) {
-        // Headers already sent (error during streaming loop)
-        console.error(
-          '[STREAM ERROR] Headers already sent. Cannot send JSON error. Ending stream if not already ended.',
-        );
-        // Send [DONE] marker before ending the stream for graceful termination
-        try {
-          res.write('data: [DONE]\n\n', () => {
-            res.end();
-          });
-        } catch (writeError) {
-          console.error('[Error Handler Stream Cleanup] Failed to write [DONE]:', writeError.message);
-          if (!res.writableEnded && !res.destroyed) {
-            try {
-              res.end();
-            } catch (endError) {
-              console.error('[Error Handler Stream Cleanup] Failed to end response:', endError.message);
-            }
-          }
-        }
+      const failure = error instanceof UpstreamError ? error : new UpstreamError({ code: 'internal_error' });
+      if (requestDiagnostic?.upstreamError && error instanceof UpstreamError) {
+        requestDiagnostic.upstreamError(failure);
+      } else {
+        requestDiagnostic?.error(error instanceof UpstreamError ? 'upstream_error' : 'handler_error', failure.status || 500);
       }
+      console.error('[ChatCompletionHandler] Request failed:', safeErrorFields(failure));
+      sendFailure(res, failure, isOriginalRequestStreaming, abortController.signal);
     } finally {
       if (!interactionOutcomeAccepted) interactionCompletion?.fail();
       cleanupClientDisconnectListeners();
@@ -1540,6 +1461,20 @@ class ChatCompletionHandler {
 // 暴露纯刷新入口供安全回归测试和内部复用；请求主链路仍通过 handler context 调用同一实现。
 Object.defineProperty(ChatCompletionHandler, 'refreshRagBlocksIfNeeded', {
   value: _refreshRagBlocksIfNeeded,
+  writable: false,
+  configurable: false,
+  enumerable: false
+});
+
+// 供离线验收直接驱动同一入口实现（非枚举、不可写）：主链路调用的是同一函数。
+Object.defineProperty(ChatCompletionHandler, 'consumeVcpToolUseForbiddenPlaceholder', {
+  value: consumeVcpToolUseForbiddenPlaceholder,
+  writable: false,
+  configurable: false,
+  enumerable: false
+});
+Object.defineProperty(ChatCompletionHandler, 'beginVcpToolForbiddenReceipt', {
+  value: beginVcpToolForbiddenReceipt,
   writable: false,
   configurable: false,
   enumerable: false
