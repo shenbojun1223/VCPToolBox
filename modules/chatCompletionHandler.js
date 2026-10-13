@@ -98,6 +98,11 @@ const { createInteractionCompletion } = require('./handlers/interactionCompletio
 
 const VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER = '[[VCPToolUse=Forbidden]]';
 
+function applyFixedSolReasoningEffort(body, requestedModel) {
+  const match = /^gpt-6\.1-sol-(low|medium|high|xhigh|max)$/i.exec(String(requestedModel || '').trim());
+  if (match) body.reasoning_effort = match[1].toLowerCase();
+}
+
 function parseBooleanEnv(value, defaultValue = false) {
   if (value === undefined || value === null || value === '') return defaultValue;
   return String(value).toLowerCase() === 'true';
@@ -912,6 +917,9 @@ class ChatCompletionHandler {
           : false;
 
         if (!isSemanticRoutingModel) {
+          // The model suffix fixes the effort even when a client sends its default effort.
+          // Set it before model redirection, which may replace the public alias.
+          applyFixedSolReasoningEffort(originalBody, originalModel);
           const redirectedModel = modelRedirectHandler.redirectModelForBackend(originalModel);
           if (redirectedModel !== originalModel) {
             originalBody = { ...originalBody, model: redirectedModel };
@@ -1022,6 +1030,7 @@ class ChatCompletionHandler {
         });
 
         if (semanticRoutePlan && semanticRoutePlan.active) {
+          applyFixedSolReasoningEffort(originalBody, semanticRoutePlan.selectedModel);
           const rawCandidates = Array.isArray(semanticRoutePlan.candidates) && semanticRoutePlan.candidates.length > 0
             ? semanticRoutePlan.candidates
             : [semanticRoutePlan.selectedModel];

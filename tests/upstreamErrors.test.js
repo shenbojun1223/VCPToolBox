@@ -81,6 +81,7 @@ function fixture(kind = 'normal', stream = true, retryFetch, globals = {}) {
     }
   };
   const mocks = { '../../vcpInfoHandler.js': {}, '../roleDivider.js': {},
+    '../vcpLoop/rollKeeper': { createRollKeeper: () => ({ evaluate: () => null, record() {}, reset() {} }) },
     '../vcpLoop/toolPayloadTruncator.js': { truncateToolPayload: x => x },
     '../vcpLoop/safeGravityProjection.js': { safeGravityProjection: async x => x } };
   const Handler = load('modules/handlers/' + (stream ? 'streamHandler' : 'nonStreamHandler') + '.js', mocks, globals);
@@ -158,6 +159,18 @@ function outerFixture({ stream = true, kind = 'normal', initialFailure = false, 
   return { ...f, chat, req, logs, events, snapshots, sent,
     fetches: () => fetches, run: () => chat.handle(req, f.res) };
 }
+
+test('GPT-6.1 Sol alias fixes outbound effort before model redirection', async () => {
+  for (const effort of ['low', 'high', 'xhigh', 'max']) {
+    const f = outerFixture({ initialFailure: true });
+    f.req.body.model = `gpt-6.1-sol-${effort}`;
+    f.req.body.reasoning_effort = 'medium';
+    f.chat.config.modelRedirectHandler.redirectModelForBackend = () => 'gpt-6.1-sol';
+    await f.run();
+    assert.equal(f.sent[0].model, 'gpt-6.1-sol');
+    assert.equal(f.sent[0].reasoning_effort, effort);
+  }
+});
 
 for (const stream of [true, false]) {
   test(`initial deterministic failure: visible safe ${stream ? 'SSE' : 'JSON'} and diagnostics`, async () => {
