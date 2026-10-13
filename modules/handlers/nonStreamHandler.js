@@ -12,6 +12,16 @@ const {
 } = require('../reasoningContentAdapter.js');
 const { createRollKeeper } = require('../vcpLoop/rollKeeper');
 
+// 读取软预算配置：缺失/空白/非法/非正数一律视为禁用 token 黄灯（0），绝不让请求抛错。
+function readSoftTokenBudgetEnv() {
+  const raw = process.env.VCP_CONTEXT_SOFT_BUDGET;
+  if (raw === undefined || raw === null) return 0;
+  const trimmed = String(raw).trim();
+  if (trimmed === '') return 0;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
 function hasVisibleContent(content) {
   if (typeof content === 'string') return content.trim().length > 0;
   if (Array.isArray(content)) {
@@ -317,7 +327,9 @@ class NonStreamHandler {
     const maxRecursion = Number.isFinite(parsedMaxRecursion) && parsedMaxRecursion > 0
       ? parsedMaxRecursion
       : 20;
-    const rollKeeper = createRollKeeper({ maxRecursion });
+    const rollKeeper = createRollKeeper({ maxRecursion, tokenBudget: readSoftTokenBudgetEnv() });
+    // 硬暂停（repeat_halt）时保存停止信息，交由循环后的 stuck 分支统一收口。
+    let stuckHalt = null;
     let conversationHistoryForClient = [];
     let currentAIContentForLoop = fullContentFromAI;
     // AICW 内层禁工具消费回执：仅记录本次请求真实发生的分支事实（是否跳过解析、
@@ -333,7 +345,12 @@ class NonStreamHandler {
         break;
       }
 
-      const rollInjection = rollKeeper.evaluate({ recursionDepth });
+      const rollInjection = rollKeeper.evaluate({ recursionDepth, messages: currentMessagesForNonStreamLoop });
+      if (rollInjection && rollInjection.kind === 'repeat_halt') {
+        // 同指纹连续失败达到阈值：硬暂停本轮工具循环，未派发的工具一律不执行。
+        stuckHalt = rollInjection;
+        break;
+      }
       if (rollInjection && rollInjection.kind && rollInjection.content) {
         currentMessagesForNonStreamLoop.push({ role: 'system', content: rollInjection.content });
       }
@@ -469,10 +486,14 @@ class NonStreamHandler {
 
         const toolResults = await toolExecutor.executeAll(normalCalls, clientIp, currentMessagesForNonStreamLoop);
         for (let i = 0; i < normalCalls.length; i++) {
+          // 结构化判错：success=false 或 raw 明确报错都算失败，不靠工具回执文本猜成败。
+          const recordedResult = toolResults[i];
+          const recordedError = !recordedResult || !recordedResult.success ||
+            !!(recordedResult.raw && this.context.isToolResultError(recordedResult.raw));
           rollKeeper.record({
             name: normalCalls[i].name,
             args: normalCalls[i].args,
-            success: !!(toolResults[i] && toolResults[i].success)
+            success: !recordedError
           });
         }
         const normalCallLogs = (() => {
@@ -669,8 +690,30 @@ class NonStreamHandler {
     }
 
     const hasPendingToolCallsAtLimit = pendingToolCallsAtLimit.length > 0;
-    if (loopEndedAtLimit && currentAIContentForClient && currentAIContentForClient.trim()) {
+
+    // 独立暂停原因：同一工具同参数连续失败达到阈值。与 limit 分支互斥。
+    const loopEndedAtStuck = stuckHalt !== null
+      && !(abortController && abortController.signal.aborted);
+    let pendingToolCallsAtStuck = [];
+    if (loopEndedAtStuck && !vcpToolUseForbidden) {
+      try {
+        pendingToolCallsAtStuck = ToolCallParser.parse(currentAIContentForLoop);
+      } catch (parseError) {
+        console.error('[VCP NonStream Loop] Failed to inspect pending tool calls at stuck halt:', parseError);
+      }
+    }
+    const hasPendingToolCallsAtStuck = pendingToolCallsAtStuck.length > 0;
+
+    if ((loopEndedAtLimit || loopEndedAtStuck) && currentAIContentForClient && currentAIContentForClient.trim()) {
       conversationHistoryForClient.push(currentAIContentForClient);
+    }
+    if (loopEndedAtStuck) {
+      const pendingClauseAtStuck = hasPendingToolCallsAtStuck
+        ? '最后生成的 ' + pendingToolCallsAtStuck.length + ' 个工具请求尚未执行（已如实保留，未派发）。'
+        : '停止时没有待执行的工具请求。';
+      const stuckNotice = '\n\n> [!WARNING]\n> **VCP 工具循环已硬暂停（同一调用连续失败）**：检测到同一工具以完全相同参数连续失败达到阈值，已停止本轮工具执行以打断重复失败循环。任务尚未完成；' + pendingClauseAtStuck + '请检查阻塞原因（工具参数、权限或上游状态）后发送“继续”恢复。为避免重复副作用，系统不会自动重放。\n';
+      conversationHistoryForClient.push(stuckNotice);
+      oneRingAssistantTurnParts.push(stuckNotice);
     }
     if (hasPendingToolCallsAtLimit) {
       const notice = '\n\n> [!WARNING]\n> **VCP 工具循环已暂停**：本轮已达到 ' + maxRecursion + ' 次工具递归上限，最后生成的 ' + pendingToolCallsAtLimit.length + ' 个工具请求尚未执行。任务尚未完成；请发送“继续”恢复。为避免重复副作用，系统不会自动重放。\n';
@@ -681,7 +724,7 @@ class NonStreamHandler {
     let finalContentForClient = conversationHistoryForClient.join('');
 
     // ★ 熔断收口时净化尾部未闭合的 VCP 工具块残片，确保落盘 history.json 的语法完整。
-    if (loopEndedAtLimit && !vcpToolUseForbidden && finalContentForClient) {
+    if ((loopEndedAtLimit || loopEndedAtStuck) && !vcpToolUseForbidden && finalContentForClient) {
       try {
         const { sanitizeContent } = require('../vcpLoop/historySanitizer.js');
         finalContentForClient = sanitizeContent(finalContentForClient);
@@ -710,7 +753,14 @@ class NonStreamHandler {
       };
     }
 
-    if (hasPendingToolCallsAtLimit) {
+    if (loopEndedAtStuck) {
+      finalJsonResponse.vcp_status = {
+        code: 'VCP_TOOL_LOOP_STUCK',
+        current: recursionDepth,
+        max: maxRecursion,
+        pendingToolCalls: pendingToolCallsAtStuck.length,
+      };
+    } else if (hasPendingToolCallsAtLimit) {
       finalJsonResponse.vcp_status = {
         code: 'VCP_TOOL_LOOP_LIMIT',
         current: recursionDepth,

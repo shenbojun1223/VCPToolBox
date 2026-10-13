@@ -393,5 +393,6 @@ module.exports = {
   listFinalContexts,
   getFinalContextById,
   clearFinalContexts,
+  countTokensForText,
   MAX_SNAPSHOTS
 };

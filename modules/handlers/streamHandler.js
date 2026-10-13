@@ -11,6 +11,16 @@ const {
 } = require('../reasoningContentAdapter.js');
 const { createRollKeeper } = require('../vcpLoop/rollKeeper');
 
+// 读取软预算配置：缺失/空白/非法/非正数一律视为禁用 token 黄灯（0），绝不让请求抛错。
+function readSoftTokenBudgetEnv() {
+  const raw = process.env.VCP_CONTEXT_SOFT_BUDGET;
+  if (raw === undefined || raw === null) return 0;
+  const trimmed = String(raw).trim();
+  if (trimmed === '') return 0;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
 class StreamHandler {
   constructor(context) {
     this.context = context;
@@ -72,7 +82,9 @@ class StreamHandler {
     const maxRecursion = Number.isFinite(parsedMaxRecursion) && parsedMaxRecursion > 0
       ? parsedMaxRecursion
       : 20;
-    const rollKeeper = createRollKeeper({ maxRecursion });
+    const rollKeeper = createRollKeeper({ maxRecursion, tokenBudget: readSoftTokenBudgetEnv() });
+    // 硬暂停（repeat_halt）时保存停止信息，交由循环后的 stuck 分支统一收口。
+    let stuckHalt = null;
     let currentAIContentForLoop = '';
     let chatLogs = [];
     let oneRingAssistantTurnParts = [];
@@ -418,7 +430,12 @@ class StreamHandler {
         break;
       }
 
-      const rollInjection = rollKeeper.evaluate({ recursionDepth });
+      const rollInjection = rollKeeper.evaluate({ recursionDepth, messages: currentMessagesForLoop });
+      if (rollInjection && rollInjection.kind === 'repeat_halt') {
+        // 同指纹连续失败达到阈值：硬暂停本轮工具循环，未派发的工具一律不执行。
+        stuckHalt = rollInjection;
+        break;
+      }
       if (rollInjection && rollInjection.kind && rollInjection.content) {
         currentMessagesForLoop.push({ role: 'system', content: rollInjection.content });
       }
@@ -587,10 +604,14 @@ class StreamHandler {
       // 执行普通调用
       const toolResults = await toolExecutor.executeAll(normalCalls, clientIp, currentMessagesForLoop);
       for (let i = 0; i < normalCalls.length; i++) {
+        // 结构化判错：success=false 或 raw 明确报错都算失败，不靠工具回执文本猜成败。
+        const recordedResult = toolResults[i];
+        const recordedError = !recordedResult || !recordedResult.success ||
+          !!(recordedResult.raw && this.context.isToolResultError(recordedResult.raw));
         rollKeeper.record({
           name: normalCalls[i].name,
           args: normalCalls[i].args,
-          success: !!(toolResults[i] && toolResults[i].success)
+          success: !recordedError
         });
       }
       const combinedToolResultsForAI = toolResults.map(r => r.content).flat();
@@ -801,7 +822,7 @@ class StreamHandler {
 
     // ★ 熔断收口前，将尾部未闭合的 VCP 工具块残片从 OneRing 记忆流中剥除，
     //   防止残片进入 Agent 长期记忆并污染未来的 RAG 检索。
-    if (recursionDepth >= maxRecursion && oneRingAssistantTurnParts.length > 0) {
+    if ((stuckHalt || recursionDepth >= maxRecursion) && oneRingAssistantTurnParts.length > 0) {
       try {
         const { sanitizeContent } = require('../vcpLoop/historySanitizer.js');
         const lastIdx = oneRingAssistantTurnParts.length - 1;
@@ -814,7 +835,51 @@ class StreamHandler {
     if (writeChatLog) writeChatLog(originalBody, chatLogs);
     // OneRing 由主流程在整轮完成且响应发送完成后提交。
 
-    if (recursionDepth >= maxRecursion && !res.writableEnded && !res.destroyed) {
+    if (stuckHalt && !res.writableEnded && !res.destroyed) {
+      // 独立暂停原因：同一工具同参数连续失败达到阈值。与 limit 分支互斥，各自只结束一次响应。
+      let pendingToolCallsAtStuck = [];
+      if (!vcpToolUseForbidden) {
+        try {
+          pendingToolCallsAtStuck = ToolCallParser.parse(currentAIContentForLoop);
+        } catch (parseError) {
+          console.error('[VCP Stream Loop] Failed to inspect pending tool calls at stuck halt:', parseError);
+        }
+      }
+
+      const pendingCountAtStuck = pendingToolCallsAtStuck.length;
+      const stuckStatus = {
+        code: 'VCP_TOOL_LOOP_STUCK',
+        current: recursionDepth,
+        max: maxRecursion,
+        pendingToolCalls: pendingCountAtStuck,
+      };
+      const pendingClauseAtStuck = pendingCountAtStuck > 0
+        ? '最后生成的 ' + pendingCountAtStuck + ' 个工具请求尚未执行（已如实保留，未派发）。'
+        : '停止时没有待执行的工具请求。';
+      const stuckNotice = '\n\n> [!WARNING]\n> **VCP 工具循环已硬暂停（同一调用连续失败）**：检测到同一工具以完全相同参数连续失败达到阈值，已停止本轮工具执行以打断重复失败循环。任务尚未完成；' + pendingClauseAtStuck + '请检查阻塞原因（工具参数、权限或上游状态）后发送“继续”恢复。为避免重复副作用，系统不会自动重放。\n';
+
+      try {
+        res.write('data: ' + JSON.stringify({
+          id: 'chatcmpl-VCP-tool-loop-stuck-notice-' + Date.now(),
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: originalBody.model,
+          choices: [{ index: 0, delta: { content: stuckNotice }, finish_reason: null }],
+          vcp_status: stuckStatus,
+        }) + '\n\n');
+
+        const stuckFinalChunk = {
+          id: 'chatcmpl-VCP-final-stuck-' + Date.now(),
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          vcp_status: stuckStatus,
+        };
+        res.write('data: ' + JSON.stringify(stuckFinalChunk) + '\n\n');
+        res.write('data: [DONE]\n\n', () => {
+          try { res.end(); } catch (e) { }
+        });
+      } catch (e) { }
+    } else if (recursionDepth >= maxRecursion && !res.writableEnded && !res.destroyed) {
       let pendingToolCallsAtLimit = [];
       if (!vcpToolUseForbidden) {
         try {
