@@ -26,7 +26,7 @@ function decision(name) {
     }] }, forbidden, auth);
 }
 
-async function runGate(args, result, expectedCode = FAKE_CODE) {
+async function runGate(args, result, expectedCode = FAKE_CODE, execution = {}) {
     const stdin = new EventEmitter();
     const calls = { checks: [], spawns: [], writes: [], exits: [], out: [], err: [] };
     const fakeProcess = {
@@ -51,8 +51,12 @@ async function runGate(args, result, expectedCode = FAKE_CODE) {
         child.stderr = new PassThrough();
         child.pid = 999999;
         setImmediate(() => {
-            child.emit('exit', 0);
-            child.emit('close', 0);
+            if (execution.stdout) child.stdout.write(execution.stdout);
+            if (execution.stderr) child.stderr.write(execution.stderr);
+            child.stdout.end();
+            child.stderr.end();
+            child.emit('exit', execution.exitCode ?? 0);
+            child.emit('close', execution.exitCode ?? 0);
         });
         return child;
     };
@@ -193,6 +197,103 @@ test('background gate denies review-required Invoke-Expression without code', as
 test('background gate allows review-required Invoke-Expression with code', async () => {
     const result = await runGate({
         command: 'Invoke-Expression', executionType: 'background', tool_password: FAKE_CODE
+    }, decision('Invoke-Expression'));
+    assert.equal(result.spawns.length, 1);
+    assert.deepEqual(result.exits, []);
+});
+
+function assertDiagnostic(result, code, stage, omitted = []) {
+    assert.deepEqual(result.exits, [1]);
+    assert.equal(result.out.length, 1, 'one machine-readable stdout response');
+    const diagnostic = JSON.parse(result.out[0]);
+    assert.deepEqual(diagnostic, JSON.parse(result.err.at(-1)));
+    assert.equal(diagnostic.status, 'error');
+    assert.equal(diagnostic.code, code);
+    assert.equal(diagnostic.stage, stage);
+    assert.equal(typeof diagnostic.error, 'string');
+    assert.equal(result.err.some(line => line.includes('请向用户索取当前最新动态验证码')), false);
+    const output = JSON.stringify([...result.out, ...result.err]);
+    for (const value of [FAKE_CODE, ...omitted]) {
+        assert.equal(output.includes(value), false, 'diagnostic leaked private input');
+    }
+    return diagnostic;
+}
+
+for (const [label, supplied, expected, code] of [
+    ['missing argument', undefined, FAKE_CODE, 'AUTH_REQUIRED'],
+    ['missing host value', FAKE_CODE, '', 'AUTH_UNAVAILABLE'],
+    ['mismatched code', 'wrong-unit-code', FAKE_CODE, 'AUTH_INVALID']
+]) {
+    test(`structured authorization diagnostic: ${label}`, async () => {
+        const command = 'Invoke-Expression PRIVATE_COMMAND_MARKER';
+        const result = await runGate({ command, tool_password: supplied },
+            decision('Invoke-Expression'), expected);
+        assert.equal(result.spawns.length, 0);
+        assert.equal(result.writes.length, 0);
+        const d = assertDiagnostic(result, code, 'authorization',
+            ['PRIVATE_COMMAND_MARKER', 'wrong-unit-code']);
+        assert.equal(d.security.decision, 'review-required');
+        assert.equal(d.security.canAuthorize, true);
+    });
+}
+
+test('forbidden diagnostic stays forbidden with a valid synthetic code', async () => {
+    const fact = {
+        ...decision('format'), reason: 'PRIVATE_POLICY_MARKER',
+        commandName: 'PRIVATE_COMMAND_MARKER', matchedKeyword: 'PRIVATE_POLICY_MARKER',
+        commandIndex: 0, line: 1, column: 2
+    };
+    const result = await runGate({
+        command: 'format PRIVATE_COMMAND_MARKER', tool_password: FAKE_CODE
+    }, fact);
+    assert.equal(result.spawns.length, 0);
+    assert.equal(result.writes.length, 0);
+    const d = assertDiagnostic(result, 'COMMAND_FORBIDDEN', 'security',
+        ['PRIVATE_POLICY_MARKER', 'PRIVATE_COMMAND_MARKER']);
+    assert.equal(d.security.canAuthorize, false);
+    assert.equal(d.security.commandIndex, 0);
+    assert.equal(d.security.line, 1);
+    assert.equal(d.security.column, 2);
+    assert.equal(Object.hasOwn(d.security, 'reason'), false);
+    assert.equal(Object.hasOwn(d.security, 'commandName'), false);
+});
+
+test('authorized fake child failure reports execution stage without raw output', async () => {
+    const command = 'Invoke-Expression PRIVATE_COMMAND_MARKER';
+    const result = await runGate({ command, tool_password: FAKE_CODE },
+        decision('Invoke-Expression'), FAKE_CODE, {
+            exitCode: 7,
+            stdout: 'PRIVATE_STDOUT_MARKER',
+            stderr: 'PRIVATE_STDERR_MARKER ' + FAKE_CODE
+        });
+    assert.equal(result.spawns.length, 1);
+    assert.equal(result.writes.length, 1);
+    const d = assertDiagnostic(result, 'EXECUTION_FAILED', 'execution',
+        ['PRIVATE_COMMAND_MARKER', 'PRIVATE_STDOUT_MARKER', 'PRIVATE_STDERR_MARKER']);
+    assert.equal(Object.hasOwn(d, 'security'), false);
+});
+
+test('authorized success has no misleading authorization warning', async () => {
+    const result = await runGate({
+        command: 'Invoke-Expression', tool_password: FAKE_CODE
+    }, decision('Invoke-Expression'));
+    assert.equal(result.spawns.length, 1);
+    assert.deepEqual(result.exits, []);
+    assert.equal(JSON.parse(result.out.at(-1)).status, 'success');
+    assert.equal(result.err.some(line => /需要验证码授权|AUTH_/.test(line)), false);
+});
+
+test('supplied wrong code on an ordinary command is still rejected', async () => {
+    const result = await runGate({
+        command: 'Write-Output ok', tool_password: 'wrong-unit-code'
+    }, decision('Write-Output'));
+    assert.equal(result.spawns.length, 0);
+    assertDiagnostic(result, 'AUTH_INVALID', 'authorization', ['wrong-unit-code']);
+});
+
+test('requireAdmin legacy credential alias keeps the same authorization semantics', async () => {
+    const result = await runGate({
+        command: 'Invoke-Expression', requireAdmin: FAKE_CODE
     }, decision('Invoke-Expression'));
     assert.equal(result.spawns.length, 1);
     assert.deepEqual(result.exits, []);
