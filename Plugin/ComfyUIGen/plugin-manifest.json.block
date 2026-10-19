@@ -129,5 +129,49 @@
     "vcpVersion": ">=1.0.0",
     "nodeVersion": ">=14.0.0",
     "comfyuiVersion": ">=0.3.0"
+  },
+  "jev": {
+    "schemaVersion": 1,
+    "enabled": true,
+    "category": "媒体娱乐",
+    "jevDescPrompt": "通过本地或远程 ComfyUI 运行自定义节点工作流，生成高质量二次元与写实插画。",
+    "jevPrompt": "用户要求使用 ComfyUI 生图时选择 ComfyUIGenerateImage。支持在 [] 中指定工作流模板名（如 [工作流:AnimaEZGen]）或 LoRA 权重；未指明工作流时沿用默认配置。",
+    "agentPrompt": "当需要调用 ComfyUI 运行高级生图工作流时，使用 {媒体娱乐} 中的 `ComfyUIGen`，提示词放入【主要内容】，工作流或负面词放入 []（如 [工作流:AnimaEZGen]、[负面:blurry]）：\nJEV:「始」请使用 {媒体娱乐} 中的 `ComfyUIGen`，生成插画【1girl, silver hair, blue eyes, cinematic anime】[工作流:AnimaEZGen]。「末」",
+    "defaultCommand": "ComfyUIGenerateImage",
+    "commands": [
+      {
+        "commandIdentifier": "ComfyUIGenerateImage",
+        "description": "调用 ComfyUI 工作流生成高质量图像",
+        "aliases": ["ComfyUI生图", "运行工作流", "工作流生图", "Comfy生图"],
+        "injectCommand": false,
+        "parameters": {
+          "prompt": {
+            "type": "text",
+            "required": true,
+            "source": "primary",
+            "maxLength": 1500,
+            "description": "详细正面提示词或英文标签"
+          },
+          "workflow": {
+            "type": "text",
+            "source": "constraints",
+            "prefixes": ["工作流", "模板", "workflow"],
+            "maxLength": 60
+          },
+          "negative_prompt": {
+            "type": "text",
+            "source": "constraints",
+            "prefixes": ["负面", "排除"],
+            "maxLength": 500
+          },
+          "lora_name": {
+            "type": "text",
+            "source": "constraints",
+            "prefixes": ["lora", "LoRA", "模型"],
+            "maxLength": 100
+          }
+        }
+      }
+    ]
   }
 }

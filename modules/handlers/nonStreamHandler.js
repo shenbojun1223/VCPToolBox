@@ -199,6 +199,7 @@ class NonStreamHandler {
       shouldProcessMediaPlus,
       isTextOnlyForceTranslateModel,
       requestPreprocessorConfig,
+      openCodeGoSessionHeader,
       reasoningToContentEnabled: reasoningToContentGloballyEnabled,
       reasoningToContentTag,
       reasoningToContentModels
@@ -266,7 +267,7 @@ class NonStreamHandler {
       `${apiUrl}/v1/chat/completions`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}`, ...openCodeGoSessionHeader },
         body: JSON.stringify(body),
         signal: abortController.signal,
       },

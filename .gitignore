@@ -299,8 +299,10 @@ helloagents/
 # Windows 缩略图缓存
 Thumbs.db
 
+# 源码研究
 # ===== 编译产物 =====
 rust-vexus-lite/target/
+rust-vexus-lite/crates/vcp-tdb-index/target/
 Plugin/DailyNoteSearcher/src/target/
 Plugin/CodeSearcher/src/target/
 Plugin/PaperReader/paperreader-rs/target/
@@ -325,5 +327,12 @@ Plugin/VCPQQBotServer/bot-node-sdk-main
 *.backup-*
 
 # Local repository inspection helper; retain on disk only.
-/_read_section.js# CPA Image recovery temporary directory
+/_read_section.js
+# CPA Image recovery temporary directory
 image/cpa-image-recovery-*/
+
+# Local native artifact archives; retain outside disposable build caches.
+/.vcp-native-archive/
+# ServerProjectForge: local configuration and separately delivered runtime.
+Plugin/ServerProjectForge/config.env
+Plugin/ServerProjectForge/bin/win32-x64/

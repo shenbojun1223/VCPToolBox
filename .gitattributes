@@ -1,1 +1,4 @@
 Plugin/VCPChatSyncHub/fixtures/protocol_1_1_golden.json text eol=lf
+# ServerProjectForge: consistent text line endings; preserve native binary bytes.
+Plugin/ServerProjectForge/** text eol=lf
+Plugin/ServerProjectForge/bin/win32-x64/** -text

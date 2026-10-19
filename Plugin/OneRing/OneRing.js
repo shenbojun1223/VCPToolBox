@@ -2,6 +2,7 @@
 // OneRing.js — 统一上下文预处理器主模块
 // 触发语法：系统提示词中包含 [[OneRing::AgentName::Frontend]]
 // Only 模式：[[OneRing::AgentName::Frontend::Only]] 或独立 [[OneRing::Only]] 只入库/标记，不做跨端上下文追加。
+// 本机临时契约：[[OneRing临时契约::Frontend]] 仅覆盖本次请求客户端，不单独激活。
 
 const fs = require('fs');
 const path = require('path');
@@ -14,6 +15,7 @@ const timelineCommon = require('./OneRingTimelineCommon.js');
 const { RawClientTimelineStrategy, probeRawClientTimestampBindings } = require('./OneRingRawClientTimeline.js');
 const { ServerInferredTimelineStrategy } = require('./OneRingServerInferredTimeline.js');
 const oneRingMemo = require('./OneRingMemo.js');
+const { isClaudeSourcePrivacyEnabled } = require('../../modules/sourcePrivacyPolicy.js');
 
 // ─── 触发语法解析 ────────────────────────────────────────────────────────────
 // 每个字段都必须被限制在同一个 [[...]] 内，尤其不能吞入右方括号或换行。
@@ -24,6 +26,23 @@ const TRIGGER_REGEX = new RegExp(ONERING_TRIGGER_PATTERN);
 const TRIGGER_GLOBAL_REGEX = new RegExp(ONERING_TRIGGER_PATTERN, 'g');
 const ONLY_TRIGGER_GLOBAL_REGEX = /\[\[OneRing::Only\]\]/gi;
 const VCP_RAG_BLOCK_REGEX = /<!--\s*VCP_RAG_BLOCK_START\b[\s\S]*?<!--\s*VCP_RAG_BLOCK_END\s*-->/gi;
+const TEMP_FRONTEND_TRIGGER_GLOBAL_REGEX = /\[\[OneRing临时契约::([^:\]\r\n]+)\]\]/g;
+
+// 扫描整个顶层连续 system 前缀，允许本机全局提示词和 Agent 主契约位于不同块。
+// 保留原标记供 final hook 在预处理前视图/元信息丢失时恢复；不写入模块级状态。
+function getTemporaryFrontendSource(messages) {
+    if (!Array.isArray(messages)) return null;
+    let frontendSource = null;
+    for (const message of messages) {
+        if (!message || message.role !== 'system') break;
+        const text = stripVcpRagBlocks(fuzzy.extractText(message.content));
+        for (const match of text.matchAll(TEMP_FRONTEND_TRIGGER_GLOBAL_REGEX)) {
+            const candidate = match[1].trim();
+            if (candidate && !isUnresolvedTemplateName(candidate)) frontendSource = candidate;
+        }
+    }
+    return frontendSource;
+}
 
 function stripVcpRagBlocks(text) {
     return typeof text === 'string' ? text.replace(VCP_RAG_BLOCK_REGEX, '') : text;
@@ -331,7 +350,128 @@ function markOneRingTimelineMeta(message, meta) {
 }
 
 function getOneRingTimelineMeta(message) {
-    return message && message.__oneRingTimelineMeta ? message.__oneRingTimelineMeta : null;
+    if (!message || typeof message !== 'object') return null;
+    const descriptor = Object.getOwnPropertyDescriptor(message, '__oneRingTimelineMeta');
+    return descriptor && descriptor.enumerable === false && descriptor.value && typeof descriptor.value === 'object'
+        ? descriptor.value
+        : null;
+}
+
+function isTrustedOneRingTimelineMeta(meta) {
+    if (!meta || typeof meta.timestamp !== 'string' ||
+        !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{3})?$/.test(meta.timestamp)) return false;
+    const source = meta.source;
+    return typeof source === 'string' && (
+        source === 'current-post-user' || source === 'tail-post-group-assistant' ||
+        source === 'db-injected' || source === 'hash-only-post-user' ||
+        source === 'exact' || source === 'fuzzy' || source.startsWith('exact-') ||
+        source.startsWith('client-verified-') || source.startsWith('only-client-verified-') ||
+        source.startsWith('record-only-client-verified-') || source.startsWith('snapshot-')
+    );
+}
+
+// 由可信时间线 meta 推导出的精确生成载体（内部记账/剥离用，含本地时间）。
+function buildVerifiedOneRingCarrier(meta) {
+    const suffix = meta.isNewConversationStart ? NEW_CONVERSATION_START_SUFFIX : '';
+    return `[OneRing通知:${meta.senderName}于${meta.timestamp}发送于${meta.frontendSource}${suffix}]`;
+}
+
+// 同一载体的对外展示形态：无时间、无时区、无时间哈希，只保留说话人/来源/新会话语义。
+// 这是 inline 模式对外唯一允许出现的 OneRing 通知样式。
+function buildTimestampFreeOneRingNotice(meta) {
+    const suffix = meta.isNewConversationStart ? NEW_CONVERSATION_START_SUFFIX : '';
+    return `[OneRing通知:${meta.senderName}发送于${meta.frontendSource}${suffix}]`;
+}
+
+// 仅当 meta 可信且正文以精确生成载体结尾时返回该载体字节串，否则返回 null。
+// 信任边界不变：调用方仍需提供非枚举、系统关联且来源可枚举的可信 meta。
+function matchVerifiedOneRingCarrierTail(text, meta) {
+    if (typeof text !== 'string' || !isTrustedOneRingTimelineMeta(meta)) return null;
+    const carrier = buildVerifiedOneRingCarrier(meta);
+    return text.endsWith(carrier) ? carrier : null;
+}
+
+// 内部剥离：只移除被证明属于生成载体的精确字节。
+// 不再 trim 正文原有空格/制表符；无法证明属于载体的分隔符一律保留。
+function stripVerifiedOneRingTailTag(text, meta) {
+    const carrier = matchVerifiedOneRingCarrierTail(text, meta);
+    if (!carrier) return text;
+    return text.slice(0, -carrier.length);
+}
+
+// 对外渲染：把可信生成载体原地替换为无时间通知。
+// 纯字节级替换：不新增也不删除正文空白，不生成新时间。
+function renderOneRingTextWithoutTime(text, meta) {
+    const carrier = matchVerifiedOneRingCarrierTail(text, meta);
+    if (!carrier) return text;
+    return text.slice(0, -carrier.length) + buildTimestampFreeOneRingNotice(meta);
+}
+
+function renderOneRingContentWithoutTime(content, meta) {
+    if (typeof content === 'string') return renderOneRingTextWithoutTime(content, meta);
+    if (Array.isArray(content)) {
+        const result = content.map(part => part && typeof part === 'object' ? { ...part } : part);
+        for (let index = result.length - 1; index >= 0; index--) {
+            if (result[index]?.type !== 'text' || typeof result[index].text !== 'string') continue;
+            const projected = renderOneRingTextWithoutTime(result[index].text, meta);
+            if (projected !== result[index].text) result[index].text = projected;
+            break;
+        }
+        return result;
+    }
+    if (content && typeof content === 'object' && typeof content.text === 'string') {
+        return { ...content, text: renderOneRingTextWithoutTime(content.text, meta) };
+    }
+    return content;
+}
+
+// 幂等检测：正文是否已带该可信 meta 的无时间生成通知（重复处理时不得再叠加一份）。
+function hasVerifiedTimestampFreeOneRingTail(text, meta) {
+    if (typeof text !== 'string' || !isTrustedOneRingTimelineMeta(meta)) return false;
+    return text.endsWith(buildTimestampFreeOneRingNotice(meta));
+}
+
+// 内部投影（system_user_block 剥离阶段使用）：只移除可信生成载体，不做对外通知渲染。
+function projectOneRingContentForClaude(content, meta) {
+    if (typeof content === 'string') return stripVerifiedOneRingTailTag(content, meta);
+    if (Array.isArray(content)) {
+        const result = content.map(part => part && typeof part === 'object' ? { ...part } : part);
+        for (let index = result.length - 1; index >= 0; index--) {
+            if (result[index]?.type !== 'text' || typeof result[index].text !== 'string') continue;
+            const projected = stripVerifiedOneRingTailTag(result[index].text, meta);
+            if (projected !== result[index].text) result[index].text = projected;
+            break;
+        }
+        return result;
+    }
+    if (content && typeof content === 'object' && typeof content.text === 'string') {
+        return { ...content, text: stripVerifiedOneRingTailTag(content.text, meta) };
+    }
+    return content;
+}
+
+function projectOneRingMessagesForClaude(messages) {
+    if (!Array.isArray(messages)) return messages;
+    const result = messages.map(message => {
+        if (!message || typeof message !== 'object') return message;
+        const meta = getOneRingTimelineMeta(message);
+        let content = renderOneRingContentWithoutTime(message.content, meta);
+        if (message.role === 'user' && typeof message.content === 'string' && isTrustedOneRingTimelineMeta(meta)) {
+            const newConversation = meta.isNewConversationStart ? NEW_CONVERSATION_START_SUFFIX : '';
+            const generatedNotice = `[系统提示:][OneRing通知:上一条消息由${meta.senderName}于${meta.timestamp}发送于${meta.frontendSource}]`;
+            if (message.content === generatedNotice) {
+                content = `[系统提示:][OneRing通知:上一条消息由${meta.senderName}发送于${meta.frontendSource}${newConversation}]`;
+            }
+        }
+        const clone = { ...message, content };
+        return copyOneRingMessageMetadata(message, clone);
+    });
+    for (const key of Object.getOwnPropertyNames(messages)) {
+        if (!key.startsWith('__oneRing')) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(messages, key);
+        if (descriptor) Object.defineProperty(result, key, descriptor);
+    }
+    return result;
 }
 
 function markOneRingOriginalIndex(message, originalIndex) {
@@ -419,18 +559,19 @@ function appendTailTag(content, senderName, timestamp, frontendSource, isNewConv
  * 替换或附加 OneRing 尾部标记。
  * 用于修正旧上下文中曾经打错 senderName/frontendSource 的尾标。
  */
-function upsertTailTag(content, senderName, timestamp, frontendSource, isNewConversationStart = false) {
+function upsertTailTag(content, senderName, timestamp, frontendSource, isNewConversationStart = false, preserveExistingText = false) {
     const newConversationSuffix = isNewConversationStart ? NEW_CONVERSATION_START_SUFFIX : '';
     const tag = `[OneRing通知:${senderName}于${timestamp}发送于${frontendSource}${newConversationSuffix}]`;
     if (typeof content === 'string') {
-        const stripped = stripOneRingTailTagText(content);
-        return `${stripped}\n${tag}`;
+        const stripped = preserveExistingText ? content : stripOneRingTailTagText(content);
+        return `${stripped}${preserveExistingText ? '' : '\n'}${tag}`;
     }
     if (Array.isArray(content)) {
         const result = [...content];
         for (let i = result.length - 1; i >= 0; i--) {
             if (result[i] && result[i].type === 'text' && typeof result[i].text === 'string') {
-                result[i] = { ...result[i], text: `${stripOneRingTailTagText(result[i].text)}\n${tag}` };
+                const text = preserveExistingText ? result[i].text : stripOneRingTailTagText(result[i].text);
+                result[i] = { ...result[i], text: `${text}${preserveExistingText ? '' : '\n'}${tag}` };
                 return result;
             }
         }
@@ -937,9 +1078,14 @@ async function dedupeAdjacentSimilarConversation(messages, threshold = 0.98) {
 class OneRingPreprocessor {
     async processMessages(messages, requestConfig) {
         let result = messages;
+        const privacyEnabled = isClaudeSourcePrivacyEnabled(requestConfig);
+        const privacyState = requestConfig?.sourcePrivacyPolicy?.state;
+        if (privacyEnabled && privacyState) privacyState.oneRing = 'running';
+
         try {
             result = await this._processOneRingMessages(messages, requestConfig);
         } catch (error) {
+            if (privacyEnabled && privacyState) privacyState.oneRing = 'failed';
             // 保持原预处理器错误语义，由 PluginManager 记录并决定上层降级。
             throw error;
         }
@@ -950,15 +1096,30 @@ class OneRingPreprocessor {
         // - 只替换顶层连续 system 前缀中的倒数第一个占位符；
         // - 替换结果不再次进入变量或 Memo 解析流程，因此禁止递归展开。
         try {
-            return oneRingMemo.injectMemo(result);
+            result = await oneRingMemo.injectMemo(result);
         } catch (error) {
+            if (privacyEnabled) {
+                if (privacyState) privacyState.oneRing = 'failed';
+                throw error;
+            }
             console.warn('[OneRingMemo] Injection failed; forwarding OneRing result unchanged:', error.message);
             return result;
         }
-    }
 
+        if (privacyEnabled) {
+            try {
+                result = projectOneRingMessagesForClaude(result);
+                if (privacyState) privacyState.oneRing = 'complete';
+            } catch (error) {
+                if (privacyState) privacyState.oneRing = 'failed';
+                throw error;
+            }
+        }
+        return result;
+    }
     async _processOneRingMessages(messages, requestConfig) {
         const cfg = { ...config, ...requestConfig };
+        const preserveUnverifiedTailTags = isClaudeSourcePrivacyEnabled(requestConfig);
         if (!hotConfig.enabled) return messages;
         const clientTimestampBindingInfo = timelineCommon.getClientTimestampBindingsFromConfig(cfg, formatOneRingTimestamp);
         const timelineStrategy = this._createTimelineStrategy(clientTimestampBindingInfo);
@@ -979,7 +1140,7 @@ class OneRingPreprocessor {
 
         const onlyTriggerMatch = getLastOnlyTriggerMatch(systemText);
         const agentName = triggerMatch[1].trim();
-        const frontendSource = triggerMatch[2].trim();
+        const frontendSource = getTemporaryFrontendSource(originalMessages || messages) || triggerMatch[2].trim();
         const triggerMode = (triggerMatch[3] || '').trim();
         const onlyMode = triggerMode.toLowerCase() === 'only' || !!onlyTriggerMatch;
         const effectiveTriggerMode = onlyMode && !triggerMode ? 'Only' : triggerMode;
@@ -1038,7 +1199,8 @@ class OneRingPreprocessor {
                     frontendSource,
                     defaultUserName,
                     outputDedupeThreshold,
-                    clientTimestampBindingInfo
+                    clientTimestampBindingInfo,
+                    preserveUnverifiedTailTags
                 );
                 this._scheduleRecordOnlyPersistence(
                     messages,
@@ -1048,12 +1210,13 @@ class OneRingPreprocessor {
                     threshold,
                     snapshotMaxBlocks,
                     outputDedupeThreshold,
-                    clientTimestampBindingInfo
+                    clientTimestampBindingInfo,
+                    preserveUnverifiedTailTags
                 );
                 const restoredResult = timelineStrategy.restoreWorkingViewToOriginalMessages
                     ? timelineStrategy.restoreWorkingViewToOriginalMessages(originalMessages, result, workingView)
                     : this._restoreWorkingViewToOriginalMessages(originalMessages, result, workingView);
-                return this._applyTailTagPlacement(restoredResult);
+                return this._applyTailTagPlacement(restoredResult, preserveUnverifiedTailTags);
             }
 
             const result = await this._processRecordOnlyMessages(
@@ -1064,18 +1227,20 @@ class OneRingPreprocessor {
                 threshold,
                 snapshotMaxBlocks,
                 outputDedupeThreshold,
-                clientTimestampBindingInfo
+                clientTimestampBindingInfo,
+                false,
+                preserveUnverifiedTailTags
             );
             const restoredResult = timelineStrategy.restoreWorkingViewToOriginalMessages
                 ? timelineStrategy.restoreWorkingViewToOriginalMessages(originalMessages, result, workingView)
                 : this._restoreWorkingViewToOriginalMessages(originalMessages, result, workingView);
-            return this._applyTailTagPlacement(restoredResult);
+            return this._applyTailTagPlacement(restoredResult, preserveUnverifiedTailTags);
         }
 
         // ── 3. 从 DB 查询同信道历史，做 diff（优先快照精确编辑，兜底 fuzzy）────
         let patchMessages = messages;
         let isFreshShortContext = false;
-        const localPostBlocks = this._extractLocalPostBlocks(messages, agentName, frontendSource, defaultUserName);
+        const localPostBlocks = this._extractLocalPostBlocks(messages, agentName, frontendSource, defaultUserName, preserveUnverifiedTailTags);
         const clientTimestampBindings = hasClientTimestampTruth
             ? timelineStrategy.bindRawMessages(
                 agentName,
@@ -1226,7 +1391,8 @@ class OneRingPreprocessor {
             defaultUserName,
             agentName,
             frontendSource,
-            newConversationStartUserIndex
+            newConversationStartUserIndex,
+            preserveUnverifiedTailTags
         );
 
         // ── 5. 跨端历史补全：先基于统一时间线元数据判定注入点，最后再统一写 OneRing 尾标 ──
@@ -1244,7 +1410,8 @@ class OneRingPreprocessor {
             defaultUserName,
             agentName,
             frontendSource,
-            newConversationStartUserIndex
+            newConversationStartUserIndex,
+            preserveUnverifiedTailTags
         );
 
         const beforeDedupeCount = patchMessages.filter(m => m && (m.role === 'user' || m.role === 'assistant')).length;
@@ -1274,7 +1441,7 @@ class OneRingPreprocessor {
         patchMessages = timelineStrategy.restoreWorkingViewToOriginalMessages
             ? timelineStrategy.restoreWorkingViewToOriginalMessages(originalMessages, patchMessages, workingView)
             : this._restoreWorkingViewToOriginalMessages(originalMessages, patchMessages, workingView);
-        return this._applyTailTagPlacement(patchMessages);
+        return this._applyTailTagPlacement(patchMessages, preserveUnverifiedTailTags);
     }
 
     _createRawClientTimelineStrategy(bindingInfo) {
@@ -1405,15 +1572,17 @@ class OneRingPreprocessor {
         return patched;
     }
 
-    _markTimelineBindings(messages, originalMessages, timestampBindings, defaultUserName, agentName, frontendSource, newConversationStartUserIndex = -1) {
+    _markTimelineBindings(messages, originalMessages, timestampBindings, defaultUserName, agentName, frontendSource, newConversationStartUserIndex = -1, preserveUnverifiedTailTags = false) {
         if (!Array.isArray(messages)) return messages;
         return messages.map((m) => {
             if (!m || (m.role !== 'user' && m.role !== 'assistant')) return m;
 
             const originalIndex = Array.isArray(originalMessages) ? originalMessages.indexOf(m) : -1;
             const bound = originalIndex >= 0 ? (timestampBindings[originalIndex] || null) : null;
-            const existingMeta = getOneRingTailMeta(m.content);
-            if (!bound && !existingMeta) return m;
+            const timelineMeta = getOneRingTimelineMeta(m);
+            const existingMeta = preserveUnverifiedTailTags ? null : getOneRingTailMeta(m.content);
+            if (preserveUnverifiedTailTags && !bound && !isTrustedOneRingTimelineMeta(timelineMeta)) return m;
+            if (!bound && !existingMeta && !isTrustedOneRingTimelineMeta(timelineMeta)) return m;
 
             const classified = m.role === 'assistant'
                 ? classifyAssistantContent(m.content, agentName)
@@ -1422,28 +1591,40 @@ class OneRingPreprocessor {
 
             const shouldMarkNewConversationStart = originalIndex === newConversationStartUserIndex;
             return markOneRingTimelineMeta(m, {
-                timestamp: bound?.timestamp || existingMeta?.timestamp,
-                senderName: bound?.senderName || existingMeta?.senderName || classified.senderName,
-                frontendSource: bound?.frontendSource || existingMeta?.frontendSource || frontendSource,
-                isNewConversationStart: shouldMarkNewConversationStart || existingMeta?.isNewConversationStart,
-                source: bound?.source || 'existing-tail'
+                timestamp: bound?.timestamp || timelineMeta?.timestamp || existingMeta?.timestamp,
+                senderName: bound
+                    ? (bound.senderName || classified.senderName)
+                    : (timelineMeta?.senderName || existingMeta?.senderName || classified.senderName),
+                frontendSource: bound
+                    ? (bound.frontendSource || frontendSource)
+                    : (timelineMeta?.frontendSource || existingMeta?.frontendSource || frontendSource),
+                isNewConversationStart: shouldMarkNewConversationStart ||
+                    (bound ? false : (timelineMeta?.isNewConversationStart || existingMeta?.isNewConversationStart)),
+                source: bound?.source || timelineMeta?.source || 'existing-tail'
             });
         });
     }
 
-    _upsertTimelineTailTags(messages, defaultUserName, agentName, frontendSource, newConversationStartUserIndex = -1) {
+    _upsertTimelineTailTags(messages, defaultUserName, agentName, frontendSource, newConversationStartUserIndex = -1, preserveUnverifiedTailTags = false) {
         if (!Array.isArray(messages)) return messages;
         return messages.map((m, index) => {
             if (!m || (m.role !== 'user' && m.role !== 'assistant')) return m;
 
             const timelineMeta = getOneRingTimelineMeta(m);
-            const existingMeta = getOneRingTailMeta(m.content);
+            const existingMeta = preserveUnverifiedTailTags ? null : getOneRingTailMeta(m.content);
             const meta = timelineMeta || existingMeta;
             if (!meta) {
+                if (preserveUnverifiedTailTags) return m;
                 return existingMeta
                     ? { ...m, content: this._stripTailTagFromContent(m.content) }
                     : m;
             }
+            if (preserveUnverifiedTailTags && !isTrustedOneRingTimelineMeta(meta)) return m;
+
+            const extractedText = fuzzy.extractText(m.content);
+            if (preserveUnverifiedTailTags &&
+                (stripVerifiedOneRingTailTag(extractedText, meta) !== extractedText ||
+                    hasVerifiedTimestampFreeOneRingTail(extractedText, meta))) return m;
 
             const classified = m.role === 'assistant'
                 ? classifyAssistantContent(m.content, agentName)
@@ -1457,13 +1638,14 @@ class OneRingPreprocessor {
                     meta.senderName || classified.senderName,
                     meta.timestamp,
                     meta.frontendSource || frontendSource,
-                    isNewConversationStart
+                    isNewConversationStart,
+                    preserveUnverifiedTailTags
                 )
             });
         });
     }
 
-    _applyTailTagPlacement(messages) {
+    _applyTailTagPlacement(messages, preserveUnverifiedTailTags = false) {
         if (!Array.isArray(messages) || hotConfig.tailTagPlacement !== TAIL_TAG_PLACEMENT_SYSTEM_USER_BLOCK) {
             return messages;
         }
@@ -1472,6 +1654,27 @@ class OneRingPreprocessor {
         for (const message of messages) {
             if (!message || message.role !== 'assistant') {
                 result.push(message);
+                continue;
+            }
+
+            const timelineMeta = getOneRingTimelineMeta(message);
+            if (preserveUnverifiedTailTags) {
+                const originalText = fuzzy.extractText(message.content);
+                if (!isTrustedOneRingTimelineMeta(timelineMeta) ||
+                    stripVerifiedOneRingTailTag(originalText, timelineMeta) === originalText) {
+                    result.push(message);
+                    continue;
+                }
+
+                result.push(cloneMessageWithOneRingMetadata(message, {
+                    content: projectOneRingContentForClaude(message.content, timelineMeta)
+                }));
+                const noticeMessage = {
+                    role: 'user',
+                    content: `[系统提示:][OneRing通知:上一条消息由${timelineMeta.senderName}于${timelineMeta.timestamp}发送于${timelineMeta.frontendSource}]`
+                };
+                markOneRingTimelineMeta(noticeMessage, timelineMeta);
+                result.push(noticeMessage);
                 continue;
             }
 
@@ -1484,10 +1687,16 @@ class OneRingPreprocessor {
             result.push(cloneMessageWithOneRingMetadata(message, {
                 content: this._stripTailTagFromContent(message.content)
             }));
-            result.push({
+            const noticeMessage = {
                 role: 'user',
                 content: `[系统提示:][OneRing通知:上一条消息由${meta.senderName}于${meta.timestamp}发送于${meta.frontendSource}]`
-            });
+            };
+            if (timelineMeta && isTrustedOneRingTimelineMeta(timelineMeta) &&
+                timelineMeta.timestamp === meta.timestamp && timelineMeta.senderName === meta.senderName &&
+                timelineMeta.frontendSource === meta.frontendSource) {
+                markOneRingTimelineMeta(noticeMessage, timelineMeta);
+            }
+            result.push(noticeMessage);
         }
 
         if (messages.__oneRingMeta) {
@@ -2126,7 +2335,7 @@ class OneRingPreprocessor {
         return stats;
     }
 
-    async _processOnlyMessagesForUpstream(messages, agentName, frontendSource, defaultUserName, outputDedupeThreshold = 0.98, clientTimestampBindingInfo = null) {
+    async _processOnlyMessagesForUpstream(messages, agentName, frontendSource, defaultUserName, outputDedupeThreshold = 0.98, clientTimestampBindingInfo = null, preserveUnverifiedTailTags = false) {
         let result = Array.isArray(messages) ? [...messages] : messages;
 
         // Only + asyncOnlyMode 的上游快速返回阶段不能生成任何新时间戳。
@@ -2142,7 +2351,7 @@ class OneRingPreprocessor {
         // 因此这里仅做输出去重和 meta 附着；真正的补标/纠标由后台
         // _processRecordOnlyMessages() 完成。若某块已有旧尾标，暂不在快速路径改写，
         // 后台严格绑定阶段会在无可信 bound 时剥离，或用真库时间修正。
-        const postBlocks = this._extractLocalPostBlocks(result, agentName, frontendSource, defaultUserName);
+        const postBlocks = this._extractLocalPostBlocks(result, agentName, frontendSource, defaultUserName, preserveUnverifiedTailTags);
         const timelineStrategy = this._createTimelineStrategy(clientTimestampBindingInfo);
         const clientTimestampBindings = timelineStrategy.hasClientTimestampTruth
             ? timelineStrategy.bindRawMessages(
@@ -2172,14 +2381,16 @@ class OneRingPreprocessor {
                 defaultUserName,
                 agentName,
                 frontendSource,
-                newConversationStartUserIndex
+                newConversationStartUserIndex,
+                preserveUnverifiedTailTags
             );
             result = this._upsertTimelineTailTags(
                 timestamped,
                 defaultUserName,
                 agentName,
                 frontendSource,
-                newConversationStartUserIndex
+                newConversationStartUserIndex,
+                preserveUnverifiedTailTags
             );
             timelineStrategy.scheduleTimestampCorrections?.(agentName, frontendSource, clientTimestampBindings.verifiedBindings, 'only-client-hash');
         }
@@ -2213,7 +2424,7 @@ class OneRingPreprocessor {
         }
     }
 
-    _scheduleRecordOnlyPersistence(messages, agentName, frontendSource, defaultUserName, threshold, maxSnapshotBlocks = 20, outputDedupeThreshold = 0.98, clientTimestampBindingInfo = null) {
+    _scheduleRecordOnlyPersistence(messages, agentName, frontendSource, defaultUserName, threshold, maxSnapshotBlocks = 20, outputDedupeThreshold = 0.98, clientTimestampBindingInfo = null, preserveUnverifiedTailTags = false) {
         const run = async () => {
             try {
                 await this._processRecordOnlyMessages(
@@ -2225,7 +2436,8 @@ class OneRingPreprocessor {
                     maxSnapshotBlocks,
                     outputDedupeThreshold,
                     clientTimestampBindingInfo,
-                    true
+                    true,
+                    preserveUnverifiedTailTags
                 );
             } catch (e) {
                 console.error('[OneRing] Async Only persistence failed:', e.message);
@@ -2239,13 +2451,13 @@ class OneRingPreprocessor {
         }
     }
 
-    async _processRecordOnlyMessages(messages, agentName, frontendSource, defaultUserName, threshold, maxSnapshotBlocks = 20, outputDedupeThreshold = 0.98, clientTimestampBindingInfo = null, suppressClientBindingLog = false) {
+    async _processRecordOnlyMessages(messages, agentName, frontendSource, defaultUserName, threshold, maxSnapshotBlocks = 20, outputDedupeThreshold = 0.98, clientTimestampBindingInfo = null, suppressClientBindingLog = false, preserveUnverifiedTailTags = false) {
         const timing = createOneRingTimingProbe('record-only', { agentName, frontendSource });
         const nextTimestamp = createOneRingTimestampSequencer();
         let result = Array.isArray(messages) ? [...messages] : messages;
 
         const effectiveClientTimestampBindingInfo = clientTimestampBindingInfo || timelineCommon.getClientTimestampBindingsFromConfig({}, formatOneRingTimestamp);
-        const postBlocks = this._extractLocalPostBlocks(result, agentName, frontendSource, defaultUserName);
+        const postBlocks = this._extractLocalPostBlocks(result, agentName, frontendSource, defaultUserName, preserveUnverifiedTailTags);
         const timelineStrategy = this._createTimelineStrategy(effectiveClientTimestampBindingInfo);
         const clientTimestampBindings = timelineStrategy.hasClientTimestampTruth
             ? timelineStrategy.bindRawMessages(
@@ -2382,7 +2594,10 @@ class OneRingPreprocessor {
         result = result.map((m) => {
             if (!m || (m.role !== 'user' && m.role !== 'assistant')) return m;
 
-            const existingMeta = getOneRingTailMeta(m.content);
+            const timelineMeta = getOneRingTimelineMeta(m);
+            const existingMeta = preserveUnverifiedTailTags
+                ? (isTrustedOneRingTimelineMeta(timelineMeta) ? timelineMeta : null)
+                : getOneRingTailMeta(m.content);
             if (m.role === 'assistant') {
                 const classifiedAssistant = classifyAssistantContent(m.content, agentName);
                 if (!classifiedAssistant) return m;
@@ -2401,20 +2616,32 @@ class OneRingPreprocessor {
                 ) return m;
 
                 if (!bound) {
+                    if (preserveUnverifiedTailTags) return m;
                     return existingMeta
                         ? cloneMessageWithOneRingMetadata(m, { content: this._stripTailTagFromContent(m.content) })
                         : m;
                 }
 
-                return cloneMessageWithOneRingMetadata(m, {
+                const cloned = cloneMessageWithOneRingMetadata(m, {
                     content: upsertTailTag(
                         m.content,
                         classifiedAssistant.senderName,
                         bound.timestamp,
                         bound.frontendSource || frontendSource,
-                        shouldMarkNewConversationStart || existingMeta?.isNewConversationStart
+                        shouldMarkNewConversationStart || existingMeta?.isNewConversationStart,
+                        preserveUnverifiedTailTags
                     )
                 });
+                const boundMeta = {
+                    timestamp: bound.timestamp,
+                    senderName: bound.senderName || classifiedAssistant.senderName,
+                    frontendSource: bound.frontendSource || frontendSource,
+                    isNewConversationStart: shouldMarkNewConversationStart || existingMeta?.isNewConversationStart,
+                    source: bound.source || 'exact'
+                };
+                return isTrustedOneRingTimelineMeta(boundMeta)
+                    ? markOneRingTimelineMeta(cloned, boundMeta)
+                    : cloned;
             }
 
             const classified = classifyUserContent(m.content, defaultUserName, agentName);
@@ -2434,20 +2661,32 @@ class OneRingPreprocessor {
             ) return m;
 
             if (!bound) {
+                if (preserveUnverifiedTailTags) return m;
                 return existingMeta
                     ? cloneMessageWithOneRingMetadata(m, { content: this._stripTailTagFromContent(m.content) })
                     : m;
             }
 
-            return cloneMessageWithOneRingMetadata(m, {
+            const cloned = cloneMessageWithOneRingMetadata(m, {
                 content: upsertTailTag(
                     m.content,
                     classified.senderName,
                     bound.timestamp,
                     bound.frontendSource || frontendSource,
-                    shouldMarkNewConversationStart || existingMeta?.isNewConversationStart
+                    shouldMarkNewConversationStart || existingMeta?.isNewConversationStart,
+                    preserveUnverifiedTailTags
                 )
             });
+            const boundMeta = {
+                timestamp: bound.timestamp,
+                senderName: bound.senderName || classified.senderName,
+                frontendSource: bound.frontendSource || frontendSource,
+                isNewConversationStart: shouldMarkNewConversationStart || existingMeta?.isNewConversationStart,
+                source: bound.source || 'exact'
+            };
+            return isTrustedOneRingTimelineMeta(boundMeta)
+                ? markOneRingTimelineMeta(cloned, boundMeta)
+                : cloned;
         });
         timing.mark('tailTagUpsert');
 
@@ -2484,14 +2723,17 @@ class OneRingPreprocessor {
         return this._attachMeta(result, agentName, frontendSource, turnMeta);
     }
 
-    _extractLocalPostBlocks(messages, agentName, frontendSource, defaultUserName) {
+    _extractLocalPostBlocks(messages, agentName, frontendSource, defaultUserName, preserveUnverifiedTailTags = false) {
         if (!Array.isArray(messages)) return [];
 
         return messages
             .map((m, index) => ({ m, index }))
             .filter(({ m }) => m && (m.role === 'user' || m.role === 'assistant'))
             .map(({ m, index }) => {
-                const tailMeta = getOneRingTailMeta(m.content);
+                const timelineMeta = getOneRingTimelineMeta(m);
+                const tailMeta = preserveUnverifiedTailTags
+                    ? (isTrustedOneRingTimelineMeta(timelineMeta) ? timelineMeta : null)
+                    : getOneRingTailMeta(m.content);
                 const rawText = fuzzy.extractText(m.content);
                 if (m.role === 'user') {
                     const classified = classifyUserContent(rawText, defaultUserName, agentName);
@@ -3017,7 +3259,8 @@ class OneRingPreprocessor {
         // AI 回复可能被写入空 agent 的幽灵库（例如 ".db"）。
         // 边界仍限制为开头连续 system 前缀，避免普通上下文/用户正文中的 OneRing 文本误触发。
         const agentName = attachedMeta?.agentName || (triggerMatch ? triggerMatch[1].trim() : null) || noticeMeta?.agentName || null;
-        const frontendSourceFromTrigger = attachedMeta?.frontendSource || (triggerMatch ? triggerMatch[2].trim() : null) || noticeMeta?.frontendSource || null;
+        const temporaryFrontendSource = getTemporaryFrontendSource(messages);
+        const frontendSourceFromTrigger = temporaryFrontendSource || attachedMeta?.frontendSource || (triggerMatch ? triggerMatch[2].trim() : null) || noticeMeta?.frontendSource || null;
         if (!agentName || !frontendSourceFromTrigger) return null;
 
         const tailPostBatch = this._findTailPostBatch(messages, config.ONERING_USER_NAME || 'Ryan', agentName);
@@ -3025,7 +3268,8 @@ class OneRingPreprocessor {
 
         return {
             agentName,
-            frontendSource: tailMeta ? tailMeta.frontendSource : frontendSourceFromTrigger,
+            // 临时契约描述本次请求端，旧上下文尾标不能把手机回复重新归回桌面端。
+            frontendSource: temporaryFrontendSource || (tailMeta ? tailMeta.frontendSource : frontendSourceFromTrigger),
             lastUserSenderName: tailMeta ? tailMeta.senderName : null,
             lastUserTimestamp: tailMeta ? tailMeta.timestamp : null,
             turnId: attachedMeta?.turnId || null,
