@@ -424,6 +424,7 @@ class SidecarServer extends EventEmitter {
         if (method === "submitPatchJob") return this._submitPatchJob(params);
         if (method === "submitWriteJob") return this._submitWriteJob(params);
         if (method === "cancel") return this._cancel(params);
+        if (method === "resolveWriteWorktree") return this._resolveWriteWorktree(params);
         if (method === "shutdown") {
             setImmediate(() => {
                 void Promise.resolve().then(() => this.shutdown()).catch(error => {
@@ -1315,6 +1316,85 @@ class SidecarServer extends EventEmitter {
         } finally {
             if (cancelTimer) clearTimeout(cancelTimer);
             if (job.cancelTimeoutTimer === cancelTimer) job.cancelTimeoutTimer = null;
+        }
+    }
+
+    async _resolveWriteWorktree(params) {
+        if (!this._writeConfigured || !this._writeAdapter) {
+            throw new SidecarError("AICW_WRITE_NOT_CONFIGURED", "Sidecar write mode is not configured");
+        }
+        const jobId = assertJobId(params?.jobId);
+        const action = String(params?.action || "").trim().toLowerCase();
+        if (action !== "discard" && action !== "promote") {
+            throw new SidecarError("INVALID_ACTION", "action must be discard or promote");
+        }
+        if (this.activeJobs.has(jobId)) {
+            throw new SidecarError("JOB_STILL_ACTIVE", "Cannot resolve Worktree while job is still active");
+        }
+        const metaPath = path.join(this.jobRoot, "meta", `${jobId}.json`);
+        if (!fs.existsSync(metaPath)) {
+            throw new SidecarError("META_NOT_FOUND", `Job ${jobId} meta does not exist`);
+        }
+        let meta;
+        try {
+            meta = readJson(metaPath);
+        } catch {
+            throw new SidecarError("META_INVALID", `Job ${jobId} meta is invalid`);
+        }
+        if (meta.jobKind !== "write") {
+            throw new SidecarError("JOB_NOT_WRITE", `Job ${jobId} is not a write job`);
+        }
+        if (!TERMINAL_STATES.has(meta.state)) {
+            throw new SidecarError("JOB_NOT_TERMINAL", `Job ${jobId} is not in terminal state: ${meta.state}`);
+        }
+        if (!meta.worktreePath || !meta.gitRepoRoot) {
+            throw new SidecarError("WORKTREE_NOT_RECORDED", `Job ${jobId} has no recorded worktree`);
+        }
+        if (meta.worktreeDiscarded === true && action === "discard") {
+            return { resolved: true, action: "discard", alreadyResolved: true, jobId };
+        }
+        if (meta.worktreePromoted === true && action === "promote") {
+            return { resolved: true, action: "promote", alreadyResolved: true, jobId };
+        }
+
+        const head = meta.wipCommit || meta.resultCommit || meta.baseHead;
+        if (!head) {
+            throw new SidecarError("WORKTREE_HEAD_UNKNOWN", `Job ${jobId} has no proven base or commit head`);
+        }
+
+        if (action === "discard") {
+            await this._writeAdapter.discardExpected({
+                repoRoot: meta.gitRepoRoot,
+                workspaceBaseRoot: this._writeWorkspaceBaseRoot,
+                expected: {
+                    path: meta.worktreePath,
+                    head,
+                    branch: meta.worktreeBranch || `vcp/aicw/${jobId}`,
+                    locked: true,
+                    lockReason: meta.worktreeLockReason || `AICodeWorker write session ${jobId}`
+                }
+            });
+            await updateJobMetaLocked(this.jobRoot, jobId, metaPath, m => {
+                m.worktreeLocked = false;
+                m.worktreeRetained = false;
+                m.worktreeDiscarded = true;
+                m.wipResolvedAt = new Date().toISOString();
+                m.wipResolution = "discarded";
+                return m;
+            });
+            return { resolved: true, action: "discard", jobId };
+        }
+
+        if (action === "promote") {
+            await this._writeAdapter.unlock(meta.gitRepoRoot, meta.worktreePath);
+            await updateJobMetaLocked(this.jobRoot, jobId, metaPath, m => {
+                m.worktreeLocked = false;
+                m.worktreePromoted = true;
+                m.wipResolvedAt = new Date().toISOString();
+                m.wipResolution = "promoted";
+                return m;
+            });
+            return { resolved: true, action: "promote", jobId };
         }
     }
 

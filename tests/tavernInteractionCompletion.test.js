@@ -83,7 +83,7 @@ test('流式：提前 close 和中止不提交', async () => {
     const body = new PassThrough();
     const pending = new StreamHandler(ctx).handle({}, response(), { ok: true, body });
     setImmediate(() => abort ? ctx.abortController.abort() : body.destroy());
-    assert.equal((await pending).completed, false);
+    await assert.rejects(pending, error => error.code === (abort ? 'aborted' : 'stream_error'));
   }
 });
 
@@ -99,8 +99,12 @@ test('两类处理器：工具中间轮不掩盖失败，成功整轮只返回�
           ? { ok: false, arrayBuffer: async () => Buffer.from('{}') }
           : make(mode === 'limit' ? 'TOOL' : 'final')
       });
-      const result = await new Handler(ctx).handle({}, response(), make('TOOL'));
-      assert.equal(result.completed, mode === 'success');
+      const pending = new Handler(ctx).handle({}, response(), make('TOOL'));
+      if (mode === 'failure') {
+        await assert.rejects(pending, error => error.name === 'UpstreamError');
+      } else {
+        assert.equal((await pending).completed, mode === 'success');
+      }
     }
   }
 });

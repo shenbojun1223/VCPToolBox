@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
+const { safeCode, safeRequestId, safeErrorFields } = require('../upstreamErrors.js');
 
 const DEFAULT_QUEUE_LIMIT = 2048;
 const DEFAULT_MAX_LINE_BYTES = 4096;
@@ -393,6 +394,15 @@ class BoundedJsonlWriter {
       httpStatus: safeStatus(read('httpStatus')),
       errorCode: safeErrorCode(read('errorCode'))
     };
+    const upstreamPhase = read('upstreamPhase');
+    if (upstreamPhase === 'initial' || upstreamPhase === 'tool_continuation') {
+      safeEvent.upstreamStatus = safeStatus(read('upstreamStatus'));
+      safeEvent.upstreamCode = safeCode(read('upstreamCode'));
+      safeEvent.upstreamPhase = upstreamPhase;
+      const attempt = read('upstreamAttempt');
+      safeEvent.upstreamAttempt = Number.isSafeInteger(attempt) && attempt > 0 ? attempt : 1;
+      safeEvent.upstreamRequestId = safeRequestId(read('upstreamRequestId'));
+    }
     let line;
     try {
       line = `${JSON.stringify(safeEvent)}\n`;
@@ -495,6 +505,20 @@ class RequestDiagnosticContext {
     if (this.onceKeys.has('error')) return;
     this.onceKeys.add('error');
     this.stage('error', httpStatus, ERROR_CODES.has(errorCode) ? errorCode : 'handler_error');
+  }
+
+  upstreamError(error) {
+    if (this.onceKeys.has('error')) return;
+    this.onceKeys.add('error');
+    const fields = safeErrorFields(error);
+    this.writer.writeEvent({
+      diagnosticId: this.diagnosticId, correlationId: this.correlationId,
+      route: this.route, phase: 'error', elapsedMs: monotonicElapsedMs(this.start),
+      httpStatus: fields.status, errorCode: 'upstream_error',
+      upstreamStatus: fields.status, upstreamCode: fields.code,
+      upstreamPhase: fields.phase, upstreamAttempt: fields.attempt,
+      upstreamRequestId: fields.requestId
+    });
   }
 
   markProxyStarted() {

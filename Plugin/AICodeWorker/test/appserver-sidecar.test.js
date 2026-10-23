@@ -1485,6 +1485,60 @@ test("write timeout with modified workspace preserves wip commit and injects met
     }
 });
 
+test("resolveWriteWorktree cleanly discards or promotes a retained WIP worktree", async () => {
+    const environment = await createDormantWriteEnvironment();
+    const discardJobId = "write_resolve_discard";
+    const promoteJobId = "write_resolve_promote";
+    const discardPaths = environment.createWriteMeta(discardJobId);
+    const promotePaths = environment.createWriteMeta(promoteJobId);
+
+    try {
+        // 1. 测试 discard 闭环
+        const discardSub = environment.submitWrite(discardJobId, "[[DELAY_MS=5000]]", discardPaths, { timeoutSec: 0.5 });
+        await waitFor(() => Boolean(readJsonOrNull(discardPaths.metaPath)?.worktreePath));
+        const discardWorktree = readJsonOrNull(discardPaths.metaPath).worktreePath;
+        fs.writeFileSync(path.join(discardWorktree, "discard.txt"), "discard content\n", "utf8");
+        await waitFor(() => readJsonOrNull(discardPaths.metaPath)?.state === "timeout", 10000);
+        await discardSub.catch(() => {});
+
+        const discardRes = await environment.server._resolveWriteWorktree({ jobId: discardJobId, action: "discard" });
+        assert.deepEqual(discardRes, { resolved: true, action: "discard", jobId: discardJobId });
+        assert.equal(fs.existsSync(discardWorktree), false);
+        const discardMeta = readJsonOrNull(discardPaths.metaPath);
+        assert.equal(discardMeta.worktreeLocked, false);
+        assert.equal(discardMeta.worktreeDiscarded, true);
+        assert.equal(discardMeta.wipResolution, "discarded");
+
+        // 2. 测试 promote 闭环
+        const promoteSub = environment.submitWrite(promoteJobId, "[[DELAY_MS=5000]]", promotePaths, { timeoutSec: 0.5 });
+        await waitFor(() => Boolean(readJsonOrNull(promotePaths.metaPath)?.worktreePath));
+        const promoteWorktree = readJsonOrNull(promotePaths.metaPath).worktreePath;
+        fs.writeFileSync(path.join(promoteWorktree, "promote.txt"), "promote content\n", "utf8");
+        await waitFor(() => readJsonOrNull(promotePaths.metaPath)?.state === "timeout", 10000);
+        await promoteSub.catch(() => {});
+
+        const promoteRes = await environment.server._resolveWriteWorktree({ jobId: promoteJobId, action: "promote" });
+        assert.deepEqual(promoteRes, { resolved: true, action: "promote", jobId: promoteJobId });
+        assert.equal(fs.existsSync(promoteWorktree), true);
+        const promoteMeta = readJsonOrNull(promotePaths.metaPath);
+        assert.equal(promoteMeta.worktreeLocked, false);
+        assert.equal(promoteMeta.worktreePromoted, true);
+        assert.equal(promoteMeta.wipResolution, "promoted");
+
+        // 3. 幂等性测试
+        const repeatDiscard = await environment.server._resolveWriteWorktree({ jobId: discardJobId, action: "discard" });
+        assert.equal(repeatDiscard.alreadyResolved, true);
+
+        // 4. 非法操作校验
+        await assert.rejects(
+            environment.server._resolveWriteWorktree({ jobId: discardJobId, action: "invalid_action" }),
+            error => error instanceof SidecarError && error.code === "INVALID_ACTION"
+        );
+    } finally {
+        await environment.close();
+    }
+});
+
 test("SidecarClient inspection and status preserve the exact patch protocol proof", async () => {
     const environment = await createEnvironment();
     try {

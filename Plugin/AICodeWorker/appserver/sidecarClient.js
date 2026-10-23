@@ -466,6 +466,16 @@ class SidecarClient {
         return this._callWithState(state, "cancel", params);
     }
 
+    async resolveWriteWorktree(params) {
+        const state = await this._requireExisting();
+        const jobId = assertJobId(params?.jobId);
+        const action = String(params?.action || "").trim().toLowerCase();
+        if (action !== "discard" && action !== "promote") {
+            throw new SidecarError("INVALID_ACTION", "action must be discard or promote");
+        }
+        return this._callWithState(state, "resolveWriteWorktree", { jobId, action });
+    }
+
     async shutdown() {
         const observed = this._readState();
         if (observed?.status !== "degraded") {

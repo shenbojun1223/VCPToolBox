@@ -1,3 +1,4 @@
+[[ContextFoldingV2]]
 
 ————VCP元思维模块————
 [[VCP元思考::Group]]

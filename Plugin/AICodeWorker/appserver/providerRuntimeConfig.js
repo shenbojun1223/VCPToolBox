@@ -17,8 +17,8 @@ const DEFAULT_ROUTE_DESCRIPTORS = Object.freeze([
     }),
     Object.freeze({
         routeId: "deepseek-commandcode",
-        revision: "commandcode-v1",
-        upstreamModel: "deepseek/deepseek-v4.1-flash",
+        revision: "commandcode-fast-v1",
+        upstreamModel: "deepseek/deepseek-v4.1-flash-fast",
         reasoningEfforts: ["low", "high", "max"],
         defaultReasoningEffort: "high",
         serviceTiers: ["default", "fast"],

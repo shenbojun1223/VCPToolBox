@@ -345,6 +345,8 @@ class JevToolCallExp {
 
         const raw = parsed.raw;
         const routes = [
+            // 方括号内的 topic_ 前缀是高特异性信号，不可能在普通对话中误命中，故置于首位。
+            { re: /\[\s*topic_[A-Za-z0-9_-]+\s*\]/i, toolKey: 'flowlock_handoff' },
             { re: /联络|联系|通讯|委托|问问.*(?:女仆|agent)/i, toolKey: 'agent_assistant' },
             { re: /闹钟|提醒我|叫醒我|定时提醒/i, toolKey: 'alarm' },
             { re: /计算|求解|算一下|科学计算/i, toolKey: 'calculator' },
@@ -352,7 +354,10 @@ class JevToolCallExp {
             // “音乐检索”是 LightMemo 的语义音乐库检索，不是立即播放。
             { re: /\[音乐检索\]|音乐检索/i, toolKey: 'light_memo' },
             { re: /播放|点歌|放一首|听歌/i, toolKey: 'music_controller' },
-            { re: /回忆|记忆|知识库|检索.*(?:日记|记忆)|搜索.*(?:日记|记忆)/i, toolKey: 'light_memo' }
+            { re: /回忆|记忆|知识库|检索.*(?:日记|记忆)|搜索.*(?:日记|记忆)/i, toolKey: 'light_memo' },
+            // 别名兜底置于末位：让「回忆【上次交班】」这类表达仍优先走 light_memo，
+            // 缺 topic_id 时在模板内明确报错，而不是静默落入记忆检索。
+            { re: /交班|延时接力|重启后继续|定时唤醒/i, toolKey: 'flowlock_handoff' }
         ];
         const route = routes.find(item => item.re.test(raw));
         return [route ? route.toolKey : 'light_memo'];
@@ -645,6 +650,38 @@ class JevToolCallExp {
             if (!duration) throw new Error('睡眠需要在 [] 中提供时长。');
             args.sleeptime = duration;
             if (main) args.tips = main;
+            return args;
+        }
+
+        if (toolKey === 'flowlock_handoff') {
+            // 目标话题必须显式给出：current_topic_id 由插件写入、UI 不同步，不是真相源。
+            const topicConstraint = constraints.find(value => (
+                /^\s*(?:话题|topic|topic_id)?\s*[:：]?\s*topic_[A-Za-z0-9_-]+\s*$/i.test(value)
+            ));
+            if (!topicConstraint) {
+                throw new Error('交班需要在 [] 中提供目标话题 ID，例如 [topic_1792655452200]。');
+            }
+            args.topic_id = topicConstraint
+                .replace(/^\s*(?:话题|topic|topic_id)\s*[:：]\s*/i, '')
+                .trim();
+
+            // 延时必须在此换算成秒：下游只做 parseInt，"3分钟" 不换算会被当成 3 秒。
+            const delayRe = /(\d+(?:\.\d+)?)\s*(小时|分钟|分|秒)/;
+            const delayConstraint = constraints.find(value => (
+                value !== topicConstraint && delayRe.test(value)
+            ));
+            if (!delayConstraint) {
+                throw new Error('交班需要在 [] 中提供唤醒延时，例如 [180秒] 或 [3分钟]。');
+            }
+            const matched = delayConstraint.match(delayRe);
+            const multiplier = matched[2] === '小时' ? 3600 : (matched[2] === '秒' ? 1 : 60);
+            const seconds = Math.round(Number(matched[1]) * multiplier);
+            args.flowlock_heartbeat = String(Math.max(1, Math.min(86400, seconds)));
+
+            if (!main) {
+                throw new Error('交班需要在【】中写明醒来后要核验什么、继续做什么。');
+            }
+            args.flowlock_prompt = main;
             return args;
         }
 

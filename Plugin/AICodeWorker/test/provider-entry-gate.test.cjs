@@ -283,10 +283,10 @@ test("provider capabilities are static for compact and full aliases, including C
                 assert.deepEqual(result.providerRouting, {
                     alias,
                     routeId,
-                    revision: routeId === "deepseek-official" ? "official-v1" : "commandcode-v1",
+                    revision: routeId === "deepseek-official" ? "official-v1" : "commandcode-fast-v1",
                     upstreamModel: routeId === "deepseek-official"
                         ? "deepseek-flash"
-                        : "deepseek/deepseek-v4.1-flash",
+                        : "deepseek/deepseek-v4.1-flash-fast",
                     configured: true,
                     executionAvailable: true,
                     blockedReason: null

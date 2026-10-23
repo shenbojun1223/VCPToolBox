@@ -1898,7 +1898,9 @@ function cleanupOldJobs(retainDays = 7, maxClean = 50) {
             const jobId = metaFileJobId;
             const appServerPatch = artifactClass === "patch";
             const appServerAnalyze = artifactClass === "analyze";
+            const appServerWrite = isAppServerWriteMeta(m);
             if (appServerPatch && !TERMINAL_STATES.has(m.state)) continue;
+            if (appServerWrite && m.worktreeLocked === true && m.worktreeDiscarded !== true) continue; // 保留审查中的沙箱绝不清
             if (artifactClass === "legacy" && m.state === "running") continue; // 跑着的绝不清
             // 优先用 meta.startedAt（不受 rsync/cp 刷新 mtime），回落到文件 mtime
             const jobTime = m.startedAt ? new Date(m.startedAt).getTime() : fs.statSync(metaPath).mtimeMs;
@@ -1910,7 +1912,7 @@ function cleanupOldJobs(retainDays = 7, maxClean = 50) {
             }
             if (appServerPatch && !removeAuthorizedAppServerPatch(jobId, m, p.patch)) continue;
             // app-server patch 的 public artifact 已由共享 verifier 精确删除；legacy 仍沿用原清理集合。
-            const relatedFiles = appServerPatch || appServerAnalyze
+            const relatedFiles = appServerPatch || appServerAnalyze || appServerWrite
                 ? [metaPath, p.args, p.output, p.log, p.codexOutput]
                 : [metaPath, p.args, p.output, p.log, p.patch, p.codexOutput];
             for (const fp of relatedFiles) {
@@ -4236,6 +4238,26 @@ async function cmdListJobs(input) {
     return { status: "success", total: jobs.length, jobs };
 }
 
+async function cmdResolveWip(input, dependencies = {}) {
+    const { jobId, action } = input;
+    if (!jobId) return { status: "error", error: "jobId 是必填参数。" };
+    const normAction = String(action || "").trim().toLowerCase();
+    if (normAction !== "discard" && normAction !== "promote") {
+        return { status: "error", error: "action 必须是 discard 或 promote。" };
+    }
+    const client = dependencies.client || createSidecarClient();
+    try {
+        const res = await client.resolveWriteWorktree({ jobId, action: normAction });
+        return { status: "success", jobId, action: normAction, ...res };
+    } catch (error) {
+        return appServerErrorResult(error, {
+            error: `解析 WIP Worktree 失败: ${error.message}`,
+            errorCode: error?.code || "AICW_RESOLVE_WIP_FAILED",
+            jobId
+        });
+    }
+}
+
 async function cmdCancel(input, dependencies = {}) {
     const { jobId } = input;
     if (!jobId) return { status: "error", error: "jobId 是必填参数。" };
@@ -4388,8 +4410,9 @@ async function main() {
             case "trace":         result = await cmdTrace(input);      break;
             case "listjobs":      result = await cmdListJobs(input);   break;
             case "cancel":        result = await cmdCancel(input);     break;
+            case "resolve_wip":   result = await cmdResolveWip(input); break;
             default:
-                result = { status: "error", error: `未知命令 "${cmd}"。支持: capabilities, run, run_and_wait, query, trace, listJobs, cancel` };
+                result = { status: "error", error: `未知命令 "${cmd}"。支持: capabilities, run, run_and_wait, query, trace, listJobs, cancel, resolve_wip` };
         }
     } catch (err) {
         result = { status: "error", error: `插件内部错误: ${err.message}` };
@@ -4445,5 +4468,6 @@ module.exports = {
     cmdQuery,
     cmdTrace,
     cmdListJobs,
-    cmdCancel
+    cmdCancel,
+    cmdResolveWip
 };

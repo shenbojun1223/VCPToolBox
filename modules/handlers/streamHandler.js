@@ -1,3 +1,4 @@
+const { UpstreamError, assertResponseOk, throwIfAborted } = require('../upstreamErrors.js');
 // modules/handlers/streamHandler.js
 const { StringDecoder } = require('string_decoder');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
@@ -8,6 +9,17 @@ const {
   normalizeReasoningTag,
   shouldConvertReasoningForModel
 } = require('../reasoningContentAdapter.js');
+const { createRollKeeper } = require('../vcpLoop/rollKeeper');
+
+// 读取软预算配置：缺失/空白/非法/非正数一律视为禁用 token 黄灯（0），绝不让请求抛错。
+function readSoftTokenBudgetEnv() {
+  const raw = process.env.VCP_CONTEXT_SOFT_BUDGET;
+  if (raw === undefined || raw === null) return 0;
+  const trimmed = String(raw).trim();
+  if (trimmed === '') return 0;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
 
 class StreamHandler {
   constructor(context) {
@@ -70,6 +82,9 @@ class StreamHandler {
     const maxRecursion = Number.isFinite(parsedMaxRecursion) && parsedMaxRecursion > 0
       ? parsedMaxRecursion
       : 20;
+    const rollKeeper = createRollKeeper({ maxRecursion, tokenBudget: readSoftTokenBudgetEnv() });
+    // 硬暂停（repeat_halt）时保存停止信息，交由循环后的 stuck 分支统一收口。
+    let stuckHalt = null;
     let currentAIContentForLoop = '';
     let chatLogs = [];
     let oneRingAssistantTurnParts = [];
@@ -128,6 +143,7 @@ class StreamHandler {
 
     // 辅助函数：处理 AI 响应流 (优化版：直通转发 + 后台解析 + chunk 空闲超时保护)
     const processAIResponseStreamHelper = async (aiResponse, isInitialCall) => {
+      await assertResponseOk(aiResponse, { phase: isInitialCall ? 'initial' : 'tool_continuation' }, abortController.signal);
       return new Promise((resolve, reject) => {
         const decoder = new StringDecoder('utf8');
         let collectedContentThisTurn = '';
@@ -253,62 +269,47 @@ class StreamHandler {
 
         // 🌟 新增：chunk 级空闲超时保护
         // 如果连续 CHUNK_IDLE_TIMEOUT 毫秒未收到任何上游 data chunk，
-        // 则判定上游流已冻结，主动中止并 resolve，防止无限挂起
+        // 则终止读取并抛出安全错误，不允许把部分输出送入工具补救轮。
         const resetChunkIdleTimer = () => {
           if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
           chunkIdleTimer = setTimeout(() => {
             if (streamAborted) return;
             console.warn(`[Stream IdleTimeout] No upstream chunk received for ${CHUNK_IDLE_TIMEOUT / 1000}s. Assuming stream stalled. Forcing end.`);
-            streamAborted = true;
-            // 通知前端这次流异常结束
-            if (!res.writableEnded && !res.destroyed) {
-              try {
-                const stallPayload = {
-                  id: `chatcmpl-VCP-stall-${Date.now()}`,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: originalBody.model || 'unknown',
-                  choices: [{ index: 0, delta: { content: '\n[上游响应超时，流已中断]' }, finish_reason: 'stop' }],
-                };
-                res.write(`data: ${JSON.stringify(stallPayload)}\n\n`);
-                res.write('data: [DONE]\n\n');
-              } catch (e) { /* ignore */ }
-            }
-            if (aiResponse.body && !aiResponse.body.destroyed) {
-              aiResponse.body.destroy();
-            }
-            if (keepAliveTimer) clearInterval(keepAliveTimer);
-            if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
-            resolve(result());
+            failStream('upstream_timeout');
           }, CHUNK_IDLE_TIMEOUT);
         };
         resetChunkIdleTimer(); // 启动首次空闲计时
 
-        const abortHandler = () => {
-          streamAborted = true;
-          if (keepAliveTimer) clearInterval(keepAliveTimer);
-          if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
-          if (DEBUG_MODE) console.log('[Stream Abort] Abort signal received, stopping stream processing.');
-          if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
-          if (aiResponse.body && !aiResponse.body.destroyed) aiResponse.body.destroy();
-          resolve(result());
+        const cleanupStream = () => {
+          clearInterval(keepAliveTimer);
+          clearTimeout(chunkIdleTimer);
+          abortController?.signal.removeEventListener('abort', abortHandler);
+          aiResponse.body.removeListener('data', onData);
+          aiResponse.body.removeListener('end', onEnd);
+          aiResponse.body.removeListener('error', onError);
+          aiResponse.body.removeListener('close', onClose);
         };
-
-        if (abortController?.signal) {
-          abortController.signal.addEventListener('abort', abortHandler);
-          if (abortController.signal.aborted) abortHandler();
-        }
-
-        aiResponse.body.on('close', () => {
-          if (upstreamEnded) return;
+        const failStream = code => {
+          if (streamAborted) return;
           streamAborted = true;
-          if (keepAliveTimer) clearInterval(keepAliveTimer);
-          if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
-          if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
-          resolve(result());
-        });
+          cleanupStream();
+          if (!aiResponse.body.destroyed) {
+            // _destroy may report an asynchronous error before close.
+            const ignoreDestroyError = () => {};
+            aiResponse.body.on('error', ignoreDestroyError);
+            aiResponse.body.once('close', () => aiResponse.body.removeListener('error', ignoreDestroyError));
+            aiResponse.body.destroy();
+          }
+          reject(new UpstreamError({ status: aiResponse.status, code,
+            phase: isInitialCall ? 'initial' : 'tool_continuation' }));
+        };
+        const abortHandler = () => failStream('aborted');
+        const onClose = () => {
+          if (!aiResponse.body.readableEnded && !streamAborted) failStream('stream_error');
+        };
+        const onError = () => failStream(abortController?.signal.aborted ? 'aborted' : 'stream_error');
 
-        aiResponse.body.on('data', chunk => {
+        const onData = chunk => {
           if (streamAborted) return;
           resetChunkIdleTimer(); // 每收到一个 chunk 就重置空闲计时器
 
@@ -351,13 +352,14 @@ class StreamHandler {
                   res.write(line + '\n');
                 }
               } catch (writeError) {
-                streamAborted = true;
+                failStream('aborted');
+                return;
               }
             }
           }
-        });
+        };
 
-        aiResponse.body.on('end', () => {
+        const onEnd = () => {
           upstreamEnded = true;
           if (keepAliveTimer) clearInterval(keepAliveTimer);
           if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
@@ -398,28 +400,15 @@ class StreamHandler {
           }
 
           writeClientReasoningCloseChunk();
-          if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
+          cleanupStream();
           resolve(result());
-        });
-
-        aiResponse.body.on('error', streamError => {
-          if (keepAliveTimer) clearInterval(keepAliveTimer);
-          if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
-          if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
-          if (streamAborted || streamError.name === 'AbortError' || streamError.type === 'aborted') {
-            streamAborted = true;
-            resolve(result());
-            return;
-          }
-          console.error('Error reading AI response stream:', streamError);
-          if (!res.writableEnded) {
-            try {
-              res.write(`data: ${JSON.stringify({ error: 'STREAM_READ_ERROR', message: streamError.message })}\n\n`);
-              res.end();
-            } catch (e) { }
-          }
-          reject(streamError);
-        });
+        };
+        aiResponse.body.on('error', onError);
+        aiResponse.body.on('close', onClose);
+        aiResponse.body.on('end', onEnd);
+        abortController?.signal.addEventListener('abort', abortHandler, { once: true });
+        if (abortController?.signal.aborted) { abortHandler(); return; }
+        aiResponse.body.on('data', onData);
       });
     };
 
@@ -439,6 +428,16 @@ class StreamHandler {
       if (abortController && abortController.signal.aborted) {
         if (DEBUG_MODE) console.log('[VCP Stream Loop] Abort detected, exiting loop.');
         break;
+      }
+
+      const rollInjection = rollKeeper.evaluate({ recursionDepth, messages: currentMessagesForLoop });
+      if (rollInjection && rollInjection.kind === 'repeat_halt') {
+        // 同指纹连续失败达到阈值：硬暂停本轮工具循环，未派发的工具一律不执行。
+        stuckHalt = rollInjection;
+        break;
+      }
+      if (rollInjection && rollInjection.kind && rollInjection.content) {
+        currentMessagesForLoop.push({ role: 'system', content: rollInjection.content });
       }
 
       let assistantMessages = [{ role: 'assistant', content: currentAIContentForLoop }];
@@ -547,6 +546,8 @@ class StreamHandler {
           } catch (e) { }
         }
 
+        throwIfAborted(abortController.signal);
+        if (res.writableEnded || res.destroyed) { rollKeeper.reset(); return; }
         const nextAiAPIResponse = await fetchWithRetry(
           `${apiUrl}/v1/chat/completions`,
           {
@@ -559,9 +560,10 @@ class StreamHandler {
             body: JSON.stringify({ ...originalBody, messages: currentMessagesForLoop, stream: true }),
             signal: abortController.signal,
           },
-          { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates }
+          { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates, phase: 'tool_continuation' }
         );
 
+        await assertResponseOk(nextAiAPIResponse, { phase: 'tool_continuation' }, abortController.signal);
         if (nextAiAPIResponse.ok) {
           let nextAIResponseData = await processAIResponseStreamHelper(nextAiAPIResponse, false);
           validUpstreamTurns = validUpstreamTurns && nextAIResponseData.completed;
@@ -601,6 +603,17 @@ class StreamHandler {
 
       // 执行普通调用
       const toolResults = await toolExecutor.executeAll(normalCalls, clientIp, currentMessagesForLoop);
+      for (let i = 0; i < normalCalls.length; i++) {
+        // 结构化判错：success=false 或 raw 明确报错都算失败，不靠工具回执文本猜成败。
+        const recordedResult = toolResults[i];
+        const recordedError = !recordedResult || !recordedResult.success ||
+          !!(recordedResult.raw && this.context.isToolResultError(recordedResult.raw));
+        rollKeeper.record({
+          name: normalCalls[i].name,
+          args: normalCalls[i].args,
+          success: !recordedError
+        });
+      }
       const combinedToolResultsForAI = toolResults.map(r => r.content).flat();
       if (archeryErrorContents.length > 0) combinedToolResultsForAI.push(...archeryErrorContents);
 
@@ -766,8 +779,8 @@ class StreamHandler {
       // Tool execution and projection may yield while the user cancels.
       // Do not invoke another upstream request after cancellation or disconnect.
       if (abortController?.signal.aborted || res.writableEnded || res.destroyed) {
-        if (!res.writableEnded && !res.destroyed) res.end();
-        break;
+        rollKeeper.reset();
+        return;
       }
 
       const nextAiAPIResponse = await fetchWithRetry(
@@ -782,10 +795,10 @@ class StreamHandler {
           body: JSON.stringify({ ...originalBody, messages: messagesForUpstream, stream: true }),
           signal: abortController.signal,
         },
-        { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates }
+        { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates, phase: 'tool_continuation' }
       );
 
-      if (!nextAiAPIResponse.ok) break;
+      await assertResponseOk(nextAiAPIResponse, { phase: 'tool_continuation' }, abortController.signal);
 
       let nextAIResponseData = await processAIResponseStreamHelper(nextAiAPIResponse, false);
       validUpstreamTurns = validUpstreamTurns && nextAIResponseData.completed;
@@ -804,9 +817,12 @@ class StreamHandler {
       recursionDepth++;
     } // toolcall loop end
 
+    // 轮数保真器：循环结束（正常退出 / break / 熔断分支）后释放本次会话状态。
+    rollKeeper.reset();
+
     // ★ 熔断收口前，将尾部未闭合的 VCP 工具块残片从 OneRing 记忆流中剥除，
     //   防止残片进入 Agent 长期记忆并污染未来的 RAG 检索。
-    if (recursionDepth >= maxRecursion && oneRingAssistantTurnParts.length > 0) {
+    if ((stuckHalt || recursionDepth >= maxRecursion) && oneRingAssistantTurnParts.length > 0) {
       try {
         const { sanitizeContent } = require('../vcpLoop/historySanitizer.js');
         const lastIdx = oneRingAssistantTurnParts.length - 1;
@@ -819,7 +835,51 @@ class StreamHandler {
     if (writeChatLog) writeChatLog(originalBody, chatLogs);
     // OneRing 由主流程在整轮完成且响应发送完成后提交。
 
-    if (recursionDepth >= maxRecursion && !res.writableEnded && !res.destroyed) {
+    if (stuckHalt && !res.writableEnded && !res.destroyed) {
+      // 独立暂停原因：同一工具同参数连续失败达到阈值。与 limit 分支互斥，各自只结束一次响应。
+      let pendingToolCallsAtStuck = [];
+      if (!vcpToolUseForbidden) {
+        try {
+          pendingToolCallsAtStuck = ToolCallParser.parse(currentAIContentForLoop);
+        } catch (parseError) {
+          console.error('[VCP Stream Loop] Failed to inspect pending tool calls at stuck halt:', parseError);
+        }
+      }
+
+      const pendingCountAtStuck = pendingToolCallsAtStuck.length;
+      const stuckStatus = {
+        code: 'VCP_TOOL_LOOP_STUCK',
+        current: recursionDepth,
+        max: maxRecursion,
+        pendingToolCalls: pendingCountAtStuck,
+      };
+      const pendingClauseAtStuck = pendingCountAtStuck > 0
+        ? '最后生成的 ' + pendingCountAtStuck + ' 个工具请求尚未执行（已如实保留，未派发）。'
+        : '停止时没有待执行的工具请求。';
+      const stuckNotice = '\n\n> [!WARNING]\n> **VCP 工具循环已硬暂停（同一调用连续失败）**：检测到同一工具以完全相同参数连续失败达到阈值，已停止本轮工具执行以打断重复失败循环。任务尚未完成；' + pendingClauseAtStuck + '请检查阻塞原因（工具参数、权限或上游状态）后发送“继续”恢复。为避免重复副作用，系统不会自动重放。\n';
+
+      try {
+        res.write('data: ' + JSON.stringify({
+          id: 'chatcmpl-VCP-tool-loop-stuck-notice-' + Date.now(),
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: originalBody.model,
+          choices: [{ index: 0, delta: { content: stuckNotice }, finish_reason: null }],
+          vcp_status: stuckStatus,
+        }) + '\n\n');
+
+        const stuckFinalChunk = {
+          id: 'chatcmpl-VCP-final-stuck-' + Date.now(),
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          vcp_status: stuckStatus,
+        };
+        res.write('data: ' + JSON.stringify(stuckFinalChunk) + '\n\n');
+        res.write('data: [DONE]\n\n', () => {
+          try { res.end(); } catch (e) { }
+        });
+      } catch (e) { }
+    } else if (recursionDepth >= maxRecursion && !res.writableEnded && !res.destroyed) {
       let pendingToolCallsAtLimit = [];
       if (!vcpToolUseForbidden) {
         try {
