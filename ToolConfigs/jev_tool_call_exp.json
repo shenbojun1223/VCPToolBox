@@ -185,6 +185,18 @@
           "plugin": "VCPSleep",
           "aliases": ["睡一觉", "打个盹", "进入睡眠", "等待回调", "vcpsleep"]
         },
+        "flowlock_handoff": {
+          "plugin": "TopicSponsor",
+          "aliases": [
+            "交班",
+            "定时唤醒",
+            "重启后继续",
+            "延时接力"
+          ],
+          "fixedArgs": {
+            "command": "AttachFlowlockToTopic"
+          }
+        },
         "music_controller": {
           "plugin": "MusicController",
           "aliases": ["播放歌曲", "播放音乐", "点歌台", "点歌", "播放器", "musiccontroller", "VCP点歌台"],
