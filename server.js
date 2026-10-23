@@ -283,12 +283,12 @@ async function closeHttpServerGracefully() {
 async function waitForActiveRequestsToDrain(timeoutMs = 30000) {
     const start = Date.now();
 
-    while (activeRequests.size > 0 && (Date.now() - start) < timeoutMs) {
+    while ((activeRequests.size > 0 || activeHttpRequests.size > 0) && (Date.now() - start) < timeoutMs) {
         console.log(`[Shutdown] Waiting for ${activeRequests.size} active request(s) to finish...`);
         await new Promise(resolve => setTimeout(resolve, 500));
     }
 
-    return activeRequests.size === 0;
+    return activeRequests.size === 0 && activeHttpRequests.size === 0;
 }
 
 async function abortAllActiveRequests(reason = '服务器正在关闭') {
@@ -1698,8 +1698,10 @@ async function gracefulShutdown(exitCode = 0, reason = 'signal') {
             }
 
             console.log(`[Server][ShutdownTrace] Phase 2/10 - closing HTTP server listener`);
-            await closeHttpServerGracefully();
-            console.log(`[Server][ShutdownTrace] Phase 2/10 - HTTP server listener closed. trackedSockets=${trackedSockets.size}, activeHttpRequests=${activeHttpRequests.size}`);
+            // server.close() stops accepting connections immediately, but its callback
+            // waits for existing HTTP connections. Do not await it before draining them.
+            const httpClosed = closeHttpServerGracefully();
+            console.log(`[Server][ShutdownTrace] Phase 2/10 - HTTP close initiated. trackedSockets=${trackedSockets.size}, activeHttpRequests=${activeHttpRequests.size}`);
 
             console.log(`[Server][ShutdownTrace] Phase 3/10 - waiting active requests to drain (initial=${activeRequests.size})`);
             const drainedNaturally = await waitForActiveRequestsToDrain(30000);
@@ -1734,6 +1736,21 @@ async function gracefulShutdown(exitCode = 0, reason = 'signal') {
             } else {
                 console.log(`[Server][ShutdownTrace] Phase 7/10 - WebSocketServer shutdown skipped`);
             }
+
+            // HTTP requests have had their grace period and WebSocket shutdown has
+            // completed. Retire remaining non-chat streams/keep-alive sockets now;
+            // otherwise they can prevent plugin cleanup (including final checkpoints).
+            const socketClosures = [...trackedSockets].map(socket => {
+                if (socket.closed) return Promise.resolve();
+                return new Promise(resolve => {
+                    socket.once('close', resolve);
+                    if (!socket.destroyed) socket.destroy();
+                });
+            });
+            server?.closeAllConnections?.();
+            await Promise.all(socketClosures);
+            await httpClosed;
+            console.log(`[Server][ShutdownTrace] Phase 7/10 - HTTP connections closed`);
 
             if (pluginManager) {
                 console.log(`[Server][ShutdownTrace] Phase 8/10 - pluginManager.shutdownAllPlugins start`);
