@@ -1,0 +1,11 @@
+{
+  "name": "vcp-server-project-forge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ServerProjectForge plugin-local compatibility dependencies; host supplies remaining dependencies",
+  "dependencies": {
+    "diff-match-patch": "1.0.5",
+    "mammoth": "1.11.0",
+    "pdf-parse": "1.1.1"
+  }
+}

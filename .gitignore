@@ -327,3 +327,8 @@ Plugin/VCPQQBotServer/bot-node-sdk-main
 # Local repository inspection helper; retain on disk only.
 /_read_section.js# CPA Image recovery temporary directory
 image/cpa-image-recovery-*/
+
+# ServerProjectForge machine-local configuration, dependencies and native runtimes
+/Plugin/ServerProjectForge/config.env
+/Plugin/ServerProjectForge/node_modules/
+/Plugin/ServerProjectForge/bin/*/

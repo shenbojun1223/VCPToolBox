@@ -1,1 +1,5 @@
 Plugin/VCPChatSyncHub/fixtures/protocol_1_1_golden.json text eol=lf
+
+# ServerProjectForge text sources; native runtimes delivered separately
+Plugin/ServerProjectForge/** text eol=lf
+Plugin/ServerProjectForge/bin/*/** -text
