@@ -33,6 +33,91 @@ export interface NewApiMonitorModelItem {
   quota: number
 }
 
+export type UsageMonitorPeriodKey = 'today' | '7d' | 'month'
+export type UsageMonitorProvider = 'codex' | 'antigravity' | 'opencodego' | 'deepseek' | 'claude'
+export type UsageMonitorAccountStatus = 'ok' | 'stale' | 'unconfigured' | 'error' | 'unsupported'
+export type UsageMonitorActivityStatus = 'ok' | 'stale' | 'unconfigured' | 'error'
+
+export interface UsageMonitorWindow {
+  id: string
+  label: string
+  remainingPercent: number | null
+  usedPercent: number | null
+  resetsAt: string | null
+}
+
+export interface UsageMonitorBalance {
+  currency: string
+  available: number | null
+  granted: number | null
+  toppedUp: number | null
+}
+
+export interface UsageMonitorAccount {
+  id: string
+  provider: UsageMonitorProvider
+  label: string
+  status: UsageMonitorAccountStatus
+  source: string
+  observedAt: string | null
+  scopeLabel: string
+  linkedChannels: string[]
+  sharedPool: boolean
+  windows: UsageMonitorWindow[]
+  balances: UsageMonitorBalance[]
+  notice: string
+  errorCode?: string
+}
+
+export interface UsageMonitorActivityTotals {
+  requests: number | null
+  inputTokens: number | null
+  outputTokens: number | null
+  cacheReadTokens: number | null
+  totalTokens: number | null
+}
+
+export interface UsageMonitorActivityTrendItem {
+  at: string
+  requests: number | null
+  totalTokens: number | null
+}
+
+export interface UsageMonitorActivityModelItem {
+  model: string
+  requests: number | null
+  inputTokens: number | null
+  outputTokens: number | null
+  cacheReadTokens: number | null
+  totalTokens: number | null
+}
+
+export interface UsageMonitorActivity {
+  status: UsageMonitorActivityStatus
+  observedAt: string | null
+  coverage: 'newapi-only'
+  complete: boolean | null
+  truncated: boolean
+  source: string
+  totals: UsageMonitorActivityTotals
+  trend: UsageMonitorActivityTrendItem[]
+  models: UsageMonitorActivityModelItem[]
+  notice: string
+}
+
+export interface UsageMonitorSnapshot {
+  schemaVersion: number
+  generatedAt: string
+  period: {
+    key: UsageMonitorPeriodKey
+    start: string
+    end: string
+    timeZone: string
+  }
+  accounts: UsageMonitorAccount[]
+  activity: UsageMonitorActivity
+}
+
 interface NewApiMonitorEnvelope<T> {
   success?: boolean
   data?: T
@@ -148,6 +233,13 @@ export const newApiMonitorApi = {
       ...data,
       items: Array.isArray(data.items) ? data.items : [],
     }
+  },
+
+  async getUsageSnapshot(period: UsageMonitorPeriodKey = 'today'): Promise<UsageMonitorSnapshot> {
+    const params = new URLSearchParams({ period })
+    return requestMonitorData<UsageMonitorSnapshot>(
+      `/admin_api/usage-monitor/snapshot?${params.toString()}`
+    )
   },
 
   async getDashboardSnapshot(query: NewApiMonitorQuery = {}): Promise<{

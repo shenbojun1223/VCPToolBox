@@ -15,6 +15,8 @@ import {
   type NewApiMonitorModelItem,
   type NewApiMonitorSummary,
   type NewApiMonitorTrendItem,
+  type UsageMonitorPeriodKey,
+  type UsageMonitorSnapshot,
   type ServerLogResponse,
 } from "@/api";
 import { useAppStore } from "@/stores/app";
@@ -233,8 +235,11 @@ export function useDashboardState(
   const newApiMonitorSummary = ref<NewApiMonitorSummary | null>(null);
   const newApiMonitorTrend = ref<NewApiMonitorTrendItem[]>([]);
   const newApiMonitorModels = ref<NewApiMonitorModelItem[]>([]);
+  const usageMonitorSnapshot = ref<UsageMonitorSnapshot | null>(null);
+  const usageMonitorPeriod = ref<UsageMonitorPeriodKey>("today");
   const newApiMonitorStatus = ref<"loading" | "ready" | "unavailable" | "error">("loading");
   const newApiMonitorError = ref("");
+  let usageMonitorRequestSeq = 0;
   const activityDataPoints = ref<number[]>(new Array(60).fill(0));
   const lastLogCheckTime = ref<Date | null>(null);
   const lastLogOffset = ref(0);
@@ -474,38 +479,67 @@ export function useDashboardState(
     }
   }
 
-  async function loadNewApiMonitor() {
-    try {
-      const snapshot = await newApiMonitorApi.getDashboardSnapshot();
+  async function loadNewApiMonitor(periodOverride?: UsageMonitorPeriodKey) {
+    const targetPeriod = periodOverride || usageMonitorPeriod.value;
+    const reqSeq = ++usageMonitorRequestSeq;
+    const getUsageFn = (newApiMonitorApi as { getUsageSnapshot?: (p: UsageMonitorPeriodKey) => Promise<UsageMonitorSnapshot> }).getUsageSnapshot;
 
-      newApiMonitorSummary.value = snapshot.summary;
-      newApiMonitorTrend.value = snapshot.trend;
-      newApiMonitorModels.value = snapshot.models;
+    const [legacyRes, usageRes] = await Promise.allSettled([
+      newApiMonitorApi.getDashboardSnapshot(),
+      typeof getUsageFn === "function" ? getUsageFn.call(newApiMonitorApi, targetPeriod) : Promise.reject(new Error("NOT_SUPPORTED")),
+    ]);
+
+    if (reqSeq !== usageMonitorRequestSeq) {
+      return;
+    }
+
+    if (usageRes.status === "fulfilled" && usageRes.value) {
+      usageMonitorSnapshot.value = usageRes.value;
+    }
+
+    if (legacyRes.status === "fulfilled" && legacyRes.value) {
+      newApiMonitorSummary.value = legacyRes.value.summary;
+      newApiMonitorTrend.value = legacyRes.value.trend;
+      newApiMonitorModels.value = legacyRes.value.models;
       newApiMonitorError.value = "";
       newApiMonitorStatus.value = "ready";
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const errorStatus =
-        typeof error === "object" &&
-        error !== null &&
-        "status" in error &&
-        typeof (error as { status?: unknown }).status === "number"
-          ? ((error as { status: number }).status)
-          : undefined;
-      logger.warn("Failed to load NewAPI monitor:", errorMessage);
-
-      if (!newApiMonitorSummary.value) {
-        newApiMonitorError.value = errorMessage;
-        newApiMonitorStatus.value =
-          errorStatus === 502 ||
-          errorStatus === 503 ||
-          errorMessage.includes("503") ||
-          errorMessage.includes("502") ||
-          errorMessage.includes("未配置")
-            ? "unavailable"
-            : "error";
-      }
+      return;
     }
+
+    if (usageRes.status === "fulfilled" && usageRes.value) {
+      newApiMonitorError.value = "";
+      newApiMonitorStatus.value = "ready";
+      return;
+    }
+
+    const error = legacyRes.status === "rejected" ? legacyRes.reason : (usageRes.status === "rejected" ? usageRes.reason : new Error("Unknown error"));
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorStatus =
+      typeof error === "object" &&
+      error !== null &&
+      "status" in error &&
+      typeof (error as { status?: unknown }).status === "number"
+        ? ((error as { status: number }).status)
+        : undefined;
+    logger.warn("Failed to load NewAPI monitor:", errorMessage);
+
+    if (!newApiMonitorSummary.value && !usageMonitorSnapshot.value) {
+      newApiMonitorError.value = errorMessage;
+      newApiMonitorStatus.value =
+        errorStatus === 502 ||
+        errorStatus === 503 ||
+        errorMessage.includes("503") ||
+        errorMessage.includes("502") ||
+        errorMessage.includes("未配置")
+          ? "unavailable"
+          : "error";
+    }
+  }
+
+  function selectUsageMonitorPeriod(period: UsageMonitorPeriodKey) {
+    if (usageMonitorPeriod.value === period) return;
+    usageMonitorPeriod.value = period;
+    void loadNewApiMonitor(period);
   }
 
   function mapWeatherIcon(code: string): string {
@@ -903,6 +937,9 @@ export function useDashboardState(
     newApiMonitorSummary,
     newApiMonitorTrend,
     newApiMonitorModels,
+    usageMonitorSnapshot,
+    usageMonitorPeriod,
+    selectUsageMonitorPeriod,
     newApiMonitorStatus,
     newApiMonitorError,
     activityCanvas,

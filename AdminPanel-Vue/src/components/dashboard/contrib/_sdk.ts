@@ -107,6 +107,7 @@ export const cardSdk = {
     getSummary: newApiMonitorApi.getSummary,
     getTrend: newApiMonitorApi.getTrend,
     getModels: newApiMonitorApi.getModels,
+    getUsageSnapshot: newApiMonitorApi.getUsageSnapshot,
     /** 一次性拉取 summary/trend/models 三件套 */
     getDashboardSnapshot: newApiMonitorApi.getDashboardSnapshot,
   },

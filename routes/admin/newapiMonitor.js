@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const { createUsageMonitorService } = require('../../modules/usageMonitor');
 
 const DEFAULT_LOOKBACK_SECONDS = 24 * 60 * 60;
 const DEFAULT_TIMEOUT_MS = 15000;
@@ -197,13 +198,29 @@ class NewApiMonitorClient {
     }
 }
 
+function loadFreshMonitorEnv() {
+    try {
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const dotenv = require('dotenv');
+        const envPath = path.join(__dirname, '..', '..', 'config.env');
+        if (fs.existsSync(envPath)) {
+            return { ...process.env, ...dotenv.parse(fs.readFileSync(envPath, 'utf8')) };
+        }
+    } catch (_) {
+        // fallback to process.env
+    }
+    return process.env;
+}
+
 function createMonitorClient(debugMode) {
+    const env = loadFreshMonitorEnv();
     return new NewApiMonitorClient({
-        baseUrl: process.env.NEWAPI_MONITOR_BASE_URL,
-        accessToken: process.env.NEWAPI_MONITOR_ACCESS_TOKEN,
-        timeoutMs: process.env.NEWAPI_MONITOR_TIMEOUT_MS,
+        baseUrl: env.NEWAPI_MONITOR_BASE_URL,
+        accessToken: env.NEWAPI_MONITOR_ACCESS_TOKEN,
+        timeoutMs: env.NEWAPI_MONITOR_TIMEOUT_MS,
         debugMode,
-        apiUserId: process.env.NEWAPI_MONITOR_API_USER_ID
+        apiUserId: env.NEWAPI_MONITOR_API_USER_ID
     });
 }
 
@@ -387,6 +404,20 @@ function handleRouteError(routeName, error, res) {
 module.exports = function newApiMonitorRoutes(options) {
     const router = express.Router();
     const debugMode = Boolean(options && options.DEBUG_MODE);
+    const usageMonitorService = (options && options.usageMonitorService) || createUsageMonitorService({ debugMode });
+
+    router.get('/usage-monitor/snapshot', async (req, res) => {
+        try {
+            const period = typeof req.query.period === 'string' ? req.query.period : 'today';
+            const data = await usageMonitorService.getSnapshot({ period });
+            res.json({
+                success: true,
+                data
+            });
+        } catch (error) {
+            handleRouteError('usage-monitor/snapshot', error, res);
+        }
+    });
 
     router.get('/newapi-monitor/summary', async (req, res) => {
         try {
