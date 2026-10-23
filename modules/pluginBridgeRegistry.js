@@ -2,6 +2,10 @@
 
 const jevClient = require('./jevClient');
 
+const DISTRIBUTED_ROUTING_KEYS = Object.freeze([
+    'targetServer', 'target_server', 'targetClient', 'target_client'
+]);
+
 class PluginDependencyBridgeRegistry {
     constructor() {
         this.bridges = [];
@@ -216,11 +220,17 @@ function createDefaultExecutionBridgeRegistry() {
             }
             let targetServerId = plugin.serverId;
             let routeInfo = null;
+            const hasNamedArgs = toolArgs !== null
+                && typeof toolArgs === 'object' && !Array.isArray(toolArgs);
+            const explicitTarget = hasNamedArgs
+                ? (DISTRIBUTED_ROUTING_KEYS.map(key => toolArgs[key]).find(value => value != null) ?? null)
+                : null;
             if (typeof context.webSocketServer.resolveDistributedToolServer === 'function') {
                 routeInfo = context.webSocketServer.resolveDistributedToolServer(
                     context.toolName,
                     context.requestIp,
-                    plugin.serverId
+                    plugin.serverId,
+                    explicitTarget
                 );
                 targetServerId = typeof routeInfo === 'string' ? routeInfo : routeInfo?.serverId;
             }
@@ -228,6 +238,10 @@ function createDefaultExecutionBridgeRegistry() {
                 throw new Error(
                     `[DISTRIBUTED_TOOL_NO_TARGET] No target server resolved for distributed tool "${context.toolName}".`
                 );
+            }
+            const forwardedArgs = hasNamedArgs ? { ...toolArgs } : toolArgs;
+            if (hasNamedArgs) {
+                for (const key of DISTRIBUTED_ROUTING_KEYS) delete forwardedArgs[key];
             }
             context.debugLog(
                 `Processing distributed tool call for: ${context.toolName} ` +
@@ -237,7 +251,7 @@ function createDefaultExecutionBridgeRegistry() {
             const result = await context.webSocketServer.executeDistributedTool(
                 targetServerId,
                 context.toolName,
-                toolArgs
+                forwardedArgs
             );
             return { result };
         }

@@ -22,6 +22,17 @@ function load(relative, mocks = {}, globals = {}) {
       if (Object.hasOwn(mocks, id)) return mocks[id];
       if (['http', 'https', 'path', 'fs', 'string_decoder'].includes(id)) return require(id);
       if (/upstreamErrors|reasoningContentAdapter|vcpToolForbiddenReceipt|interactionCompletion/.test(id)) return require(path.resolve(path.dirname(filename), id));
+      const reviewedPureModules = new Set([
+        'modules/opencodeGoSession.js',
+        'modules/sourcePrivacyPolicy.js',
+        'modules/vcpLoop/historySanitizer.js'
+      ]);
+      if (id.startsWith('./') || id.startsWith('../')) {
+        const resolved = path.resolve(path.dirname(filename), id);
+        const moduleFile = path.extname(resolved) ? resolved : resolved + '.js';
+        const relativeFile = path.relative(root, moduleFile).split(path.sep).join('/');
+        if (reviewedPureModules.has(relativeFile)) return require(moduleFile);
+      }
       throw new Error('Unmocked dependency: ' + id);
     }, ...globals
   }, { filename });

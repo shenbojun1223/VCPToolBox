@@ -1,12 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { PassThrough } = require('node:stream');
+const { PassThrough, Readable } = require('node:stream');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const StreamHandler = require('../modules/handlers/streamHandler');
 const NonStreamHandler = require('../modules/handlers/nonStreamHandler');
+const ToolCallParser = require('../modules/vcpLoop/toolCallParser');
 
 function context(overrides = {}) {
   return {
@@ -30,10 +31,17 @@ function response() {
   const res = new EventEmitter();
   res.writableEnded = false;
   res.destroyed = false;
-  res.write = (_chunk, callback) => { if (callback) callback(); return true; };
+  res.writes = [];
+  res.write = (chunk, callback) => { res.writes.push(chunk); if (callback) callback(); return true; };
   res.end = () => { res.writableEnded = true; res.emit('finish'); };
   res.send = () => res.end();
   return res;
+}
+
+function streamEvents(res) {
+  return res.writes.join('').split(/\r?\n/)
+    .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
+    .map(line => JSON.parse(line.slice(6)));
 }
 
 function jsonResponse(content, finish_reason = 'stop', extra = {}, ok = true) {
@@ -76,6 +84,68 @@ for (const [name, content, reason, done, expected, suffix] of [
     assert.equal(result.completed, expected);
   });
 }
+
+test('流式：仅在整轮结束时向客户端发送 finish_reason', async () => {
+  const res = response();
+  const ctx = context({ fetchWithRetry: async () => streamResponse('after tool') });
+  const result = await new StreamHandler(ctx).handle({}, res, streamResponse('TOOL'));
+  const events = streamEvents(res);
+  const terminals = events.filter(event => event.choices?.[0]?.finish_reason);
+  assert.equal(result.completed, true);
+  assert.deepEqual(terminals.map(event => event.choices[0].finish_reason), ['stop']);
+  assert.equal(events.at(-1), terminals[0]);
+  assert.equal((res.writes.join('').match(/data: \[DONE\]/g) || []).length, 1);
+});
+
+test('流式：上游长度截断不能被最终 stop 掩盖', async () => {
+  const res = response();
+  const result = await new StreamHandler(context()).handle({}, res, streamResponse('partial', 'length'));
+  const terminals = streamEvents(res).filter(event => event.choices?.[0]?.finish_reason);
+  assert.equal(result.completed, false);
+  assert.deepEqual(terminals.map(event => event.choices[0].finish_reason), ['length']);
+});
+
+test('流式：缺少结束信号时提示响应不完整，不冒充长度限制', async () => {
+  const res = response();
+  const result = await new StreamHandler(context()).handle({}, res, streamResponse('partial', null, false));
+  const events = streamEvents(res);
+  assert.equal(result.completed, false);
+  assert.equal(events.at(-2).vcp_status.code, 'UPSTREAM_STREAM_INCOMPLETE');
+  assert.match(events.at(-2).choices[0].delta.content, /响应未完整结束/);
+  assert.equal(events.at(-1).choices[0].finish_reason, null);
+  assert.equal((res.writes.join('').match(/data: \[DONE\]/g) || []).length, 1);
+});
+
+test('流式：上游在 SSE 流内返回显式 error 帧（如 limit_error_upstream）时透传真实原因而非提示继续', async () => {
+  const res = response();
+  const errFrame = `data: ${JSON.stringify({
+    error: {
+      message: 'the CLI reported a usage or limit problem',
+      type: 'bridge_error',
+      code: 'limit_error_upstream'
+    }
+  })}\n\ndata: [DONE]\n\n`;
+  const result = await new StreamHandler(context()).handle({}, res, { ok: true, body: Readable.from([errFrame]) });
+  const events = streamEvents(res);
+  assert.equal(result.completed, false);
+  assert.equal(events.at(-2).vcp_status.code, 'UPSTREAM_STREAM_ERROR');
+  assert.match(events.at(-2).choices[0].delta.content, /limit_error_upstream/);
+  assert.match(events.at(-2).choices[0].delta.content, /无需发送“继续”/);
+  assert.equal(events.at(-1).choices[0].finish_reason, null);
+  assert.equal((res.writes.join('').match(/data: \[DONE\]/g) || []).length, 1);
+});
+
+test('流式：未闭合工具请求不得被当作正常完成', async () => {
+  const res = response();
+  const ctx = context({ ToolCallParser, originalBody: { model: 'go-gemini4-high', messages: [], max_tokens: 1000 } });
+  const result = await new StreamHandler(ctx).handle({}, res,
+    streamResponse('正文\n<<<[TOOL_REQUEST]>>>\ntool_name: FileOperator\nparam: 「始」未写完'));
+  const events = streamEvents(res);
+  assert.equal(result.completed, false);
+  assert.equal(events.at(-2).vcp_status.code, 'VCP_TOOL_BLOCK_INCOMPLETE');
+  assert.match(events.at(-2).choices[0].delta.content, /工具没有执行/);
+  assert.equal(events.at(-1).choices[0].finish_reason, null);
+});
 
 test('流式：提前 close 和中止不提交', async () => {
   for (const abort of [false, true]) {
@@ -241,6 +311,9 @@ test('OneRing：显式失败禁止 insert/update/摘要，成功及旧入口兼�
       if (name === './OneRingMemo.js') return { DEFAULT_CONFIG: {}, scheduleAutoGenerate: () => calls.push(['memo']) };
       if (name === './OneRingSnapshot.js') return { contentHash: text => text };
       if (name === './OneRingFuzzy.js') return { extractText: text => text };
+      if (name === '../../modules/sourcePrivacyPolicy.js') {
+        return require(path.resolve(path.dirname(filename), name));
+      }
       if (name.startsWith('./') || name === 'chokidar') return {};
       return require(name);
     }

@@ -1185,7 +1185,25 @@ function createDistributedRoutingError(code, message, details) {
     return error;
 }
 
-function resolveDistributedToolServer(toolName, requestIp, preferredServerId = null) {
+function matchExplicitDistributedServer(candidates, explicitTarget) {
+    if (explicitTarget === null || explicitTarget === undefined) return [];
+    const raw = String(explicitTarget).trim();
+    if (!raw) return [];
+    const lower = raw.toLowerCase();
+
+    const exactIdMatches = candidates.filter(server =>
+        server.serverId === raw ||
+        (server.clientId && server.clientId === raw)
+    );
+    if (exactIdMatches.length > 0) return exactIdMatches;
+
+    return candidates.filter(server =>
+        String(server.serverName || '').trim().toLowerCase() === lower ||
+        String(server.serverId || '').trim().toLowerCase() === lower
+    );
+}
+
+function resolveDistributedToolServer(toolName, requestIp, preferredServerId = null, explicitTarget = null) {
     const candidates = getDistributedServerSnapshot().filter(server =>
         server.connected &&
         Array.isArray(server.tools) &&
@@ -1196,7 +1214,42 @@ function resolveDistributedToolServer(toolName, requestIp, preferredServerId = n
         throw createDistributedRoutingError(
             'DISTRIBUTED_TOOL_NO_PROVIDER',
             `No connected distributed server provides tool "${toolName}".`,
-            { toolName, requestIp: normalizeIpAddress(requestIp), preferredServerId }
+            { toolName, requestIp: normalizeIpAddress(requestIp), preferredServerId, explicitTarget }
+        );
+    }
+
+    const normalizedExplicitTarget = explicitTarget !== null && explicitTarget !== undefined
+        ? String(explicitTarget).trim()
+        : '';
+    if (normalizedExplicitTarget) {
+        const targetMatches = matchExplicitDistributedServer(candidates, normalizedExplicitTarget);
+        if (targetMatches.length === 1) {
+            return {
+                ...targetMatches[0],
+                reason: 'explicit_target',
+                requestIp: normalizeIpAddress(requestIp),
+                explicitTarget: normalizedExplicitTarget
+            };
+        }
+        if (targetMatches.length === 0) {
+            throw createDistributedRoutingError(
+                'DISTRIBUTED_TOOL_TARGET_NOT_FOUND',
+                `Specified targetServer "${normalizedExplicitTarget}" does not match any connected provider for tool "${toolName}".`,
+                {
+                    toolName,
+                    explicitTarget: normalizedExplicitTarget,
+                    candidates: describeDistributedCandidates(candidates)
+                }
+            );
+        }
+        throw createDistributedRoutingError(
+            'DISTRIBUTED_TOOL_TARGET_AMBIGUOUS',
+            `Specified targetServer "${normalizedExplicitTarget}" matches multiple providers for tool "${toolName}". Use exact serverId.`,
+            {
+                toolName,
+                explicitTarget: normalizedExplicitTarget,
+                candidates: describeDistributedCandidates(targetMatches)
+            }
         );
     }
 
@@ -1215,9 +1268,20 @@ function resolveDistributedToolServer(toolName, requestIp, preferredServerId = n
         }
 
         if (sourceMatches.length > 1) {
+            const exactConnMatches = sourceMatches.filter(server =>
+                normalizeIpAddress(server.connectionIp) === normalizedRequestIp
+            );
+            if (exactConnMatches.length === 1) {
+                return {
+                    ...exactConnMatches[0],
+                    reason: 'connection_ip',
+                    requestIp: normalizedRequestIp
+                };
+            }
+
             throw createDistributedRoutingError(
                 'DISTRIBUTED_TOOL_TARGET_AMBIGUOUS',
-                `Request source IP matches multiple providers for tool "${toolName}". Refusing cross-device execution.`,
+                `Request source IP matches multiple providers for tool "${toolName}". Refusing cross-device execution. Pass targetServer (serverId or serverName) to disambiguate.`,
                 {
                     toolName,
                     requestIp: normalizedRequestIp,
@@ -1238,7 +1302,7 @@ function resolveDistributedToolServer(toolName, requestIp, preferredServerId = n
 
     throw createDistributedRoutingError(
         'DISTRIBUTED_TOOL_TARGET_AMBIGUOUS',
-        `Multiple devices provide tool "${toolName}", but request source could not be matched uniquely. Refusing cross-device execution.`,
+        `Multiple devices provide tool "${toolName}", but request source could not be matched uniquely. Refusing cross-device execution. Pass targetServer (serverId or serverName) to disambiguate.`,
         {
             toolName,
             requestIp: normalizedRequestIp,

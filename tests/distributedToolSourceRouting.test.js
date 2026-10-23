@@ -34,8 +34,15 @@ test.beforeEach(() => {
   distributedServers.clear();
 });
 
-test.after(() => {
+test.after(async () => {
   distributedServers.clear();
+  // PluginManager constructs an approval-config watcher even without server startup.
+  const approval = pluginManager.toolApprovalManager;
+  const watcher = approval?.watcher;
+  if (watcher) {
+    await watcher.close();
+    if (approval.watcher === watcher) approval.watcher = null;
+  }
 });
 
 test('routes a duplicated tool to the unique provider matching request source IP', () => {
@@ -85,6 +92,46 @@ test('fails closed when multiple providers share the same visible source IP', ()
     ),
     /DISTRIBUTED_TOOL_TARGET_AMBIGUOUS/
   );
+});
+test('disambiguates shared publicIP when one provider uniquely matches connectionIp', () => {
+  addServer('home', { connectionIp: '10.1.0.25', publicIP: '203.0.113.10' });
+  // Both providers advertise the request address, but only home connects from it.
+  addServer('work', {
+    connectionIp: '10.1.0.99',
+    publicIP: '203.0.113.10',
+    localIPs: ['10.1.0.25']
+  });
+
+  const route = webSocketServer.resolveDistributedToolServer(
+    'PowerShellExecutor',
+    '10.1.0.25'
+  );
+
+  assert.equal(route.serverId, 'home');
+  assert.equal(route.reason, 'connection_ip');
+});
+
+test('routes to explicitTarget by serverId or serverName when multiple providers exist', () => {
+  addServer('home', { serverName: 'Home-PC', publicIP: '203.0.113.10' });
+  addServer('work', { serverName: 'Work-PC', publicIP: '198.51.100.20' });
+
+  const byName = webSocketServer.resolveDistributedToolServer(
+    'PowerShellExecutor',
+    '192.0.2.99',
+    'home',
+    'Work-PC'
+  );
+  assert.equal(byName.serverId, 'work');
+  assert.equal(byName.reason, 'explicit_target');
+
+  const byId = webSocketServer.resolveDistributedToolServer(
+    'PowerShellExecutor',
+    null,
+    'work',
+    'home'
+  );
+  assert.equal(byId.serverId, 'home');
+  assert.equal(byId.reason, 'explicit_target');
 });
 
 test('uses a sole online provider when no source match is available', () => {
@@ -171,4 +218,108 @@ test('PluginManager keeps duplicate providers and fails over the logical manifes
     pluginManager.buildVCPDescription = originalBuild;
     pluginManager.webSocketServer = originalWebSocketServer;
   }
+});
+
+for (const key of ['targetServer', 'target_server', 'targetClient', 'target_client']) {
+  test(`execution bridge consumes ${key} without mutating business arguments`, async () => {
+    const args = Object.freeze({
+      [key]: 'work', command: 'inspect',
+      serverId: 'business-id', server_id: 'business-id-2',
+      serverName: 'business-name', server_name: 'business-name-2'
+    });
+    let executions = 0;
+    const context = {
+      toolName: 'SyntheticTool', requestIp: null, debugLog() {},
+      webSocketServer: {
+        resolveDistributedToolServer(tool, ip, preferred, explicit) {
+          assert.equal(explicit, 'work');
+          return { serverId: 'work', reason: 'explicit_target' };
+        },
+        async executeDistributedTool(server, tool, forwarded) {
+          executions++;
+          assert.equal(server, 'work');
+          assert.notStrictEqual(forwarded, args);
+          assert.deepEqual(forwarded, {
+            command: 'inspect', serverId: 'business-id', server_id: 'business-id-2',
+            serverName: 'business-name', server_name: 'business-name-2'
+          });
+          return 'ok';
+        }
+      }
+    };
+    const result = await createDefaultExecutionBridgeRegistry().execute(
+      { isDistributed: true, serverId: 'home' }, args, context
+    );
+    assert.equal(args[key], 'work');
+    assert.equal(executions, 1);
+    assert.deepEqual(result, { result: 'ok' });
+  });
+}
+
+test('business server fields do not select the execution device', async () => {
+  const args = Object.freeze({
+    serverId: 'data-store', server_id: 'data-store-2',
+    serverName: 'database', server_name: 'database-2'
+  });
+  let executed = false;
+  await createDefaultExecutionBridgeRegistry().execute(
+    { isDistributed: true, serverId: 'home' }, args, {
+      toolName: 'SyntheticTool', requestIp: null, debugLog() {},
+      webSocketServer: {
+        resolveDistributedToolServer(tool, ip, preferred, explicit) {
+          assert.equal(explicit, null);
+          return { serverId: 'home' };
+        },
+        async executeDistributedTool(server, tool, forwarded) {
+          executed = true;
+          assert.equal(server, 'home');
+          assert.deepEqual(forwarded, args);
+          return 'ok';
+        }
+      }
+    }
+  );
+  assert.equal(executed, true);
+});
+
+test('array arguments are passed through without routing-field interpretation', async () => {
+  const args = Object.assign(['value'], { targetServer: 'not-a-routing-object' });
+  Object.freeze(args);
+  await createDefaultExecutionBridgeRegistry().execute(
+    { isDistributed: true, serverId: 'home' }, args, {
+      toolName: 'SyntheticTool', requestIp: null, debugLog() {},
+      webSocketServer: {
+        resolveDistributedToolServer(tool, ip, preferred, explicit) {
+          assert.equal(explicit, null);
+          return { serverId: 'home' };
+        },
+        async executeDistributedTool(server, tool, forwarded) {
+          assert.strictEqual(forwarded, args);
+          assert.equal(args.targetServer, 'not-a-routing-object');
+          return 'ok';
+        }
+      }
+    }
+  );
+});
+
+test('unknown explicit target refuses fallback even with a sole provider', () => {
+  addServer('home', { serverName: 'Home-PC' });
+  assert.throws(
+    () => webSocketServer.resolveDistributedToolServer('PowerShellExecutor', null, 'home', 'missing'),
+    /DISTRIBUTED_TOOL_TARGET_NOT_FOUND/
+  );
+});
+
+test('duplicate explicit server names fail closed while exact IDs remain usable', () => {
+  addServer('home', { serverName: 'Same-PC' });
+  addServer('work', { serverName: 'Same-PC' });
+  assert.throws(
+    () => webSocketServer.resolveDistributedToolServer('PowerShellExecutor', null, 'home', 'Same-PC'),
+    /DISTRIBUTED_TOOL_TARGET_AMBIGUOUS/
+  );
+  assert.equal(
+    webSocketServer.resolveDistributedToolServer('PowerShellExecutor', null, 'home', 'work').serverId,
+    'work'
+  );
 });

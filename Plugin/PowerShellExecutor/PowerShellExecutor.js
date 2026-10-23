@@ -68,10 +68,49 @@ try {
 }
 
 // --- AST safety gate: inspect source as data, never execute it during inspection. ---
-function securityError(message, security) {
+function securityError(message, security, code) {
     const error = new Error(message);
     error.security = security;
+    error.diagnosticCode = code;
     return error;
+}
+
+// Only fixed messages and bounded metadata cross the error channel.
+// Never serialize raw execution errors, arguments, environment or credentials.
+function failureDiagnostic(error, stage) {
+    const messages = {
+        COMMAND_FORBIDDEN: '命令命中禁止策略；验证码不可覆盖。',
+        AUTH_REQUIRED: '需要验证码，但插件未收到有效的授权参数。',
+        AUTH_UNAVAILABLE: '插件未获得宿主提供的验证码校验值。',
+        AUTH_INVALID: '提交的验证码与宿主提供的校验值不匹配。',
+        INPUT_INVALID: '请求格式或参数无效。',
+        SECURITY_CHECK_FAILED: '安全检查发生异常，未进入命令执行。',
+        EXECUTION_FAILED: '已通过当前请求的门禁检查，但执行或结果处理失败。'
+    };
+    const defaults = {
+        input: 'INPUT_INVALID', validation: 'INPUT_INVALID',
+        security: 'SECURITY_CHECK_FAILED', authorization: 'AUTH_UNAVAILABLE',
+        execution: 'EXECUTION_FAILED'
+    };
+    const supplied = error && error.diagnosticCode;
+    const code = Object.hasOwn(messages, supplied) ? supplied : (defaults[stage] || 'INPUT_INVALID');
+    const diagnostic = { status: 'error', code, stage, error: `[${code}][${Object.hasOwn(defaults, stage) ? stage : 'input'}] ${messages[code]}` };
+    const security = error && error.security;
+    if (security) {
+        diagnostic.security = {};
+        if (['allow', 'auth-required', 'review-required', 'forbidden'].includes(security.decision)) {
+            diagnostic.security.decision = security.decision;
+        }
+        if (typeof security.canAuthorize === 'boolean') {
+            diagnostic.security.canAuthorize = security.canAuthorize;
+        }
+        for (const key of ['commandIndex', 'line', 'column']) {
+            if (Number.isSafeInteger(security[key]) && security[key] >= 0) {
+                diagnostic.security[key] = security[key];
+            }
+        }
+    }
+    return diagnostic;
 }
 
 // --- 回调函数 ---
@@ -228,6 +267,7 @@ async function main() {
     });
 
     process.stdin.on('end', async () => {
+        let stage = 'input';
         try {
             const args = JSON.parse(input);
 
@@ -243,6 +283,7 @@ async function main() {
             }
 
             // Inspect the entire batch BEFORE execution or credential comparison.
+            stage = 'security';
             const securityResult = checkCommands(
                 commands,
                 defaultConfig.forbiddenCommands,
@@ -250,13 +291,10 @@ async function main() {
                 { shell: resolvedShell }
             );
             if (securityResult.isForbidden) {
-                throw securityError(`执行被拒绝：${securityResult.reason}`, securityResult);
+                throw securityError('命令命中禁止策略。', securityResult, 'COMMAND_FORBIDDEN');
             }
             const isAuthRequiredByConfig = securityResult.needsAuth || securityResult.requiresReview;
-            if (isAuthRequiredByConfig) {
-                // Actionable first line so truncation never hides the required action.
-                console.error(`[ServerPowerShellExecutor] 需要验证码授权（${securityResult.decision}/${securityResult.matchedKeyword}）：请向用户索取当前最新动态验证码，重新调用并在参数中携带 tool_password。`);
-            }
+            stage = 'validation';
 
             let command;
             const isMultiCommand = commands.length > 1;
@@ -285,21 +323,23 @@ async function main() {
                 throw new Error('缺少必需参数: 必须提供 "command" 或 "command1", "command2", ... 等参数。');
             }
 
-            // 验证码验证逻辑
+            // 验证码验证逻辑（判定条件保持不变）
+            stage = 'authorization';
             if (isAuthRequiredByConfig && !toolPassword) {
-                throw securityError('此命令需要【动态验证码】授权。请立即向用户索取当前最新验证码，然后重新调用本工具并在参数中携带 tool_password（验证码）。不要放弃或改用其他工具规避。', securityResult);
+                throw securityError('缺少验证码参数。', securityResult, 'AUTH_REQUIRED');
             }
 
             if (toolPassword) {
                 const realCode = process.env.DECRYPTED_AUTH_CODE;
                 if (!realCode) {
-                    throw securityError('无法获取验证码。请确保主服务器配置正确。', securityResult);
+                    throw securityError('宿主未提供验证码校验值。', securityResult, 'AUTH_UNAVAILABLE');
                 }
                 if (String(toolPassword) !== realCode) {
-                    throw securityError('【验证码错误】当前验证码可能已刷新，请向用户索取最新动态验证码后重新调用本工具。', securityResult);
+                    throw securityError('验证码不匹配。', securityResult, 'AUTH_INVALID');
                 }
             }
 
+            stage = 'execution';
             if (executionType === 'background') {
                 const requestId = crypto.randomUUID();
                 const tempFilePath = path.join(__dirname, `${requestId}.log`);
@@ -431,10 +471,9 @@ async function main() {
                 console.log(JSON.stringify({ status: 'success', result: { content: [{ type: 'text', text: resultOutput }] } }));
             }
         } catch (error) {
-            console.error(JSON.stringify({
-                status: 'error', error: error.message,
-                ...(error.security ? { security: error.security } : {})
-            }));
+            const diagnostic = JSON.stringify(failureDiagnostic(error, stage));
+            console.log(diagnostic);
+            console.error(diagnostic);
             process.exit(1);
         }
     });

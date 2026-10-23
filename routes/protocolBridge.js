@@ -593,16 +593,20 @@ function extractMessagesFromAnthropicBody(body) {
 // Gemini GenerateContent API 消息提取
 // ============================================================
 
+function normalizeGeminiTextParts(parts) {
+    if (!Array.isArray(parts)) return '';
+    return parts
+        .map(part => (part && typeof part.text === 'string' ? part.text : ''))
+        .filter(Boolean)
+        .join('\n');
+}
+
 function extractMessagesFromGeminiBody(body) {
     const messages = [];
 
     // 提取 systemInstruction
     if (body.systemInstruction && typeof body.systemInstruction === 'object') {
-        const parts = Array.isArray(body.systemInstruction.parts) ? body.systemInstruction.parts : [];
-        const systemText = parts
-            .map(part => (part && typeof part.text === 'string' ? part.text : ''))
-            .filter(Boolean)
-            .join('\n');
+        const systemText = normalizeGeminiTextParts(body.systemInstruction.parts);
         if (systemText) {
             messages.push({ role: 'system', content: systemText });
         }
@@ -612,7 +616,7 @@ function extractMessagesFromGeminiBody(body) {
     if (Array.isArray(body.contents)) {
         for (const content of body.contents) {
             const role = content.role === 'model' ? 'assistant' : normalizeMessageRole(content.role || 'user');
-            const text = normalizeTextContent(content.parts);
+            const text = normalizeGeminiTextParts(content.parts);
             if (role && text) {
                 messages.push({ role, content: text });
             }
@@ -1305,6 +1309,7 @@ async function forwardToChatCompletions(req, res, {
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${serverKey}`,
+                ...(req.headers['x-opencode-session'] && { 'x-opencode-session': req.headers['x-opencode-session'] }),
                 // 透传原始请求的 user-agent
                 ...(req.headers['user-agent'] && { 'User-Agent': req.headers['user-agent'] })
             },

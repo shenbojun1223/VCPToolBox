@@ -152,8 +152,13 @@ class JevToolCallExp {
         }
 
         const uniqueUrls = uniqueStrings(imageUrls);
-        const allowsUrlAsPrimary = (categoryKey === 'web_search' || thirdParty) && uniqueUrls.length > 0;
-        if (primary.length === 0 && !allowsUrlAsPrimary) {
+        const allowsUrlAsPrimary = (categoryKey === 'web_search' || categoryKey === 'desktop_control' || thirdParty) && uniqueUrls.length > 0;
+        const allowsThirdPartyEmptyPrimary = thirdParty && (backtickTools.length > 0 || semanticConstraints.length > 0);
+        const allowsConstraintAsPrimary = categoryKey === 'desktop_control' && (
+            semanticConstraints.length > 0
+            || /截图|截屏|看屏幕|窗口列表|列出窗口|查询窗口|查看窗口|查询桌面|查看桌面|查询dock|查看dock|样式自动化/i.test(raw)
+        );
+        if (primary.length === 0 && !allowsUrlAsPrimary && !allowsThirdPartyEmptyPrimary && !allowsConstraintAsPrimary) {
             throw new Error('JEV 表达式缺少主要内容，请使用【主要内容】。打开网页时也可直接把 URL 放入 [URL]。');
         }
 
@@ -280,6 +285,8 @@ class JevToolCallExp {
             toolKeys = this._normalizeUrlFetchSelection(toolKeys, parsed);
         } else if (parsed.categoryKey === 'daily_tools') {
             toolKeys = this._normalizeDailyToolSelection(toolKeys, parsed);
+        } else if (parsed.categoryKey === 'desktop_control') {
+            toolKeys = this._normalizeDesktopToolSelection(toolKeys, parsed);
         }
 
         const calls = [];
@@ -294,6 +301,8 @@ class JevToolCallExp {
                 args = await this._buildImageArgs(toolKey, tool, parsed);
             } else if (parsed.categoryKey === 'daily_tools') {
                 args = this._buildDailyToolArgs(toolKey, tool, parsed);
+            } else if (parsed.categoryKey === 'desktop_control') {
+                args = this._buildDesktopControlArgs(toolKey, tool, parsed);
             } else {
                 throw new Error(`JEV 尚未实现能力目录 "${parsed.categoryKey}"。`);
             }
@@ -699,6 +708,333 @@ class JevToolCallExp {
         throw new Error(`JEV 尚未实现日用工具模板 "${toolKey}"。`);
     }
 
+    _normalizeDesktopToolSelection(toolKeys, parsed) {
+        if (parsed.quotedTools.length > 0) return toolKeys;
+        const raw = parsed.raw;
+        if (/壁纸|wallpaper|挂件|widget|dock栏|查询dock|查看dock|vcpdesktop|查询桌面|查看桌面|桌面画布|样式自动化/i.test(raw)) {
+            return ['desktop_remote'];
+        }
+        return ['screen_pilot'];
+    }
+
+    _extractDesktopPrefixedValue(constraints, prefixes) {
+        for (const item of constraints) {
+            for (const prefix of prefixes) {
+                if (item.length <= prefix.length) continue;
+                const head = item.slice(0, prefix.length);
+                const sep = item[prefix.length];
+                if (head.toLowerCase() === prefix.toLowerCase() && (sep === ':' || sep === '：' || sep === '=')) {
+                    return item.slice(prefix.length + 1).trim();
+                }
+            }
+        }
+        return null;
+    }
+
+    _buildDesktopControlArgs(toolKey, tool, parsed) {
+        const primaryList = parsed.primary.map(item => item.trim()).filter(Boolean);
+        const main = primaryList.join('\n').trim();
+        const constraints = parsed.constraints.map(item => item.trim()).filter(Boolean);
+        const tagConstraints = constraints.filter(item => !/[:：=]/.test(item));
+        const joinedConstraints = tagConstraints.join(' ');
+        const wrapperText = parsed.raw
+            .replace(/【[\s\S]*?】/g, ' ')
+            .replace(/\[[\s\S]*?\]/g, ' ')
+            .replace(/\{[^{}]*\}/g, ' ')
+            .replace(/`[^`]*`/g, ' ');
+        const actionSignal = `${primaryList[0] || ''} ${wrapperText}`.trim();
+        const payloadText = primaryList.length >= 2
+            ? primaryList.slice(1).join('\n').trim()
+            : (primaryList[0] || '');
+
+        if (toolKey === 'desktop_remote') {
+            const args = { ...(tool.fixedArgs || {}) };
+            if (/壁纸|wallpaper/i.test(parsed.raw)) {
+                args.command = 'SetWallpaper';
+                const src = parsed.imageUrls[0]
+                    || this._extractDesktopPrefixedValue(constraints, ['壁纸', '地址', 'url', 'source'])
+                    || (/^(?:https?:\/\/|file:\/\/|<!doctype|<html)/i.test(payloadText) ? payloadText : null)
+                    || (/^(?:https?:\/\/|file:\/\/|<!doctype|<html)/i.test(main) ? main : null);
+                if (!src) throw new Error('设置壁纸需要在 [URL] 或【HTML/URL】中提供壁纸来源。');
+                args.wallpaperSource = src;
+                return args;
+            }
+            if (/挂件源码|查看源码|widget源码|viewwidgetsource/i.test(parsed.raw)) {
+                args.command = 'ViewWidgetSource';
+                const widgetId = this._extractDesktopPrefixedValue(constraints, ['挂件', 'widget', 'widgetid', 'id'])
+                    || (!/源码|查看/i.test(payloadText) ? payloadText : '');
+                if (!widgetId) throw new Error('查看挂件源码需要在 [挂件:ID] 或【ID】中提供 widgetId。');
+                args.widgetId = widgetId;
+                return args;
+            }
+            if (/创建挂件|新建挂件|生成挂件|添加挂件|createwidget/i.test(parsed.raw)) {
+                args.command = 'CreateWidget';
+                const html = primaryList.length >= 2 ? payloadText : main.replace(/^(?:创建挂件|新建挂件|生成挂件)\s*[:：]?\s*/i, '');
+                if (!html) throw new Error('创建挂件需要在【】中提供 HTML 代码。');
+                args.htmlContent = html;
+                const saveName = this._extractDesktopPrefixedValue(constraints, ['名称', '收藏', 'savename', 'name']);
+                if (saveName) {
+                    args.saveName = saveName;
+                    args.autoSave = 'true';
+                } else if (/收藏|保存|autosave/i.test(joinedConstraints)) {
+                    args.autoSave = 'true';
+                }
+                const widgetId = this._extractDesktopPrefixedValue(constraints, ['挂件', 'widgetid', 'id']);
+                if (widgetId) args.widgetId = widgetId;
+                const coord = this._extractDesktopPrefixedValue(constraints, ['坐标', '位置', 'pos']);
+                if (coord) {
+                    const m = coord.match(/(-?\d+)\s*[,，\s×x]\s*(-?\d+)/i);
+                    if (m) {
+                        args.x = m[1];
+                        args.y = m[2];
+                    }
+                }
+                const size = this._extractDesktopPrefixedValue(constraints, ['尺寸', '大小', '宽高', 'size']);
+                if (size) {
+                    const m = size.match(/(\d+)\s*[,，\s×x]\s*(\d+)/i);
+                    if (m) {
+                        args.width = m[1];
+                        args.height = m[2];
+                    }
+                }
+                return args;
+            }
+            if (/dock|应用列表|快捷方式|querydock/i.test(parsed.raw)) {
+                args.command = 'QueryDock';
+                return args;
+            }
+            if (/样式自动化状态|查询样式自动化|getstyleautomationstatus/i.test(parsed.raw)) {
+                args.command = 'GetStyleAutomationStatus';
+                return args;
+            }
+            if (/样式自动化|setstyleautomation/i.test(parsed.raw)) {
+                args.command = 'SetStyleAutomation';
+                args.enabled = /关闭|停止|禁用|false/i.test(parsed.raw) ? 'false' : 'true';
+                return args;
+            }
+            args.command = 'QueryDesktop';
+            return args;
+        }
+
+        if (toolKey === 'screen_pilot') {
+            const args = { ...(tool.fixedArgs || {}) };
+
+            // 1. 提取通用窗口选择器与修饰约束
+            const windowTitle = this._extractDesktopPrefixedValue(constraints, ['窗口', '标题', 'window', 'windowtitle']);
+            if (windowTitle) args.windowTitle = windowTitle;
+
+            const processName = this._extractDesktopPrefixedValue(constraints, ['进程', 'process', 'processname'])
+                || constraints.find(c => /^[A-Za-z0-9_.-]+\.exe$/i.test(c));
+            if (processName) args.processName = processName;
+
+            const hwnd = this._extractDesktopPrefixedValue(constraints, ['句柄', 'hwnd']);
+            if (hwnd) args.hwnd = hwnd;
+
+            const pid = this._extractDesktopPrefixedValue(constraints, ['pid']);
+            if (pid) args.pid = pid;
+
+            const className = this._extractDesktopPrefixedValue(constraints, ['类名', 'class', 'classname']);
+            if (className) args.className = className;
+
+            const controlType = this._extractDesktopPrefixedValue(constraints, ['控件', '类型', 'controltype']);
+            if (controlType) args.controlType = controlType;
+
+            const elementId = this._extractDesktopPrefixedValue(constraints, ['元素', 'elementid']);
+            if (elementId) args.elementId = elementId;
+
+            const automationId = this._extractDesktopPrefixedValue(constraints, ['自动化id', 'automationid']);
+            if (automationId) args.automationId = automationId;
+
+            const verifyText = this._extractDesktopPrefixedValue(constraints, ['验证', '等待出现', '验证文字', 'verify', 'verifytext']);
+            if (verifyText) args.verifyText = verifyText;
+
+            const textDisappears = this._extractDesktopPrefixedValue(constraints, ['等待消失', '消失文字', 'textdisappears']);
+            if (textDisappears) args.textDisappears = textDisappears;
+
+            const timeoutVal = this._extractDesktopPrefixedValue(constraints, ['超时', 'timeout', 'timeoutms']);
+            if (timeoutVal) {
+                const msMatch = timeoutVal.match(/(\d+)\s*(ms|毫秒|s|秒)?/i);
+                if (msMatch) {
+                    const num = Number(msMatch[1]);
+                    const unit = (msMatch[2] || '').toLowerCase();
+                    const ms = (unit === 's' || unit === '秒') ? String(num * 1000) : String(num);
+                    args.timeoutMs = ms;
+                    args.verifyTimeoutMs = ms;
+                }
+            }
+
+            if (/后台|不抢焦点|不抢鼠标|background/i.test(joinedConstraints)) args.background = 'true';
+            else if (/前台|foreground/i.test(joinedConstraints)) args.background = 'false';
+
+            if (/相对窗口|窗口坐标|relativetowindow|relative/i.test(joinedConstraints)) {
+                args.relativeToWindow = 'true';
+            }
+
+            if (/右键|right/i.test(joinedConstraints)) args.button = 'right';
+            else if (/中键|middle/i.test(joinedConstraints)) args.button = 'middle';
+
+            if (/双击|double|2次|两次/i.test(joinedConstraints)) args.clicks = '2';
+
+            const coordStr = this._extractDesktopPrefixedValue(constraints, ['坐标', '位置', '点', 'coord', 'pos'])
+                || constraints.find(c => /^\s*-?\d+(?:\.\d+)?\s*[,，]\s*-?\d+(?:\.\d+)?\s*$/.test(c));
+            let parsedCoord = null;
+            if (coordStr) {
+                const cm = coordStr.match(/(-?\d+(?:\.\d+)?)\s*[,，\s×x]\s*(-?\d+(?:\.\d+)?)/i);
+                if (cm) {
+                    parsedCoord = { x: cm[1], y: cm[2] };
+                }
+            }
+
+            // 2. 判定具体命令
+            // (a) QueryWindows
+            if (/列出窗口|查询窗口|窗口列表|查看窗口|获取窗口|所有窗口|querywindows/i.test(actionSignal) || /^列出窗口|窗口列表|查询窗口$/i.test(main)) {
+                args.command = 'QueryWindows';
+                return args;
+            }
+
+            // (b) ScreenCapture
+            if ((/截图|截屏|截取|抓图|屏幕快照|看屏幕|看看屏幕|查看屏幕|画面|screencapture/i.test(actionSignal) || /^截图|截屏|截取|看屏幕$/i.test(main))
+                && !/点击|输入|打字|滚动|等待/i.test(actionSignal)) {
+                args.command = 'ScreenCapture';
+                if (/ocr|识别文字|文字识别/i.test(joinedConstraints) || /ocr|识别文字/i.test(actionSignal)) {
+                    args.ocr = 'true';
+                }
+                if (/png|无损/i.test(joinedConstraints)) args.format = 'png';
+                if (/保存|save/i.test(joinedConstraints)) args.save = 'true';
+                const cleanTarget = payloadText.replace(/^(?:截图|截屏|截取|看屏幕|查看屏幕)\s*[:：]?\s*/i, '').trim();
+                if (cleanTarget && !/^(?:截图|截屏|屏幕|全屏|画面|当前屏幕)$/i.test(cleanTarget)) {
+                    if (/\.exe$/i.test(cleanTarget) && !args.processName) args.processName = cleanTarget;
+                    else if (!args.windowTitle && !args.hwnd && !args.processName) args.windowTitle = cleanTarget;
+                }
+                return args;
+            }
+
+            // (c) InspectUI
+            if (/控件树|元素树|探测ui|分析ui|检查ui|inspectui/i.test(actionSignal)) {
+                args.command = 'InspectUI';
+                const cleanTarget = payloadText.replace(/^(?:控件树|元素树|探测ui|分析ui|检查ui|inspectui)\s*[:：]?\s*/i, '').trim();
+                if (cleanTarget && !args.windowTitle && !args.processName && !args.hwnd) {
+                    if (/\.exe$/i.test(cleanTarget)) args.processName = cleanTarget;
+                    else args.windowTitle = cleanTarget;
+                }
+                return args;
+            }
+
+            // (d) ScrollAt
+            if (/滚动|滚轮|向上滚|向下滚|往上滚|往下滚|scrollat/i.test(actionSignal)) {
+                args.command = 'ScrollAt';
+                args.direction = /上|up/i.test(`${actionSignal} ${joinedConstraints}`) ? 'up' : 'down';
+                const amountMatch = `${actionSignal} ${joinedConstraints} ${payloadText}`.match(/(\d+)\s*(?:格|次|行|刻度)/);
+                if (amountMatch) args.amount = amountMatch[1];
+                if (parsedCoord) {
+                    args.x = parsedCoord.x;
+                    args.y = parsedCoord.y;
+                }
+                return args;
+            }
+
+            // (e) TypeText
+            if (/^(?:输入|打字|键入|写入文本|typetext)/i.test(primaryList[0] || '') || /输入|打字|键入|typetext/i.test(wrapperText)) {
+                args.command = 'TypeText';
+                const textToType = primaryList.length >= 2
+                    ? payloadText
+                    : (primaryList[0] || '').replace(/^(?:输入|打字|键入|写入文本|typetext)\s*[:：]?\s*/i, '');
+                if (!textToType) throw new Error('文本输入需要在【】中提供要输入的文本内容。');
+                args.text = textToType;
+                if (/回车|enter/i.test(joinedConstraints) || /并回车|按回车/i.test(wrapperText)) {
+                    args.enter = 'true';
+                }
+                return args;
+            }
+
+            // (f) WaitForText / WaitForElement / WaitForDisappear
+            if (/等待文字|等待文本|等待元素|等待出现|等待消失|waitfor/i.test(actionSignal)) {
+                const target = primaryList.length >= 2
+                    ? payloadText
+                    : (primaryList[0] || '').replace(/^(?:等待文字|等待文本|等待元素|等待出现|等待消失|等待)\s*[:：]?\s*/i, '').trim();
+                const isDisappear = /消失|disappear/i.test(`${actionSignal} ${joinedConstraints}`);
+                const useUia = /uia|元素|控件/i.test(`${actionSignal} ${joinedConstraints}`) || Boolean(args.controlType || args.automationId || args.elementId);
+                if (isDisappear) {
+                    args.command = 'WaitForDisappear';
+                    if (useUia) {
+                        if (target && !args.name) args.name = target;
+                    } else {
+                        args.text = target;
+                        args.ocr = 'true';
+                    }
+                } else if (useUia) {
+                    args.command = 'WaitForElement';
+                    if (target && !args.name) args.name = target;
+                } else {
+                    args.command = 'WaitForText';
+                    args.text = target;
+                }
+                return args;
+            }
+
+            // (g) ClickAt (坐标点击)
+            const targetClean = (primaryList.length >= 2
+                ? payloadText
+                : (primaryList[0] || '').replace(/^(?:点击|单击|双击|右键点击|右键|调用|触发|切换|勾选|展开|折叠|选择|聚焦|click|interact)\s*[:：]?\s*/i, '')
+            ).trim();
+
+            if (parsedCoord && (!targetClean || /^(?:坐标|位置|此处|这里)$/i.test(targetClean))) {
+                args.command = 'ClickAt';
+                args.x = parsedCoord.x;
+                args.y = parsedCoord.y;
+                return args;
+            }
+
+            // (h) 显式视觉点击 ClickVisual
+            if (/^(?:视觉|图生图|涂色|视觉点击|clickvisual)$/i.test(constraints.find(c => /视觉|图生图|涂色|clickvisual/i.test(c)) || '')
+                || /视觉点击|clickvisual/i.test(actionSignal)) {
+                args.command = 'ClickVisual';
+                args.description = targetClean || main;
+                return args;
+            }
+
+            // (i) 显式 OCR 点击 ClickText
+            if (constraints.some(c => /^(?:ocr|ocr点击|文字点击|文本点击|clicktext)$/i.test(c))
+                || /ocr点击|文字点击|clicktext/i.test(actionSignal)) {
+                args.command = 'ClickText';
+                args.text = targetClean || main;
+                const matchMode = this._extractDesktopPrefixedValue(constraints, ['匹配', '模式', 'matchmode']);
+                if (matchMode) args.matchMode = matchMode;
+                return args;
+            }
+
+            // (j) 显式 UIAction
+            if (constraints.some(c => /^(?:uia|uiaction)$/i.test(c)) || /uiaction/i.test(actionSignal)) {
+                args.command = 'UIAction';
+                if (targetClean && !args.name) args.name = targetClean;
+                args.action = this._resolveDesktopInteractAction(actionSignal, joinedConstraints);
+                return args;
+            }
+
+            // (k) 默认统一语义交互 Interact (UIA -> OCR -> 视觉自动降级)
+            args.command = 'Interact';
+            args.action = this._resolveDesktopInteractAction(actionSignal, joinedConstraints);
+            if (targetClean) {
+                if (!args.name) args.name = targetClean;
+                if (!args.text) args.text = targetClean;
+            }
+            return args;
+        }
+
+        throw new Error(`JEV 尚未实现桌面操控工具模板 "${toolKey}"。`);
+    }
+
+    _resolveDesktopInteractAction(actionSignal, joinedConstraints) {
+        const combined = `${actionSignal} ${joinedConstraints}`;
+        if (/展开|expand/i.test(combined)) return 'expand';
+        if (/折叠|收起|collapse/i.test(combined)) return 'collapse';
+        if (/勾选|切换|开关|toggle/i.test(combined)) return 'toggle';
+        if (/选择|选中|select/i.test(combined)) return 'select';
+        if (/聚焦|焦点|focus/i.test(combined)) return 'focus';
+        if (/调用|invoke/i.test(combined)) return 'invoke';
+        return 'click';
+    }
+
     async _buildImageArgs(toolKey, tool, parsed) {
         const prompt = parsed.primary.join('\n');
         const images = parsed.imageUrls;
@@ -880,7 +1216,16 @@ class JevToolCallExp {
         //    [] 中的自由文本（台词、说明）绝不参与子串匹配，只交给 text 参数原样搬运；
         // 3. 锚点之外的自然语言动作词（如“打开”“查询”）：兜底。
         const primaryText = normalizeAlias(parsed.primary.join(' '));
-        const constraintTags = new Set(parsed.constraints.map(normalizeAlias).filter(Boolean));
+        const constraintTags = new Set();
+        for (const raw of parsed.constraints) {
+            const normalized = normalizeAlias(raw);
+            if (normalized) constraintTags.add(normalized);
+            const colonIndex = raw.search(/[:：]/);
+            if (colonIndex > 0 && colonIndex < raw.length - 1) {
+                const afterColon = normalizeAlias(raw.slice(colonIndex + 1));
+                if (afterColon) constraintTags.add(afterColon);
+            }
+        }
         const wrapperText = normalizeAlias(parsed.raw
             .replace(/【[\s\S]*?】/g, ' ')
             .replace(/\[[\s\S]*?\]/g, ' ')
@@ -1030,7 +1375,15 @@ class JevToolCallExp {
     _markExactConstraints(constraints, aliases, consumed) {
         const targets = new Set(aliases.map(normalizeAlias).filter(Boolean));
         constraints.forEach((value, index) => {
-            if (targets.has(normalizeAlias(value))) consumed.add(index);
+            if (targets.has(normalizeAlias(value))) {
+                consumed.add(index);
+                return;
+            }
+            const colonIndex = value.search(/[:：]/);
+            if (colonIndex > 0 && colonIndex < value.length - 1) {
+                const afterColon = normalizeAlias(value.slice(colonIndex + 1));
+                if (targets.has(afterColon)) consumed.add(index);
+            }
         });
     }
 
@@ -1130,9 +1483,13 @@ class JevToolCallExp {
             args[name] = value;
         };
         for (const [name, param] of textParams) {
-            if (param.source === 'primary') assignText(name, param, parsed.primary.join('\n'));
-            else if (param.source === 'url') assignText(name, param, parsed.imageUrls[0]);
-            else if (param.prefixes.length > 0) {
+            if (param.source === 'primary') {
+                const textVal = parsed.primary.length > 0 ? parsed.primary.join('\n') : (parsed.imageUrls[0] || '');
+                assignText(name, param, textVal);
+            } else if (param.source === 'url') {
+                const urlVal = parsed.imageUrls[0] || (IMAGE_URL_RE.test(parsed.primary[0] || '') ? parsed.primary[0] : '');
+                assignText(name, param, urlVal);
+            } else if (param.prefixes.length > 0) {
                 assignText(name, param, this._takePrefixedConstraint(constraints, param.prefixes, consumed));
             }
         }
@@ -1140,11 +1497,22 @@ class JevToolCallExp {
         if (freeText) {
             const remaining = constraints.filter((_, index) => !consumed.has(index));
             if (remaining.length > 0) assignText(freeText[0], freeText[1], remaining.join('\n'));
+        } else {
+            // 单槽位余量回退：仅当命令总共只声明了 1 个 source=constraints 的文本参数且尚未赋值，同时未消费约束恰好剩 1 个时，自动绑定
+            const allConstraintTextParams = textParams.filter(([, param]) => param.source === 'constraints');
+            if (allConstraintTextParams.length === 1) {
+                const [singleName, singleParam] = allConstraintTextParams[0];
+                const remainingUnconsumed = constraints.filter((_, index) => !consumed.has(index));
+                if ((args[singleName] === undefined || args[singleName] === '') && remainingUnconsumed.length === 1) {
+                    assignText(singleName, singleParam, remainingUnconsumed[0]);
+                }
+            }
         }
 
         for (const [name, param] of paramEntries) {
             if (param.required && (args[name] === undefined || args[name] === '')) {
-                throw new Error(`工具 "${entry.toolName}" 命令 ${command.commandIdentifier} 缺少必填参数 ${name}。`);
+                const hint = param.source === 'primary' ? '，请使用【主要内容】提供。' : '。';
+                throw new Error(`工具 "${entry.toolName}" 命令 ${command.commandIdentifier} 缺少必填参数 ${name}${hint}`);
             }
         }
         return args;

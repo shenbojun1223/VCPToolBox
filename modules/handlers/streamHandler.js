@@ -10,6 +10,7 @@ const {
   shouldConvertReasoningForModel
 } = require('../reasoningContentAdapter.js');
 const { createRollKeeper } = require('../vcpLoop/rollKeeper');
+const { inspectToolBlockClosure } = require('../vcpLoop/historySanitizer');
 
 // 读取软预算配置：缺失/空白/非法/非正数一律视为禁用 token 黄灯（0），绝不让请求抛错。
 function readSoftTokenBudgetEnv() {
@@ -62,6 +63,7 @@ class StreamHandler {
       shouldProcessMediaPlus,
       isTextOnlyForceTranslateModel,
       requestPreprocessorConfig,
+      openCodeGoSessionHeader,
       reasoningToContentEnabled: reasoningToContentGloballyEnabled,
       reasoningToContentTag,
       reasoningToContentModels
@@ -89,7 +91,53 @@ class StreamHandler {
     let chatLogs = [];
     let oneRingAssistantTurnParts = [];
     let validUpstreamTurns = true;
+    let lastUpstreamFinishReason = null;
+    let lastUpstreamError = null;
     let completed = false;
+
+    const finalUpstreamFinishReason = () => validUpstreamTurns ? 'stop'
+      : (lastUpstreamFinishReason && lastUpstreamFinishReason !== 'stop' ? lastUpstreamFinishReason : null);
+
+    const formatStreamUpstreamErrorNotice = (errObj) => {
+      if (!errObj) return null;
+      const safeClean = (val, maxLen = 160) => String(val ?? '')
+        .replace(/[\u0000-\u001f\u007f<>]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, maxLen);
+      if (typeof errObj === 'string') {
+        const msg = safeClean(errObj);
+        return msg ? `\n\n[上游返回错误：${msg}]` : '\n\n[上游返回错误；请检查渠道状态或配额后重试。]';
+      }
+      if (typeof errObj === 'object') {
+        const rawCode = typeof errObj.code === 'string' && /^[A-Za-z0-9._:-]{1,64}$/.test(errObj.code)
+          ? errObj.code
+          : (typeof errObj.type === 'string' && /^[A-Za-z0-9._:-]{1,64}$/.test(errObj.type) ? errObj.type : null);
+        const rawMsg = typeof errObj.message === 'string' ? safeClean(errObj.message) : '';
+        if (rawCode === 'limit_error_upstream') {
+          return `\n\n[上游返回错误 (${rawCode})：Claude 官方订阅配额已达当前窗口上限${rawMsg ? ` (${rawMsg})` : ''}。请等待窗口重置或切换模型渠道，无需发送“继续”。]`;
+        }
+        if (rawCode && rawMsg) return `\n\n[上游返回错误 (${rawCode})：${rawMsg}]`;
+        if (rawCode) return `\n\n[上游返回错误 (${rawCode})；请检查渠道状态后重试。]`;
+        if (rawMsg) return `\n\n[上游返回错误：${rawMsg}]`;
+      }
+      return '\n\n[上游返回错误；请检查渠道状态或配额后重试。]';
+    };
+
+    const writeIncompleteUpstreamNotice = () => {
+      if (validUpstreamTurns || finalUpstreamFinishReason() || res.writableEnded || res.destroyed) return;
+      const explicitErrorNotice = formatStreamUpstreamErrorNotice(lastUpstreamError);
+      const noticeText = explicitErrorNotice || '\n\n[上游响应未完整结束；本次回复可能不完整。请重试或发送“继续”。]';
+      const statusCode = explicitErrorNotice ? 'UPSTREAM_STREAM_ERROR' : 'UPSTREAM_STREAM_INCOMPLETE';
+      res.write(`data: ${JSON.stringify({
+        id: `chatcmpl-VCP-upstream-incomplete-${Date.now()}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: originalBody.model,
+        choices: [{ index: 0, delta: { content: noticeText }, finish_reason: null }],
+        vcp_status: { code: statusCode }
+      })}\n\n`);
+    };
 
     const containsImageUrlPart = (content) => Array.isArray(content) &&
       content.some(part => part?.type === 'image_url' && part.image_url && typeof part.image_url.url === 'string');
@@ -159,16 +207,22 @@ class StreamHandler {
         let finishReason = null;
         let sawDone = false;
         let invalidPayload = false;
+        let streamError = null;
         let upstreamEnded = false;
         const result = () => ({
           content: collectedContentThisTurn,
           message,
+          finishReason,
+          streamError,
           completed: !streamAborted && !invalidPayload && aiResponse.ok &&
             collectedContentThisTurn.trim().length > 0 &&
             (finishReason === 'stop' || (!finishReason && sawDone))
         });
         const observePayload = (parsedData) => {
-          if (parsedData?.error) invalidPayload = true;
+          if (parsedData?.error) {
+            invalidPayload = true;
+            streamError = parsedData.error;
+          }
           const reason = parsedData?.choices?.[0]?.finish_reason;
           if (reason) finishReason = reason;
         };
@@ -344,8 +398,15 @@ class StreamHandler {
               try {
                 if (isDoneLine) {
                   writeClientReasoningCloseChunk();
-                } else if (reasoningToContentEnabled && parsedData) {
-                  const transformedData = transformParsedDataForClient(parsedData);
+                } else if (parsedData && (reasoningToContentEnabled || parsedData.choices?.some(choice => choice.finish_reason))) {
+                  const transformedData = reasoningToContentEnabled
+                    ? transformParsedDataForClient(parsedData)
+                    : JSON.parse(JSON.stringify(parsedData));
+                  // 上游的一轮已经结束，VCP 的工具循环仍可能继续。
+                  // 客户端只能在整个 VCP 响应结束时看到终止原因。
+                  for (const choice of transformedData.choices || []) {
+                    if (choice.finish_reason) choice.finish_reason = null;
+                  }
                   res.write(`data: ${JSON.stringify(transformedData)}\n`);
                 } else {
                   // 保留空行，因为 SSE 依靠空行分隔消息块。
@@ -390,8 +451,14 @@ class StreamHandler {
               try {
                 if (isDoneLine) {
                   writeClientReasoningCloseChunk();
-                } else if (reasoningToContentEnabled && parsedData) {
-                  res.write(`data: ${JSON.stringify(transformParsedDataForClient(parsedData))}\n`);
+                } else if (parsedData && (reasoningToContentEnabled || parsedData.choices?.some(choice => choice.finish_reason))) {
+                  const transformedData = reasoningToContentEnabled
+                    ? transformParsedDataForClient(parsedData)
+                    : JSON.parse(JSON.stringify(parsedData));
+                  for (const choice of transformedData.choices || []) {
+                    if (choice.finish_reason) choice.finish_reason = null;
+                  }
+                  res.write(`data: ${JSON.stringify(transformedData)}\n`);
                 } else {
                   res.write(sseLineBuffer + '\n');
                 }
@@ -416,6 +483,8 @@ class StreamHandler {
     if (DEBUG_MODE) console.log('[VCP Stream Loop] Processing initial AI call.');
     let initialAIResponseData = await processAIResponseStreamHelper(firstAiAPIResponse, true);
     validUpstreamTurns = initialAIResponseData.completed;
+    lastUpstreamFinishReason = initialAIResponseData.finishReason;
+    if (initialAIResponseData.streamError) lastUpstreamError = initialAIResponseData.streamError;
     currentAIContentForLoop = initialAIResponseData.content;
     if (writeChatLog) chatLogs.push({ request: originalBody, response: initialAIResponseData.message });
     if (currentAIContentForLoop && currentAIContentForLoop.trim()) {
@@ -455,15 +524,31 @@ class StreamHandler {
       const toolCalls = vcpToolUseForbidden ? [] : ToolCallParser.parse(currentAIContentForLoop);
       if (toolCalls.length === 0) {
         if (DEBUG_MODE) console.log('[VCP Stream Loop] No tool calls found. Exiting loop.');
+        const hasUnclosedToolBlock = !vcpToolUseForbidden &&
+          inspectToolBlockClosure(currentAIContentForLoop).hasUnclosed;
         if (!res.writableEnded) {
+          const finalFinishReason = hasUnclosedToolBlock ? null : finalUpstreamFinishReason();
+          const incompleteToolStatus = hasUnclosedToolBlock ? { code: 'VCP_TOOL_BLOCK_INCOMPLETE' } : null;
           const finalChunkPayload = {
-            id: `chatcmpl-VCP-final-stop-${Date.now()}`,
+            id: `chatcmpl-VCP-final-${finalFinishReason}-${Date.now()}`,
             object: 'chat.completion.chunk',
             created: Math.floor(Date.now() / 1000),
             model: originalBody.model,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            choices: [{ index: 0, delta: {}, finish_reason: finalFinishReason }],
           };
+          if (incompleteToolStatus) finalChunkPayload.vcp_status = incompleteToolStatus;
           try {
+            if (hasUnclosedToolBlock) {
+              res.write(`data: ${JSON.stringify({
+                id: `chatcmpl-VCP-tool-block-incomplete-${Date.now()}`,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: originalBody.model,
+                choices: [{ index: 0, delta: { content: '\n\n[模型在工具请求中途停止；该工具没有执行，本次任务尚未完成。请发送“继续”。]' }, finish_reason: null }],
+                vcp_status: incompleteToolStatus
+              })}\n\n`);
+            }
+            if (!hasUnclosedToolBlock) writeIncompleteUpstreamNotice();
             res.write(`data: ${JSON.stringify(finalChunkPayload)}\n\n`);
             res.write('data: [DONE]\n\n', () => res.end());
           } catch (writeError) {
@@ -471,7 +556,7 @@ class StreamHandler {
             if (!res.writableEnded && !res.destroyed) try { res.end(); } catch (e) { }
           }
         }
-        completed = validUpstreamTurns;
+        completed = validUpstreamTurns && !hasUnclosedToolBlock;
         break;
       }
 
@@ -555,6 +640,7 @@ class StreamHandler {
             headers: {
               'Content-Type': 'application/json',
               Authorization: `Bearer ${apiKey}`,
+              ...openCodeGoSessionHeader,
               Accept: 'text/event-stream',
             },
             body: JSON.stringify({ ...originalBody, messages: currentMessagesForLoop, stream: true }),
@@ -567,6 +653,8 @@ class StreamHandler {
         if (nextAiAPIResponse.ok) {
           let nextAIResponseData = await processAIResponseStreamHelper(nextAiAPIResponse, false);
           validUpstreamTurns = validUpstreamTurns && nextAIResponseData.completed;
+          lastUpstreamFinishReason = nextAIResponseData.finishReason;
+          if (nextAIResponseData.streamError) lastUpstreamError = nextAIResponseData.streamError;
           currentAIContentForLoop = nextAIResponseData.content;
           if (currentAIContentForLoop && currentAIContentForLoop.trim()) {
             oneRingAssistantTurnParts.push(currentAIContentForLoop);
@@ -587,10 +675,12 @@ class StreamHandler {
       if (normalCalls.length === 0) {
         if (!res.writableEnded && !res.destroyed) {
           try {
+            const finalFinishReason = finalUpstreamFinishReason();
+            writeIncompleteUpstreamNotice();
             res.write(`data: ${JSON.stringify({
-              id: `chatcmpl-VCP-final-stop-${Date.now()}`,
+              id: `chatcmpl-VCP-final-${finalFinishReason}-${Date.now()}`,
               object: 'chat.completion.chunk',
-              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+              choices: [{ index: 0, delta: {}, finish_reason: finalFinishReason }],
             })}\n\n`);
             res.write('data: [DONE]\n\n', () => {
               try { res.end(); } catch (e) { }
@@ -790,6 +880,7 @@ class StreamHandler {
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${apiKey}`,
+            ...openCodeGoSessionHeader,
             Accept: 'text/event-stream',
           },
           body: JSON.stringify({ ...originalBody, messages: messagesForUpstream, stream: true }),
@@ -802,6 +893,8 @@ class StreamHandler {
 
       let nextAIResponseData = await processAIResponseStreamHelper(nextAiAPIResponse, false);
       validUpstreamTurns = validUpstreamTurns && nextAIResponseData.completed;
+      lastUpstreamFinishReason = nextAIResponseData.finishReason;
+      if (nextAIResponseData.streamError) lastUpstreamError = nextAIResponseData.streamError;
       currentAIContentForLoop = nextAIResponseData.content;
       if (currentAIContentForLoop && currentAIContentForLoop.trim()) {
         oneRingAssistantTurnParts.push(currentAIContentForLoop);
@@ -890,7 +983,7 @@ class StreamHandler {
       }
 
       const hasPendingToolCallsAtLimit = pendingToolCallsAtLimit.length > 0;
-      const finalFinishReason = hasPendingToolCallsAtLimit ? 'length' : 'stop';
+      const finalFinishReason = hasPendingToolCallsAtLimit ? 'length' : finalUpstreamFinishReason();
       const status = hasPendingToolCallsAtLimit ? {
         code: 'VCP_TOOL_LOOP_LIMIT',
         current: recursionDepth,
@@ -899,6 +992,7 @@ class StreamHandler {
       } : null;
 
       try {
+        if (!hasPendingToolCallsAtLimit) writeIncompleteUpstreamNotice();
         if (hasPendingToolCallsAtLimit) {
           const notice = '\n\n> [!WARNING]\n> **VCP 工具循环已暂停**：本轮已达到 ' + maxRecursion + ' 次工具递归上限，最后生成的 ' + pendingToolCallsAtLimit.length + ' 个工具请求尚未执行。任务尚未完成；请发送“继续”恢复。为避免重复副作用，系统不会自动重放。\n';
           const noticePayload = {

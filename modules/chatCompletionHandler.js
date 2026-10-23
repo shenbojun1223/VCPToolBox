@@ -10,6 +10,8 @@ const http = require('http');
 const https = require('https');
 const finalContextStore = require('./finalContextStore.js');
 const { appendBudgetNotice } = require('./softContextBudget.js');
+const { resolveOpenCodeGoSession } = require('./opencodeGoSession.js');
+const { createRequestSourcePrivacyPolicy, SourcePrivacyFallbackError, SourcePrivacyProcessingError } = require('./sourcePrivacyPolicy.js');
 // AICW 内层禁工具消费回执（opt-in，本机控制头）：仅在显式控制头存在时启用，普通请求零影响。
 const { beginVcpToolForbiddenReceipt, emitVcpToolForbiddenReceipt } = require('./vcpToolForbiddenReceipt.js');
 
@@ -44,6 +46,20 @@ function respondVcpToolForbiddenRefusal(res, refusal) {
   return true;
 }
 
+function respondSourcePrivacyFailure(res, error) {
+  if (!res || typeof res.status !== 'function' || typeof res.json !== 'function' ||
+      res.headersSent || res.writableEnded || res.destroyed) return false;
+  res.status(error.status).json({
+    error: {
+      type: error.status === 400 ? 'invalid_request' : 'internal_error',
+      status: error.status,
+      code: error.code,
+      message: error.message
+    }
+  });
+  return true;
+}
+
 function refuseVcpToolForbiddenReceipt(res, binding, code) {
   const refusal = new VcpToolForbiddenRefusal(code);
   emitVcpToolForbiddenReceipt(res, {
@@ -63,6 +79,86 @@ function refuseVcpToolForbiddenReceipt(res, binding, code) {
     res.setHeader('x-aicw-tfr-receipt', 'rejected:' + refusal.receiptCode);
   }
   return refusal;
+}
+
+// AICW request-private single-attempt limit (opt-in, local control header): the ONE
+// legal value is the string "1" and an ABSENT header leaves every ordinary request
+// byte-identical to the frozen path. The control value selects a request-private
+// budget that is occupied at the REAL upstream fetch boundary, so the initial send,
+// an inner fetch retry, a semantic model fallback, a response-read re-send and any
+// later call of the same request share ONE attempt. No credential, no task and no
+// cross-request state is added.
+const SINGLE_ATTEMPT_HEADER = 'x-vcp-single-attempt';
+const SINGLE_ATTEMPT_REFUSAL_MESSAGE = '[VCP_SINGLE_ATTEMPT] the request-private single upstream attempt limit refused this request before model dispatch.';
+const SINGLE_ATTEMPT_CODE_RE = /^vcp_single_attempt_[a-z0-9_]{1,48}$/;
+
+class VcpSingleAttemptRefusal extends Error {
+  constructor(code) {
+    const fixed = typeof code === 'string' && SINGLE_ATTEMPT_CODE_RE.test(code) ? code : 'vcp_single_attempt_control_invalid';
+    super(fixed);
+    this.name = 'VcpSingleAttemptRefusal';
+    this.code = fixed;
+    this.receiptCode = fixed;
+    this.status = 400;
+  }
+}
+
+// The ONE fail-closed writer of this control: fixed code only - the raw control value,
+// the raw body, the model and every credential are never echoed, and the failure is
+// answered before any upstream dispatch.
+function respondVcpSingleAttemptRefusal(res, refusal) {
+  if (!res || typeof res.json !== 'function' || typeof res.setHeader !== 'function') return false;
+  if (res.headersSent || res.writableEnded || res.destroyed) return false;
+  const status = refusal && refusal.status ? refusal.status : 400;
+  res.status(status).json({
+    error: { type: 'upstream_error', status, code: refusal && refusal.code ? refusal.code : 'vcp_single_attempt_control_invalid', message: SINGLE_ATTEMPT_REFUSAL_MESSAGE }
+  });
+  return true;
+}
+
+// A refusal always answers with a fixed code. When the request also carries a VALID
+// tool-forbidden binding, the reserved receipt namespace is force-overwritten with the
+// same refusal token; the TFR protocol itself (control shape, receipt fields) is never
+// touched or extended.
+function refuseVcpSingleAttempt(res, binding, code) {
+  const refusal = new VcpSingleAttemptRefusal(code);
+  if (binding && binding.active === true) {
+    refuseVcpToolForbiddenReceipt(res, binding, refusal.receiptCode);
+  }
+  return refusal;
+}
+
+// Presence and value of the ONE reserved control key. A header map spelling the same
+// reserved key under more than one case-variant name is ambiguous and refused, and a
+// present value that is not the exact string "1" is refused by type/value instead of
+// being coerced. Only "no own entry at all" means the mechanism is off.
+function readSingleAttemptControlHeader(req) {
+  if (!req || typeof req.headers !== 'object' || req.headers === null || Array.isArray(req.headers)) {
+    return { present: false, ambiguous: false, value: null };
+  }
+  let present = false;
+  let ambiguous = false;
+  let value = null;
+  for (const [name, entry] of Object.entries(req.headers)) {
+    if (String(name).toLowerCase() !== SINGLE_ATTEMPT_HEADER) continue;
+    if (present) { ambiguous = true; break; }
+    present = true;
+    value = entry;
+  }
+  return { present, ambiguous, value };
+}
+
+// The ONE request-private budget. It is occupied once per REAL upstream attempt and is
+// never refunded on a network error, an HTTP failure, a body error or a cancel, never
+// recreated for a later call of the same request and never shared between requests.
+function createSingleAttemptBudget() {
+  let consumed = false;
+  return {
+    consume() {
+      if (consumed) throw new VcpSingleAttemptRefusal('vcp_single_attempt_exhausted');
+      consumed = true;
+    }
+  };
 }
 
 // 多模态配置真相源（JSON 优先 + 热更新），用于在请求时动态拉取 MultiModalForceTranslateModels
@@ -484,7 +580,7 @@ function readDispatchedModel(options) {
 async function fetchWithRetry(
   url,
   options,
-  { retries = 3, delay = 1000, debugMode = false, onRetry = null, onRequestSent = null, onResponseHeaders = null, connectionTimeout = 900000, modelFallbackCandidates = null, phase = 'initial', onModelDispatched = null } = {},
+  { retries = 3, delay = 1000, debugMode = false, onRetry = null, onRequestSent = null, onResponseHeaders = null, connectionTimeout = 900000, modelFallbackCandidates = null, phase = 'initial', onModelDispatched = null, attemptBudget = null, redirect = null } = {},
 ) {
   const { default: fetch } = await import('node-fetch');
   const maxAttempts = Math.max(
@@ -494,6 +590,12 @@ async function fetchWithRetry(
   const externalSignal = options.signal;
   for (let i = 0; i < maxAttempts; i++) {
     throwIfAborted(externalSignal);
+    // The request-private budget is occupied at the REAL fetch boundary: before any
+    // attempt wiring and deliberately OUTSIDE the network-error catch, so a refusal can
+    // never be reclassified as a transport failure and never leaks a listener. A cancel
+    // before the first dispatch therefore occupies nothing, and an attempt that already
+    // left this process is never refunded and never repeated.
+    if (attemptBudget && typeof attemptBudget.consume === 'function') attemptBudget.consume();
     const attemptController = new AbortController();
     let didTimeout = false;
     const forwardAbort = () => attemptController.abort();
@@ -510,7 +612,9 @@ async function fetchWithRetry(
       const attemptOptions = applyModelFallbackForAttempt(options, modelFallbackCandidates, i, debugMode);
       attemptModel = readDispatchedModel(attemptOptions);
       try { onRequestSent?.(); } catch (_) { /* observational */ }
-      response = await fetch(url, { ...attemptOptions, agent: getFetchAgent, signal: attemptController.signal });
+      // `redirect` is only ever supplied by the opt-in single-attempt wrapper (which
+      // pins it to "error"); an ordinary request keeps node-fetch default behaviour.
+      response = await fetch(url, { ...attemptOptions, agent: getFetchAgent, signal: attemptController.signal, ...(redirect ? { redirect } : {}) });
     } catch (_) {
       failure = externalSignal?.aborted ? abortError({ phase, attempt: i + 1 })
         : new UpstreamError({ code: didTimeout ? 'upstream_timeout' : 'network_error', phase, attempt: i + 1 });
@@ -744,6 +848,12 @@ class ChatCompletionHandler {
     };
 
     let clientIp = normalizeClientIp(req.ip);
+    const openCodeGoSession = process.env.OpenCodeGoSessionEnabled === 'true'
+      ? resolveOpenCodeGoSession(req, process.env.Key)
+      : null;
+    const openCodeGoSessionHeader = openCodeGoSession
+      ? { 'x-opencode-session': openCodeGoSession }
+      : {};
 
     const requestDiagnostic = req.__vcpDiagnostics;
     if (requestDiagnostic) requestDiagnostic.stage('preprocess_start');
@@ -782,6 +892,44 @@ class ChatCompletionHandler {
       respondVcpToolForbiddenRefusal(res, refusal);
       return;
     }
+    // AICW request-private single-attempt opt-in: only the exact string "1" switches the
+    // mechanism on, and it is accepted only together with a VALID tool-forbidden binding
+    // (which already requires an explicit `stream: false`). Every absent, illegal,
+    // ambiguous or non-matching input is refused with a fixed code BEFORE preprocessing,
+    // tool parsing or model dispatch; the budget itself is created here and stays private
+    // to this one request.
+    const singleAttemptControl = readSingleAttemptControlHeader(req);
+    let singleAttemptBudget = null;
+    if (singleAttemptControl.present) {
+      const singleAttemptControlCode = singleAttemptControl.ambiguous ? 'vcp_single_attempt_control_ambiguous'
+        : typeof singleAttemptControl.value !== 'string' ? 'vcp_single_attempt_control_type'
+        : singleAttemptControl.value !== '1' ? 'vcp_single_attempt_control_value'
+        : null;
+      if (singleAttemptControlCode !== null) {
+        respondVcpSingleAttemptRefusal(res, refuseVcpSingleAttempt(res, vcpToolForbiddenReceipt, singleAttemptControlCode));
+        return;
+      }
+      if (vcpToolForbiddenReceipt === null || vcpToolForbiddenReceipt.valid !== true) {
+        respondVcpSingleAttemptRefusal(res, refuseVcpSingleAttempt(res, vcpToolForbiddenReceipt, 'vcp_single_attempt_requires_tfr'));
+        return;
+      }
+      singleAttemptBudget = createSingleAttemptBudget();
+    }
+
+    // The request-scoped dispatch boundary: in single-attempt mode EVERY upstream send
+    // of THIS request goes through this wrapper, so the one shared budget and the
+    // no-redirect rule also cover the inner fetch retry, the semantic model fallback and
+    // each NonStreamHandler re-send. An ordinary request keeps the exact frozen function.
+    const requestFetchWithRetry = singleAttemptBudget === null
+      ? observedFetchWithRetry
+      : (url, options, retryOptions = {}) => observedFetchWithRetry(url, options, {
+        ...retryOptions,
+        retries: 1,
+        modelFallbackCandidates: null,
+        attemptBudget: singleAttemptBudget,
+        redirect: 'error'
+      });
+
     const vcpchatExtensions = originalBody && typeof originalBody === 'object'
       ? originalBody.vcpchatExtensions
       : null;
@@ -1055,6 +1203,12 @@ class ChatCompletionHandler {
         }
       }
 
+      const sourcePrivacyPolicy = createRequestSourcePrivacyPolicy(
+        originalBody.model,
+        semanticModelFallbackCandidates
+      );
+      requestPreprocessorConfig.sourcePrivacyPolicy = sourcePrivacyPolicy;
+
       // --- 纯文本模型强制翻译多模态 ---
       // 当语义路由 / ModelRedirect 解析后的真实后端模型命中
       // MultiModalForceTranslateModels 列表（不区分大小写、tag 子串匹配）时：
@@ -1082,6 +1236,7 @@ class ChatCompletionHandler {
       // 创建一个包含所有所需依赖的统一上下文
       const processingContext = {
         pluginManager,
+        sourcePrivacyPolicy,
         webSocketServer,
         cachedEmojiLists: this.config.cachedEmojiLists,
         detectors: this.config.detectors,
@@ -1188,8 +1343,16 @@ class ChatCompletionHandler {
             requestPreprocessorConfig
           );
         } catch (pluginError) {
+          if (sourcePrivacyPolicy.enabled && name === 'OneRing') {
+            sourcePrivacyPolicy.state.oneRing = 'failed';
+            throw new SourcePrivacyProcessingError();
+          }
           console.error(`[Server] Error in preprocessor ${name}:`, pluginError);
         }
+      }
+      if (sourcePrivacyPolicy.enabled && pluginManager.messagePreprocessors?.has?.('OneRing') &&
+          sourcePrivacyPolicy.state.oneRing !== 'complete') {
+        throw new SourcePrivacyProcessingError();
       }
       if (DEBUG_MODE) await writeDebugLog('LogAfterPreprocessors', processedMessages);
 
@@ -1305,13 +1468,14 @@ class ChatCompletionHandler {
 
       if (requestDiagnostic) requestDiagnostic.stage('preprocess_end');
 
-      let firstAiAPIResponse = await observedFetchWithRetry(
+      let firstAiAPIResponse = await requestFetchWithRetry(
         `${apiUrl}/v1/chat/completions`,
         {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${apiKey}`,
+            ...openCodeGoSessionHeader,
             ...(req.headers['user-agent'] && { 'User-Agent': req.headers['user-agent'] }),
             Accept: willStreamResponse ? 'text/event-stream' : req.headers['accept'] || 'application/json',
           },
@@ -1385,7 +1549,7 @@ class ChatCompletionHandler {
         clientIp,
         forceShowVCP,
         _refreshRagBlocksIfNeeded,
-        fetchWithRetry: observedFetchWithRetry,
+        fetchWithRetry: requestFetchWithRetry,
         isToolResultError,
         formatToolResult,
         vcpToolUseForbidden,
@@ -1396,7 +1560,8 @@ class ChatCompletionHandler {
         shouldProcessMedia,
         shouldProcessMediaPlus,
         isTextOnlyForceTranslateModel,
-        requestPreprocessorConfig
+        requestPreprocessorConfig,
+        openCodeGoSessionHeader
       };
 
       const outcome = isUpstreamStreaming
@@ -1405,10 +1570,23 @@ class ChatCompletionHandler {
       interactionOutcomeAccepted = true;
       interactionCompletion.accept(outcome);
     } catch (error) {
+      if (error instanceof SourcePrivacyFallbackError || error instanceof SourcePrivacyProcessingError) {
+        respondSourcePrivacyFailure(res, error);
+        return;
+      }
       // Explicit opt-in refusal: fixed code only, answered BEFORE the generic failure
       // path so the reserved receipt namespace and the HTTP status stay exact.
       if (error instanceof VcpToolForbiddenRefusal) {
         respondVcpToolForbiddenRefusal(res, error);
+        return;
+      }
+      // Request-private single-attempt refusal (fixed code only): answered before the
+      // generic failure path so the HTTP status and the reserved receipt namespace stay
+      // exact - a valid TFR binding keeps the already forced `rejected:<code>` token and
+      // a TFR-less request never grows a receipt header it did not opt into.
+      if (error instanceof VcpSingleAttemptRefusal) {
+        refuseVcpSingleAttempt(res, vcpToolForbiddenReceipt, error.code);
+        respondVcpSingleAttemptRefusal(res, error);
         return;
       }
       if (error.name === 'AbortError') {
