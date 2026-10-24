@@ -286,6 +286,56 @@ async function withEnv(name, value, run) {
   }
 }
 
+// Signature replay requires unchanged assistant text and stable history positions.
+for (const streaming of [false, true]) {
+  for (const scenario of ['normal', 'depth', 'token', 'archery_depth']) {
+    test(`signature replay: ${streaming ? 'stream' : 'nonstream'} ${scenario} keeps assistant turns intact`, async () => {
+      await withEnv('VCP_CONTEXT_SOFT_BUDGET', scenario === 'token' ? '1' : '0', async () => {
+        const archery = scenario === 'archery_depth';
+        const format = text => archery
+          ? text.replace('path:', 'archery:「始」true「末」\npath:') : text;
+        const firstText = format(toolCallText()) + '\r\n ';
+        // Preserve intentional whitespace too: removing all leading newlines is not a fix.
+        const secondText = '\n' + format(toolCallText().replace('a.txt', 'b.txt')) + '  ';
+        const response = streaming ? streamResponse : nonStreamResponse;
+        const { requests, fetchFn } = makeCapturingFetch(i => response(i === 1 ? secondText : PLAIN_TEXT));
+        const initial = [{ role: 'user', content: 'synthetic signature replay fixture' }];
+        const executor = makeExecutor({ success: !archery, rawError: archery ? 'fixture_failure' : null });
+        const limit = scenario.includes('depth') ? 3 : 40;
+        const context = baseContext({
+          originalBody: { model: 'offline-model', messages: initial, stream: streaming },
+          maxVCPLoopStream: limit, maxVCPLoopNonStream: limit,
+          toolExecutor: executor, fetchWithRetry: fetchFn
+        });
+        const res = streaming ? createStreamRes() : createNonStreamRes();
+        const Handler = streaming ? StreamHandler : NonStreamHandler;
+        await new Handler(context).handle({}, res, response(firstText));
+        assert.equal(executor.executed.length, 2);
+        assert.equal(requests.length, 2);
+        assert.deepEqual(requests[0].messages.slice(0, initial.length), initial);
+        assert.deepEqual(requests[0].messages[initial.length], { role: 'assistant', content: firstText },
+          'a new reminder must not occupy the cached position of the assistant turn');
+        assert.deepEqual(requests[1].messages.slice(0, requests[0].messages.length), requests[0].messages,
+          'the next continuation must preserve the previously transmitted history prefix');
+        assert.deepEqual(requests[1].messages.filter(m => m.role === 'assistant').map(m => m.content),
+          [firstText, secondText], 'continuation text must match upstream text exactly');
+        if (scenario !== 'normal') {
+          const marker = scenario === 'token' ? TOKEN_YELLOW_MARKER : DEPTH_YELLOW_MARKER;
+          assert.equal(countMarker(requests[0], marker), 1);
+          assert.equal(countMarker(requests[1], marker), 1);
+          assert.equal(requests[0].messages[initial.length + 1].role, 'system');
+          assert.ok(requests[0].messages[initial.length + 1].content.includes(marker));
+        }
+        if (!streaming) {
+          const client = JSON.parse(res.sent[0].toString());
+          assert.ok(client.choices[0].message.content.includes('\n' + secondText),
+            'client formatting keeps its display separator');
+        }
+      });
+    });
+  }
+}
+
 // —— 用例 ——
 
 test('流式：连续同指纹失败后硬暂停，后续工具不派发，回执 VCP_TOOL_LOOP_STUCK，DONE/end 各一次', async () => {

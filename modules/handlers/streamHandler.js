@@ -505,10 +505,6 @@ class StreamHandler {
         stuckHalt = rollInjection;
         break;
       }
-      if (rollInjection && rollInjection.kind && rollInjection.content) {
-        currentMessagesForLoop.push({ role: 'system', content: rollInjection.content });
-      }
-
       let assistantMessages = [{ role: 'assistant', content: currentAIContentForLoop }];
       if (enableRoleDivider && enableRoleDividerInLoop) {
         assistantMessages = roleDivider.process(assistantMessages, {
@@ -520,6 +516,10 @@ class StreamHandler {
         });
       }
       currentMessagesForLoop.push(...assistantMessages);
+      // Append reminders after the response so signature replay retains its history position.
+      if (rollInjection && rollInjection.kind && rollInjection.content) {
+        currentMessagesForLoop.push({ role: 'system', content: rollInjection.content });
+      }
 
       const toolCalls = vcpToolUseForbidden ? [] : ToolCallParser.parse(currentAIContentForLoop);
       if (toolCalls.length === 0) {

@@ -352,10 +352,6 @@ class NonStreamHandler {
         stuckHalt = rollInjection;
         break;
       }
-      if (rollInjection && rollInjection.kind && rollInjection.content) {
-        currentMessagesForNonStreamLoop.push({ role: 'system', content: rollInjection.content });
-      }
-
       let anyToolProcessedInCurrentIteration = false;
       conversationHistoryForClient.push(currentAIContentForClient);
 
@@ -408,6 +404,10 @@ class NonStreamHandler {
             });
           }
           currentMessagesForNonStreamLoop.push(...assistantMessages);
+          // Keep the response at its original position for upstream signature replay.
+          if (rollInjection && rollInjection.kind && rollInjection.content) {
+            currentMessagesForNonStreamLoop.push({ role: 'system', content: rollInjection.content });
+          }
 
           const errorPayload = `<!-- VCP_TOOL_PAYLOAD -->\n${JSON.stringify(archeryErrorContents)}`;
           const { truncateToolPayload: truncateErrPayload } = require('../vcpLoop/toolPayloadTruncator.js');
@@ -445,10 +445,10 @@ class NonStreamHandler {
             const recursionParsedResponse = extractedResponse(recursionText);
             const recursionMessage = recursionParsedResponse.message;
             if (recursionMessage) {
-              currentAIContentForLoop = '\n' + extractVisibleContent(recursionMessage);
+              currentAIContentForLoop = extractVisibleContent(recursionMessage);
               currentAIContentForClient = '\n' + extractClientContent(recursionMessage, '', recursionParsedResponse.choice);
             } else {
-              currentAIContentForLoop = '\n' + recursionText;
+              currentAIContentForLoop = recursionText;
               currentAIContentForClient = '\n' + recursionText;
             }
             if (currentAIContentForLoop && currentAIContentForLoop.trim()) {
@@ -484,6 +484,10 @@ class NonStreamHandler {
           });
         }
         currentMessagesForNonStreamLoop.push(...assistantMessages);
+        // Keep the response at its original position for upstream signature replay.
+        if (rollInjection && rollInjection.kind && rollInjection.content) {
+          currentMessagesForNonStreamLoop.push({ role: 'system', content: rollInjection.content });
+        }
 
         const toolResults = await toolExecutor.executeAll(normalCalls, clientIp, currentMessagesForNonStreamLoop);
         for (let i = 0; i < normalCalls.length; i++) {
@@ -648,10 +652,11 @@ class NonStreamHandler {
         const recursionParsedResponse = extractedResponse(recursionText);
         const recursionMessage = recursionParsedResponse.message;
         if (recursionMessage) {
-          currentAIContentForLoop = '\n' + extractVisibleContent(recursionMessage);
+          // Display separators belong only to client output, never replayed model text.
+          currentAIContentForLoop = extractVisibleContent(recursionMessage);
           currentAIContentForClient = '\n' + extractClientContent(recursionMessage, '', recursionParsedResponse.choice);
         } else {
-          currentAIContentForLoop = '\n' + recursionText;
+          currentAIContentForLoop = recursionText;
           currentAIContentForClient = '\n' + recursionText;
         }
         if (currentAIContentForLoop && currentAIContentForLoop.trim()) {
