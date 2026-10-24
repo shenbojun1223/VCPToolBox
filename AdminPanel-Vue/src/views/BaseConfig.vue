@@ -206,7 +206,7 @@ import UiTextarea from '@/components/ui/UiTextarea.vue'
 import {
   showMessage,
   parseEnvToList,
-  serializeEnvAssignment,
+  serializeEnvEntries,
   inferEnvValueType,
   isSensitiveConfigKey,
   type EnvEntry,
@@ -221,6 +221,7 @@ interface ConfigEntry extends EnvEntry {
   sectionTitle: string
   groupDescription: string
   commentText: string
+  originalValue?: string
 }
 
 interface ConfigSection {
@@ -966,6 +967,7 @@ async function loadConfig() {
             commentText: '',
           }),
       ...entry,
+      originalValue: entry.isCommentOrEmpty ? undefined : entry.value,
       value: normalizeValue(
         entry.value,
         entry.isCommentOrEmpty ? 'string' : inferEnvValueType(entry.key, entry.value)
@@ -982,8 +984,18 @@ async function loadConfig() {
 }
 
 async function handleSubmit() {
-  const newConfigString = buildEnvStringForEntries(configEntries.value)
-  
+  let newConfigString: string
+
+  try {
+    newConfigString = buildEnvStringForEntries(configEntries.value)
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    statusMessage.value = `保存失败：${errorMessage}`
+    statusType.value = 'error'
+    showMessage(`保存失败：${errorMessage}`, 'error')
+    return
+  }
+
   try {
     await adminConfigApi.saveMainConfig(newConfigString, {
       loadingKey: 'base-config.save'
@@ -996,33 +1008,12 @@ async function handleSubmit() {
     const errorMessage = error instanceof Error ? error.message : String(error)
     statusMessage.value = `保存失败：${errorMessage}`
     statusType.value = 'error'
+    showMessage(`保存失败：${errorMessage}`, 'error')
   }
 }
 
 function buildEnvStringForEntries(entries: ConfigEntry[]): string {
-  return entries.map((entry) => {
-    if (entry.isCommentOrEmpty) {
-      return String(entry.value ?? '')
-    }
-
-    let value = String(entry.value ?? '')
-
-    if (entry.type === 'boolean') {
-      value = entry.value === 'true' ? 'true' : 'false'
-    }
-
-    if (entry.type === 'integer') {
-      const raw = String(entry.value ?? '').trim()
-      if (raw === '') {
-        value = ''
-      } else {
-        const parsed = Number.parseInt(raw, 10)
-        value = Number.isNaN(parsed) ? raw : String(parsed)
-      }
-    }
-
-    return serializeEnvAssignment(entry.key!, value)
-  }).join('\n')
+  return serializeEnvEntries(entries)
 }
 
 watch(

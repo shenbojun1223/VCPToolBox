@@ -27,10 +27,16 @@ export {
   inferEnvValueType,
   parseEnvToList,
   serializeEnvAssignment,
+  serializeEnvEntry,
+  serializeEnvEntries,
+  assertEnvEntriesStructured,
   serializeEnvValue,
   castEnvValue,
   isSensitiveConfigKey,
+  EnvSerializationError,
   type EnvEntry,
+  type EnvSerializableEntry,
+  type EnvSerializationErrorCode,
 } from "./env";
 
 // 主配置合并工具

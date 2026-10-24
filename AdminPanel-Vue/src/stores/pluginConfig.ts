@@ -4,12 +4,14 @@ import { pluginApi } from '@/api'
 import { askConfirm, askInput } from '@/platform/feedback/feedbackBus'
 import { useAppStore } from '@/stores/app'
 import type { PluginInfo, PluginInvocationCommand } from '@/types/api.plugin'
-import { 
-  parseEnvToList, 
-  serializeEnvAssignment, 
+import {
+  parseEnvToList,
+  serializeEnvEntries,
+  assertEnvEntriesStructured,
   showMessage,
   castEnvValue,
-  isSensitiveConfigKey
+  isSensitiveConfigKey,
+  inferEnvValueType
 } from '@/utils'
 
 export type ConfigValue = string | boolean | number | null
@@ -20,6 +22,11 @@ export interface ConfigEntry {
   isCommentOrEmpty: boolean
   isMultilineQuoted: boolean
   type: 'string' | 'boolean' | 'integer'
+  originalValue?: string
+  inlineComment?: string
+  parseError?: string
+  duplicateKey?: boolean
+  originalLineNumStart?: number
 }
 
 export type InvocationCommand = PluginInvocationCommand
@@ -57,14 +64,18 @@ export const usePluginConfigStore = defineStore('plugin-config', () => {
       const existing = configEntries.value.find((entry) => !entry.isCommentOrEmpty && entry.key === key)
       const expectedType = normalizeSchemaType(schema[key])
       const fallback = defaults[key] ?? ''
-      const rawValue = existing ? String(existing.value ?? '') : fallback
+      const rawValue = existing
+        ? (existing.originalValue ?? String(existing.value ?? ''))
+        : String(fallback)
 
       return {
         key,
         value: castEnvValue(rawValue, expectedType),
         isCommentOrEmpty: false,
         isMultilineQuoted: existing?.isMultilineQuoted ?? String(rawValue).includes('\n'),
-        type: expectedType
+        type: expectedType,
+        originalValue: existing ? rawValue : undefined,
+        inlineComment: existing?.inlineComment
       } as ConfigEntry
     })
   })
@@ -115,30 +126,7 @@ export const usePluginConfigStore = defineStore('plugin-config', () => {
   }
 
   function inferInputType(key: string | null, value: string): ConfigEntry['type'] {
-    // 如果是敏感字段（Token/Key等），强制设为字符串，防止被误判为整数
-    if (key && isSensitiveConfigKey(key)) return 'string'
-
-    if (/^(true|false)$/i.test(value)) {
-      return 'boolean'
-    }
-    if (!Number.isNaN(Number.parseFloat(value)) && Number.isFinite(Number.parseFloat(value)) && !value.includes('.')) {
-      return 'integer'
-    }
-    return 'string'
-  }
-
-  function serializeConfigEntry(entry: ConfigEntry): string {
-    const raw = entry.value
-    let value = String(raw ?? '')
-
-    if (entry.type === 'boolean') {
-      value = raw ? 'true' : 'false'
-    } else if (entry.type === 'integer') {
-      const parsed = Number.parseInt(String(raw), 10)
-      value = Number.isNaN(parsed) ? '' : String(parsed)
-    }
-
-    return serializeEnvAssignment(entry.key!, value)
+    return inferEnvValueType(key, value)
   }
 
   function isKeyInSchema(key: string): boolean {
@@ -231,6 +219,7 @@ export const usePluginConfigStore = defineStore('plugin-config', () => {
         return {
           ...entry,
           type: inferredType,
+          originalValue: entry.isCommentOrEmpty || !entry.key ? undefined : entry.value,
           value: entry.isCommentOrEmpty || !entry.key ? entry.value : castEnvValue(entry.value, inferredType)
         }
       })
@@ -353,48 +342,60 @@ export const usePluginConfigStore = defineStore('plugin-config', () => {
   }
 
   async function savePluginConfig(pluginName: string) {
-    const allEntriesMap = new Map<string, ConfigEntry>()
+    let configString: string
 
-    schemaEntries.value.forEach((entry) => {
-      if (entry.key) {
-        allEntriesMap.set(entry.key, entry)
-      }
-    })
+    try {
+      assertEnvEntriesStructured(configEntries.value)
 
-    customEntries.value.forEach((entry) => {
-      if (!entry.isCommentOrEmpty && entry.key) {
-        allEntriesMap.set(entry.key, entry)
-      }
-    })
+      const allEntriesMap = new Map<string, ConfigEntry>()
 
-    const remainingKeys = new Set(allEntriesMap.keys())
-    const finalLines: string[] = []
+      schemaEntries.value.forEach((entry) => {
+        if (entry.key) {
+          allEntriesMap.set(entry.key, entry)
+        }
+      })
 
-    configEntries.value.forEach((entry) => {
-      if (entry.isCommentOrEmpty || !entry.key) {
-        finalLines.push(String(entry.value))
-        return
-      }
+      customEntries.value.forEach((entry) => {
+        if (!entry.isCommentOrEmpty && entry.key) {
+          allEntriesMap.set(entry.key, entry)
+        }
+      })
 
-      const currentEntry = allEntriesMap.get(entry.key)
-      if (!currentEntry) {
-        return
-      }
+      const remainingKeys = new Set(allEntriesMap.keys())
+      const finalEntries: ConfigEntry[] = []
 
-      finalLines.push(serializeConfigEntry(currentEntry))
-      remainingKeys.delete(entry.key)
-    })
+      configEntries.value.forEach((entry) => {
+        if (entry.isCommentOrEmpty || !entry.key) {
+          finalEntries.push(entry)
+          return
+        }
 
-    remainingKeys.forEach((key) => {
-      const entry = allEntriesMap.get(key)
-      if (!entry) {
-        return
-      }
+        const currentEntry = allEntriesMap.get(entry.key)
+        if (!currentEntry) {
+          return
+        }
 
-      finalLines.push(serializeConfigEntry(entry))
-    })
+        finalEntries.push(currentEntry)
+        remainingKeys.delete(entry.key)
+      })
 
-    const configString = finalLines.join('\n')
+      remainingKeys.forEach((key) => {
+        const entry = allEntriesMap.get(key)
+        if (!entry) {
+          return
+        }
+
+        finalEntries.push(entry)
+      })
+
+      configString = serializeEnvEntries(finalEntries)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      statusMessage.value = `保存失败：${errorMessage}`
+      statusType.value = 'error'
+      showMessage(`保存失败：${errorMessage}`, 'error')
+      return
+    }
 
     try {
       await pluginApi.savePluginConfig(pluginName, configString, {
