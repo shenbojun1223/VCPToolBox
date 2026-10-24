@@ -231,11 +231,14 @@ export function serializeEnvValue(value: SerializableEnvValue): string {
   )
 }
 
-export function serializeEnvAssignment(
-  key: string,
-  value: SerializableEnvValue,
-  inlineComment?: string
-): string {
+function assertEnvKey(key: string): void {
+  // dotenv 16.5.0 assigns into a normal object, so this key cannot be persisted.
+  if (key === '__proto__') {
+    throw new EnvSerializationError(
+      'invalid-key',
+      '该保留键无法被当前 ENV 后端可靠保存，请更换配置键名。'
+    )
+  }
   if (!ENV_KEY_PATTERN.test(key)) {
     throw new EnvSerializationError(
       'invalid-key',
@@ -243,6 +246,14 @@ export function serializeEnvAssignment(
     )
   }
 
+}
+
+export function serializeEnvAssignment(
+  key: string,
+  value: SerializableEnvValue,
+  inlineComment?: string
+): string {
+  assertEnvKey(key)
   return `${key}=${serializeEnvValue(value)}${normalizeInlineComment(inlineComment)}`
 }
 
@@ -325,21 +336,38 @@ export function serializeEnvEntry(entry: EnvSerializableEntry): string {
  * 在结构化合并前检查源文档是否可安全编辑。
  */
 export function assertEnvEntriesStructured(entries: readonly EnvSerializableEntry[]): void {
+  const seenKeys = new Set<string>()
   entries.forEach((entry, index) => {
-    if (!entry.parseError && !entry.duplicateKey) return
-
     const location = entry.originalLineNumStart !== undefined
       ? `第 ${entry.originalLineNumStart + 1} 行`
       : `第 ${index + 1} 项`
 
-    throw new EnvSerializationError(
-      'unstable-source',
-      `${location}存在无法可靠解析的结构（引号截断或重复键），已阻止保存。`
-    )
+    try {
+      if (entry.parseError || entry.duplicateKey) {
+        throw new EnvSerializationError(
+          'unstable-source',
+          '该行存在无法可靠解析的结构（引号截断或重复键），已阻止保存。'
+        )
+      }
+      if (!entry.isCommentOrEmpty) {
+        // Validate current keys before schema filtering or Map merging can discard them.
+        assertEnvKey(entry.key ?? '')
+        if (seenKeys.has(entry.key!)) {
+          throw new EnvSerializationError('unstable-source', '配置键重复，已阻止保存。')
+        }
+        seenKeys.add(entry.key!)
+      }
+    } catch (error) {
+      if (error instanceof EnvSerializationError) {
+        throw new EnvSerializationError(error.code, `${location}配置无法无损保存：${error.message}`)
+      }
+      throw error
+    }
   })
 }
 
 export function serializeEnvEntries(entries: readonly EnvSerializableEntry[]): string {
+  assertEnvEntriesStructured(entries)
   return entries.map((entry, index) => {
     const location = entry.originalLineNumStart !== undefined
       ? `第 ${entry.originalLineNumStart + 1} 行`
@@ -440,7 +468,9 @@ export function parseEnvToList(content: string): EnvEntry[] {
     seenKeys.add(key)
 
     let parseError: string | undefined
-    if (!isCompleteQuoted) {
+    if (key === '__proto__') {
+      parseError = '该保留键无法被当前 ENV 后端可靠保存，已阻止结构化保存。'
+    } else if (!isCompleteQuoted) {
       parseError = '该行的引号未闭合或包含无法识别的引号结构，已阻止结构化保存。'
     } else if (duplicateKey) {
       parseError = '该配置键重复出现，无法确定保存后的语义，已阻止保存。'

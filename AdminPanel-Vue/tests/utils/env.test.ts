@@ -367,4 +367,35 @@ describe('env utilities', () => {
     expect(isSensitiveConfigKey('WhitelistEmbeddingModelMaxToken')).toBe(false)
     expect(isSensitiveConfigKey('MultiModalModelOutputMaxTokens')).toBe(false)
   })
+
+  it('rejects the backend-discarded reserved key rather than claiming a successful save', () => {
+    const parsed = dotenv.parse('__proto__=SYNTHETIC_VALUE\nAUDIT_SENTINEL=unchanged')
+    expect(Object.prototype.hasOwnProperty.call(parsed, '__proto__')).toBe(false)
+    expect(() => serializeEnvAssignment('__proto__', 'SYNTHETIC_VALUE')).toThrow(/保留键/)
+    const entries = parseEnvToList('__proto__=SYNTHETIC_VALUE\nAUDIT_SENTINEL=unchanged')
+    expect(entries[0].parseError).toContain('保留键')
+    expect(entries[1]).toMatchObject({ key: 'AUDIT_SENTINEL', value: 'unchanged' })
+    expect(() => serializeEnvEntries(entries)).toThrow()
+  })
+
+  it('keeps other object-named keys that dotenv can persist', () => {
+    for (const key of ['constructor', 'toString', 'prototype', '__PROTO__']) {
+      expectLosslessRoundTrip(key, 'SYNTHETIC_VALUE')
+    }
+  })
+
+
+  it('checks edited keys and duplicate keys before any merge or serialization', () => {
+    for (const key of ['__proto__', '', 'A\nB', 'A=B']) {
+      const entries = parseEnvToList('SAFE=value\nAUDIT_SENTINEL=unchanged')
+      entries[0].key = key
+      expect(() => assertEnvEntriesStructured(entries)).toThrow()
+      expect(() => serializeEnvEntries(entries)).toThrow()
+    }
+    const duplicate = parseEnvToList('FIRST=one\nSECOND=two')
+    duplicate[1].key = 'FIRST'
+    expect(() => assertEnvEntriesStructured(duplicate)).toThrow(/重复/)
+    expect(() => serializeEnvEntries(duplicate)).toThrow(/重复/)
+  })
+
 })

@@ -304,4 +304,59 @@ describe('plugin config store', () => {
     expect(store.statusType).toBe('error')
     expect(store.statusMessage).toContain('第 2 行')
   })
+
+  it('blocks a reserved key in the loaded document before saving', async () => {
+    const store = usePluginConfigStore()
+    mockGetPlugins.mockResolvedValue([
+      makePlugin('__proto__=SYNTHETIC_VALUE\nAUDIT_SENTINEL=unchanged'),
+    ])
+    await store.loadPluginConfig('calendar')
+    await store.savePluginConfig('calendar')
+    expect(mockSavePluginConfig).not.toHaveBeenCalled()
+    expect(store.statusType).toBe('error')
+    expect(mockShowMessage).toHaveBeenCalledWith(expect.stringContaining('保存失败'), 'error')
+    expect(String(mockShowMessage.mock.calls.at(-1)?.[0])).not.toContain('SYNTHETIC_VALUE')
+    expect(store.configEntries.find(entry => entry.key === 'AUDIT_SENTINEL')?.value).toBe('unchanged')
+  })
+
+  it('rejects an edited key that the backend cannot persist without losing the edit', async () => {
+    const store = usePluginConfigStore()
+    mockGetPlugins.mockResolvedValue([makePlugin('SAFE=original\nAUDIT_SENTINEL=unchanged')])
+    await store.loadPluginConfig('calendar')
+    const entry = store.configEntries.find(item => item.key === 'SAFE')
+    if (!entry) throw new Error('test setup: missing SAFE')
+    entry.key = '__proto__'
+    entry.value = 'SYNTHETIC_EDIT'
+    await store.savePluginConfig('calendar')
+    expect(mockSavePluginConfig).not.toHaveBeenCalled()
+    expect(store.statusType).toBe('error')
+    expect(entry.value).toBe('SYNTHETIC_EDIT')
+    expect(mockShowMessage).not.toHaveBeenCalledWith(expect.any(String), 'success')
+  })
+
+
+  it('preserves legitimate inherited-object names as custom fields with no schema', async () => {
+    const source = 'constructor=first\ntoString=second\nhasOwnProperty=third\nAUDIT_SENTINEL=unchanged'
+    const store = usePluginConfigStore()
+    mockGetPlugins.mockResolvedValue([makePlugin(source)])
+    await store.loadPluginConfig('calendar')
+    await store.savePluginConfig('calendar')
+    expect(mockSavePluginConfig).toHaveBeenCalledTimes(1)
+    const text = (mockSavePluginConfig.mock.calls[0] as unknown as [string, string, unknown])[1]
+    expect(dotenv.parse(text)).toEqual(dotenv.parse(source))
+  })
+
+  it('does not overwrite values when an edited custom key collides with another key', async () => {
+    const store = usePluginConfigStore()
+    mockGetPlugins.mockResolvedValue([makePlugin('FIRST=one\nSECOND=two\nAUDIT_SENTINEL=unchanged')])
+    await store.loadPluginConfig('calendar')
+    const entry = store.configEntries.find(item => item.key === 'SECOND')
+    if (!entry) throw new Error('test setup: missing SECOND')
+    entry.key = 'FIRST'
+    await store.savePluginConfig('calendar')
+    expect(mockSavePluginConfig).not.toHaveBeenCalled()
+    expect(store.statusType).toBe('error')
+    expect(entry.value).toBe('two')
+  })
+
 })

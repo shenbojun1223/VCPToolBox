@@ -130,7 +130,8 @@ export const usePluginConfigStore = defineStore('plugin-config', () => {
   }
 
   function isKeyInSchema(key: string): boolean {
-    return !!pluginData.value?.manifest.configSchema?.[key]
+    const schema = pluginData.value?.manifest.configSchema
+    return !!schema && Object.prototype.hasOwnProperty.call(schema, key)
   }
 
   function isKeyInEnv(key: string): boolean {
