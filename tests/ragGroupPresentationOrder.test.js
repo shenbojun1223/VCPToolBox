@@ -199,9 +199,11 @@ test('unsupported presentation is passed through without creating state', () => 
     const order = new Order();
     assert.equal(order.render('standard/time/AIMemo', null, order.begin(context())), 'standard/time/AIMemo');
     assert.equal(order.states.size, 0);
-});test('actual system-message handoff shares cache Maps but isolates carrier context', async () => {
-    const start = pluginSource.indexOf('            await Promise.all(targetSystemMessageIndices.map');
-    const end = pluginSource.indexOf('            }));', start);
+});
+
+test('actual system-message handoff shares cache Maps but isolates carrier context', async () => {
+    const start = pluginSource.indexOf('            systemMessageTasks = targetSystemMessageIndices.map(async (index) => {');
+    const end = pluginSource.indexOf('\n            // 元思考只等待同类查询的感应就绪', start);
     assert.ok(start > 0 && end > start);
     const execute = vm.runInNewContext(`(async function(input) {
         const { requestCache, groupOrderRequest, newMessages } = input;
@@ -211,7 +213,10 @@ test('unsupported presentation is passed through without creating state', () => 
         const isAIMemoLicensed = false, dynamicParams = { metrics: {} }, historySegments = [];
         const contextDiaryPrefixes = new Set(), messages = [], ghostTags = [];
         const collectedAttachments = [], isFreshTimeConversationStart = false;
-        ${pluginSource.slice(start, end + '            }));'.length)}
+        let systemMessageTasks;
+        ${pluginSource.slice(start, end)}
+        await Promise.all(systemMessageTasks);
+        return newMessages;
     })`, { console: { log() {} } });
     const shared = { chunksByFilePath: new Map(), fullDocumentCache: new Map() };
     const order = new Order();

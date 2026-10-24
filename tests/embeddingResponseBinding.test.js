@@ -16,6 +16,7 @@ async function run(data) {
   let requests=0;
   const audited=[];
   const send = vm.runInNewContext('('+body+'\n)', {
+    process:{env:{}},
     fixtureFetch: async()=>{
       requests++;
       return {ok:true,status:200,text:async()=>JSON.stringify({data,model:'fixture-model'})};
@@ -73,6 +74,7 @@ async function runBatches(texts, responder) {
   assert(batchStart>=0 && batchEnd>batchStart);
   const calls=[],completed=[];
   const context={
+    process:{env:{}},
     fixtureFetch:async(_url,options)=>{
       const inputs=JSON.parse(options.body).input;
       calls.push(inputs);

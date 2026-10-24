@@ -7,7 +7,7 @@ const dotenv = require("dotenv");
 dotenv.config({ path: "config.env" });
 
 const path = require("path");
-const { promises: fs, existsSync } = require("fs");
+const { promises: fs } = require("fs");
 const http = require("http");
 const basicAuth = require("basic-auth");
 const cors = require("cors");
@@ -17,6 +17,12 @@ const {
   isLoopbackSocket,
 } = require("./modules/diagnostics/requestDiagnostics.js");
 const { createCpuSampler } = require("./modules/diagnostics/cpuSampler.js");
+const {
+  createAdminPanelBuildController,
+  createAdminPanelReadinessMiddleware,
+  renderMissingAssetsPage,
+} = require("./modules/adminPanelBootstrap.js");
+const { verifyDistIntegrity } = require("./scripts/ensure_admin_panel.js");
 
 const MAIN_PORT = parseInt(process.env.PORT) || 3000;
 const ADMIN_PORT = MAIN_PORT + 1;
@@ -31,15 +37,31 @@ const LEGACY_ADMIN_PANEL_BACKUP_ROOT = path.join(
 );
 const VUE_ADMIN_PANEL_INDEX = path.join(VUE_ADMIN_PANEL_ROOT, "index.html");
 
-if (!existsSync(VUE_ADMIN_PANEL_INDEX)) {
-  console.warn(
-    `[AdminServer] Vue AdminPanel build not found: ${VUE_ADMIN_PANEL_INDEX}`
-  );
-  console.warn(
-    '[AdminServer] Run "npm run build" inside AdminPanel-Vue before starting the admin server.'
-  );
+const adminPanelBuildController = createAdminPanelBuildController({
+  indexPath: VUE_ADMIN_PANEL_INDEX,
+  scriptPath: path.join(__dirname, "scripts", "ensure_admin_panel.js"),
+  cwd: __dirname,
+  enabled: process.env.VCP_ADMIN_PANEL_AUTO_BUILD === "1",
+  timeoutMs: 11 * 60 * 1000,
+  validateOutput: () => verifyDistIntegrity(__dirname),
+});
+
+function renderAdminPanelPlaceholder(req, res) {
+  if (adminPanelBuildController.isReady()) {
+    return res.redirect(req.originalUrl || "/AdminPanel/");
+  }
+
+  adminPanelBuildController.startIfEnabled();
+  const state = adminPanelBuildController.getStatus();
+  const statusCode = state.status === "building" ? 503 : 500;
+  return res.status(statusCode)
+    .setHeader("Content-Type", "text/html; charset=utf-8")
+    .send(renderMissingAssetsPage(state, adminPanelBuildController.isEnabled()));
 }
 
+if (!adminPanelBuildController.isReady()) {
+  console.warn('[AdminServer] AdminPanel-Vue assets are incomplete; automatic build is opt-in.');
+}
 // ============================================================
 // 登录防暴力破解
 // ============================================================
@@ -343,12 +365,21 @@ const adminAuth = (req, res, next) => {
 app.use(adminAuth);
 
 // 静态文件：默认托管 Vue 构建产物，并保留 legacy 路径兼容旧链接
+const adminPanelReadinessMiddleware = createAdminPanelReadinessMiddleware(
+  adminPanelBuildController,
+  renderAdminPanelPlaceholder
+);
+app.use("/AdminPanel", adminPanelReadinessMiddleware);
+app.use("/AdminPanelLegacy", adminPanelReadinessMiddleware);
 app.use("/AdminPanel", express.static(VUE_ADMIN_PANEL_ROOT));
 // Static serving targets the Vue build by default and keeps the legacy route alive.
 app.use("/AdminPanel", express.static(VUE_ADMIN_PANEL_ROOT));
 app.use("/AdminPanelLegacy", express.static(VUE_ADMIN_PANEL_ROOT));
 
 function serveVueAdminPanelApp(req, res, next) {
+  if (!adminPanelBuildController.isReady()) {
+    return renderAdminPanelPlaceholder(req, res);
+  }
   if (path.extname(req.path)) {
     return next();
   }
@@ -425,7 +456,8 @@ const localModules = [
   // dailyNotes 必须由主进程处理：主进程持有唯一的 KnowledgeBaseManager，
   // 可将文件变更、SQLite 摄取与 Rust 索引更新纳入同一协调时序。
   // 独立管理进程通过下方 /admin_api 兜底代理透明转发，不改变前端 API。
-  "agentAssistant", // Agent 助手配置（纯文件 I/O）
+  // agentAssistant 同时包含配置 I/O 与依赖插件实例的委托接口，
+  // 必须整体走兜底代理，由主进程处理委托状态及配置热重载。
   "aiChat", // 后台 AI 代理（本地转发主服务 /v1/chat/completions，避免前端暴露 Key）
   "semanticRouter", // 语义模型路由器配置（本地 JSON 读写 + 上游模型拉取）
 ];

@@ -17,6 +17,7 @@ const plain = value => JSON.parse(JSON.stringify(value));
 async function run(texts, respond, observer, models=['primary']) {
   const requests=[];
   const context={
+    process:{env:{}},
     fixtureFetch:async(_url, options)=>{
       const request=JSON.parse(options.body);
       requests.push(request);
