@@ -31,6 +31,12 @@ vi.mock('@/utils', async () => {
   }
 })
 
+vi.mock('@/platform/feedback/feedbackBus', () => ({
+  askConfirm: vi.fn(async () => true),
+  askInput: vi.fn(async () => 'NEW_CUSTOM'),
+}))
+
+import { askInput } from '@/platform/feedback/feedbackBus'
 import { usePluginConfigStore } from '@/stores/pluginConfig'
 import { serializeEnvAssignment } from '@/utils'
 
@@ -62,6 +68,156 @@ describe('plugin config store', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     vi.clearAllMocks()
+  })
+
+  it.each(['add', 'remove'] as const)('keeps schema edits after custom field %s', async (action) => {
+    const store = usePluginConfigStore()
+    mockGetPlugins.mockResolvedValue([makePlugin(
+      'RETRIES=03\nCUSTOM=remove\nAUDIT_SENTINEL=unchanged',
+      { RETRIES: 'integer', TITLE: 'string' },
+      { TITLE: 'default' }
+    )])
+    await store.loadPluginConfig('calendar')
+    const retries = store.schemaEntries.find(e => e.key === 'RETRIES')!
+    const title = store.schemaEntries.find(e => e.key === 'TITLE')!
+    retries.value = 5
+    title.value = 'edited default'
+    if (action === 'add') {
+      await store.addCustomField()
+      store.configEntries.find(e => e.key === 'NEW_CUSTOM')!.value = 'new'
+    } else {
+      await store.removeCustomField('CUSTOM')
+    }
+    expect(store.schemaEntries.find(e => e.key === 'RETRIES')).toBe(retries)
+    expect(store.schemaEntries.find(e => e.key === 'TITLE')).toBe(title)
+    expect(retries.value).toBe(5)
+    expect(title.value).toBe('edited default')
+    await store.savePluginConfig('calendar')
+    expect(mockSavePluginConfig).toHaveBeenCalledTimes(1)
+    const parsed = dotenv.parse((mockSavePluginConfig.mock.calls[0] as [string, string])[1])
+    expect(parsed.RETRIES).toBe('5')
+    expect(parsed.TITLE).toBe('edited default')
+    expect(parsed.AUDIT_SENTINEL).toBe('unchanged')
+    if (action === 'add') expect(parsed.NEW_CUSTOM).toBe('new')
+    else expect(parsed).not.toHaveProperty('CUSTOM')
+  })
+
+  it('keeps several schema edits through repeated structural changes and custom edits', async () => {
+    const store = usePluginConfigStore()
+    mockGetPlugins.mockResolvedValue([makePlugin(
+      'COUNT=003\nFLAG=TRUE\nCUSTOM=old\nAUDIT_SENTINEL=unchanged',
+      { COUNT: 'integer', FLAG: 'boolean', TITLE: 'string' },
+      { TITLE: 'default' }
+    )])
+    await store.loadPluginConfig('calendar')
+    store.schemaEntries.find(e => e.key === 'COUNT')!.value = 8
+    store.schemaEntries.find(e => e.key === 'FLAG')!.value = false
+    store.schemaEntries.find(e => e.key === 'TITLE')!.value = 'new title'
+    await store.addCustomField()
+    await store.removeCustomField('NEW_CUSTOM')
+    await store.addCustomField()
+    store.configEntries.find(e => e.key === 'NEW_CUSTOM')!.value = 'another'
+    store.configEntries.find(e => e.key === 'CUSTOM')!.value = 'updated'
+    await store.savePluginConfig('calendar')
+    expect(dotenv.parse((mockSavePluginConfig.mock.calls[0] as [string, string])[1])).toEqual({
+      COUNT: '8', FLAG: 'false', TITLE: 'new title', CUSTOM: 'updated',
+      NEW_CUSTOM: 'another', AUDIT_SENTINEL: 'unchanged',
+    })
+  })
+
+  it.each([
+    ['custom', ' true ', true], ['schema', ' true ', true],
+    ['custom', '\tTrUe\t', true], ['schema', '\tTrUe\t', true],
+    ['custom', ' FALSE ', false], ['schema', ' FALSE ', false],
+  ] as const)('preserves untouched padded boolean in %s (%s)', async (mode, raw, expectedUi) => {
+    const store = usePluginConfigStore()
+    const source = `FLAG='${raw}'\nAUDIT_SENTINEL=unchanged`
+    mockGetPlugins.mockResolvedValue([makePlugin(source, mode === 'schema' ? { FLAG: 'boolean' } : {})])
+    await store.loadPluginConfig('calendar')
+    const entry = (mode === 'schema' ? store.schemaEntries : store.configEntries).find(e => e.key === 'FLAG')!
+    expect(entry.value).toBe(expectedUi)
+    await store.savePluginConfig('calendar')
+    expect(mockSavePluginConfig).toHaveBeenCalledTimes(1)
+    expect(dotenv.parse((mockSavePluginConfig.mock.calls[0] as [string, string])[1])).toEqual(dotenv.parse(source))
+  })
+
+  it.each(['custom', 'schema'] as const)('persists deliberate padded-boolean toggle in %s', async mode => {
+    const store = usePluginConfigStore()
+    mockGetPlugins.mockResolvedValue([makePlugin("FLAG=' true '\nAUDIT_SENTINEL=unchanged",
+      mode === 'schema' ? { FLAG: 'boolean' } : {})])
+    await store.loadPluginConfig('calendar')
+    const entry = (mode === 'schema' ? store.schemaEntries : store.configEntries).find(e => e.key === 'FLAG')!
+    entry.value = false
+    await store.addCustomField()
+    await store.removeCustomField('NEW_CUSTOM')
+    await store.savePluginConfig('calendar')
+    expect(dotenv.parse((mockSavePluginConfig.mock.calls[0] as [string, string])[1])).toEqual({
+      FLAG: 'false', AUDIT_SENTINEL: 'unchanged',
+    })
+  })
+
+  it('retains schema edits after failed save for a successful retry', async () => {
+    const store = usePluginConfigStore()
+    mockGetPlugins.mockResolvedValue([makePlugin('COUNT=03', { COUNT: 'integer', TITLE: 'string' })])
+    await store.loadPluginConfig('calendar')
+    store.schemaEntries.find(e => e.key === 'COUNT')!.value = 9
+    store.schemaEntries.find(e => e.key === 'TITLE')!.value = 'pending'
+    mockSavePluginConfig.mockRejectedValueOnce(new Error('synthetic transport failure'))
+    await store.savePluginConfig('calendar')
+    expect(store.statusType).toBe('error')
+    await store.addCustomField()
+    await store.savePluginConfig('calendar')
+    expect(mockSavePluginConfig).toHaveBeenCalledTimes(2)
+    expect(dotenv.parse((mockSavePluginConfig.mock.calls[1] as [string, string])[1])).toMatchObject({
+      COUNT: '9', TITLE: 'pending',
+    })
+  })
+
+  it('reinitializes schema edit state on reload and clears it for a missing plugin', async () => {
+    const store = usePluginConfigStore()
+    mockGetPlugins.mockResolvedValue([makePlugin('COUNT=03', { COUNT: 'integer', TITLE: 'string' }, { TITLE: 'first' })])
+    await store.loadPluginConfig('calendar')
+    store.schemaEntries.find(e => e.key === 'COUNT')!.value = 9
+    store.schemaEntries.find(e => e.key === 'TITLE')!.value = 'stale'
+    mockGetPlugins.mockResolvedValue([makePlugin('COUNT=07', { COUNT: 'integer', TITLE: 'string' }, { TITLE: 'second' })])
+    await store.loadPluginConfig('calendar', { forceRefresh: true })
+    expect(store.schemaEntries.find(e => e.key === 'COUNT')!.value).toBe(7)
+    expect(store.schemaEntries.find(e => e.key === 'TITLE')!.value).toBe('second')
+    mockGetPlugins.mockResolvedValue([])
+    await store.loadPluginConfig('missing', { forceRefresh: true })
+    expect(store.schemaEntries).toEqual([])
+  })
+
+  it.each(['TITLE', 'COUNT'])('rejects adding a custom field that shadows schema field %s', async key => {
+    const store = usePluginConfigStore()
+    mockGetPlugins.mockResolvedValue([makePlugin('COUNT=03', { COUNT: 'integer', TITLE: 'string' }, { TITLE: 'default' })])
+    await store.loadPluginConfig('calendar')
+    const title = store.schemaEntries.find(e => e.key === 'TITLE')!
+    title.value = 'pending edit'
+    const beforeLength = store.configEntries.length
+    vi.mocked(askInput).mockResolvedValueOnce(key)
+    await store.addCustomField()
+    const request = vi.mocked(askInput).mock.calls.at(-1)![0]
+    expect(request.validate?.(key)).toBeTruthy()
+    expect(store.configEntries).toHaveLength(beforeLength)
+    expect(store.schemaEntries.find(e => e.key === 'TITLE')).toBe(title)
+    expect(title.value).toBe('pending edit')
+    expect(mockShowMessage).not.toHaveBeenCalledWith(expect.any(String), 'success')
+  })
+
+  it('rejects a renamed custom key colliding with a schema-only field before merge', async () => {
+    const store = usePluginConfigStore()
+    mockGetPlugins.mockResolvedValue([makePlugin('CUSTOM=old\nAUDIT_SENTINEL=unchanged',
+      { TITLE: 'string' }, { TITLE: 'default' })])
+    await store.loadPluginConfig('calendar')
+    const entry = store.configEntries.find(e => e.key === 'CUSTOM')!
+    entry.key = 'TITLE'
+    entry.value = 'pending custom edit'
+    await store.savePluginConfig('calendar')
+    expect(mockSavePluginConfig).not.toHaveBeenCalled()
+    expect(store.statusType).toBe('error')
+    expect(entry.value).toBe('pending custom edit')
+    expect(store.schemaEntries.find(e => e.key === 'TITLE')!.value).toBe('default')
   })
 
   it('loads plugin config and infers entry types', async () => {

@@ -81,7 +81,7 @@ export function inferEnvValueType(key: string | null, value: string): 'string' |
 export function castEnvValue(value: string | boolean | number, type: 'string' | 'boolean' | 'integer'): string | boolean | number {
   const strValue = String(value)
   if (type === 'boolean') {
-    return strValue.toLowerCase() === 'true'
+    return isTrueValue(value)
   }
   if (type === 'integer') {
     const parsed = parseInt(strValue, 10)

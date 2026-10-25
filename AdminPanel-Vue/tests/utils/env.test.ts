@@ -81,6 +81,19 @@ const ADDITIONAL_ROUND_TRIP_VALUES = [
 ]
 
 describe('env utilities', () => {
+  it.each([
+    [' true ', true], ['\tTrUe\t', true], [' TRUE\n', true],
+    [' false ', false], ['\tFALSE\t', false],
+  ] as const)('aligns inferred boolean, UI conversion and untouched serialization for %s', (raw, expected) => {
+    expect(inferEnvValueType('FLAG', raw)).toBe('boolean')
+    expect(castEnvValue(raw, 'boolean')).toBe(expected)
+    const text = serializeEnvEntries([{
+      key: 'FLAG', value: castEnvValue(raw, 'boolean'), type: 'boolean',
+      originalValue: raw, isCommentOrEmpty: false,
+    }])
+    expect(dotenv.parse(text)).toEqual({ FLAG: raw })
+  })
+
   it('uses the backend dotenv 16.5.0 parser as the independent oracle', () => {
     expect(dotenvPackage.version).toBe('16.5.0')
   })

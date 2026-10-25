@@ -8,6 +8,7 @@ import {
   parseEnvToList,
   serializeEnvEntries,
   assertEnvEntriesStructured,
+  EnvSerializationError,
   showMessage,
   castEnvValue,
   isSensitiveConfigKey,
@@ -56,29 +57,38 @@ export const usePluginConfigStore = defineStore('plugin-config', () => {
     return !!schema && Object.keys(schema).length > 0
   })
 
-  const schemaEntries = computed(() => {
+  // Editable entries are state, not disposable computed projections. Rebuild only
+  // when loading a document; adding/removing custom fields must not reset edits.
+  const schemaEntries = ref<ConfigEntry[]>([])
+
+  function initializeSchemaEntries() {
     const schema = pluginData.value?.manifest.configSchema || {}
     const defaults = pluginData.value?.manifest.defaults || {}
 
-    return Object.keys(schema).map((key) => {
+    schemaEntries.value = Object.keys(schema).map((key) => {
       const existing = configEntries.value.find((entry) => !entry.isCommentOrEmpty && entry.key === key)
       const expectedType = normalizeSchemaType(schema[key])
-      const fallback = defaults[key] ?? ''
-      const rawValue = existing
-        ? (existing.originalValue ?? String(existing.value ?? ''))
-        : String(fallback)
 
+      if (existing) {
+        const rawValue = existing.originalValue ?? String(existing.value ?? '')
+        existing.type = expectedType
+        existing.value = castEnvValue(rawValue, expectedType)
+        // Share the source entry so validation, editing and saving see one value.
+        return existing
+      }
+
+      const rawValue = Object.prototype.hasOwnProperty.call(defaults, key)
+        ? String(defaults[key] ?? '')
+        : ''
       return {
         key,
         value: castEnvValue(rawValue, expectedType),
         isCommentOrEmpty: false,
-        isMultilineQuoted: existing?.isMultilineQuoted ?? String(rawValue).includes('\n'),
-        type: expectedType,
-        originalValue: existing ? rawValue : undefined,
-        inlineComment: existing?.inlineComment
+        isMultilineQuoted: rawValue.includes('\n'),
+        type: expectedType
       } as ConfigEntry
     })
-  })
+  }
 
   const customEntries = computed(() => configEntries.value.filter((entry) => {
     if (entry.isCommentOrEmpty) return true
@@ -159,26 +169,33 @@ export const usePluginConfigStore = defineStore('plugin-config', () => {
   }
 
   async function addCustomField() {
+    const validateKey = (value: string): string | null => {
+      const normalized = value.trim().replace(/\s+/g, '_')
+      if (!normalized) return '键名不能为空'
+      const exists = isKeyInSchema(normalized) || configEntries.value.some(
+        (entry) => !entry.isCommentOrEmpty && entry.key === normalized
+      )
+      if (exists) return `配置项 "${normalized}" 已存在`
+      return null
+    }
     const key = await askInput({
       title: '添加自定义配置项',
       message: '请输入新自定义配置项的键名（例如 MY_PLUGIN_VAR）',
       placeholder: 'MY_PLUGIN_VAR',
       confirmText: '添加',
-      validate: (value) => {
-        const normalized = value.trim().replace(/\s+/g, '_')
-        if (!normalized) return '键名不能为空'
-        const exists = configEntries.value.some(
-          (entry) => !entry.isCommentOrEmpty && entry.key === normalized
-        )
-        if (exists) return `配置项 "${normalized}" 已存在`
-        return null
-      },
+      validate: validateKey,
     })
     if (!key || !key.trim()) {
       return
     }
 
     const normalizedKey = key.trim().replace(/\s+/g, '_')
+    // Recheck after the asynchronous prompt, before mutating editable state.
+    const validationError = validateKey(normalizedKey)
+    if (validationError) {
+      showMessage(validationError, 'error')
+      return
+    }
 
     configEntries.value.push({
       key: normalizedKey,
@@ -195,6 +212,7 @@ export const usePluginConfigStore = defineStore('plugin-config', () => {
     clearTransientUiState()
     pluginData.value = null
     configEntries.value = []
+    schemaEntries.value = []
 
     try {
       const plugins = options.forceRefresh
@@ -224,6 +242,8 @@ export const usePluginConfigStore = defineStore('plugin-config', () => {
           value: entry.isCommentOrEmpty || !entry.key ? entry.value : castEnvValue(entry.value, inferredType)
         }
       })
+
+      initializeSchemaEntries()
 
       invocationCommands.value.forEach((cmd) => {
         const identifier = getCommandIdentifier(cmd)
@@ -347,6 +367,21 @@ export const usePluginConfigStore = defineStore('plugin-config', () => {
 
     try {
       assertEnvEntriesStructured(configEntries.value)
+      assertEnvEntriesStructured(schemaEntries.value)
+
+      // Existing schema entries share source identity. A different source entry
+      // with the same key is an edit conflict, not a value to silently discard.
+      for (const entry of schemaEntries.value) {
+        const sourceEntry = configEntries.value.find(
+          item => !item.isCommentOrEmpty && item.key === entry.key
+        )
+        if (sourceEntry && sourceEntry !== entry) {
+          throw new EnvSerializationError(
+            'unstable-source',
+            '自定义配置项与 Schema 字段冲突，已阻止保存，请更换自定义键名。'
+          )
+        }
+      }
 
       const allEntriesMap = new Map<string, ConfigEntry>()
 

@@ -91,6 +91,30 @@ describe('BaseConfig env persistence', () => {
     vi.clearAllMocks()
   })
 
+  it.each([' true ', '\tTrUe\t', ' FALSE '])('preserves untouched padded boolean %s in main config', async raw => {
+    const source = `FLAG='${raw}'\nAUDIT_SENTINEL=unchanged`
+    mockGetMainConfig.mockResolvedValue(mainConfig(source))
+    const vm = createVm()
+    await vm.loadConfig()
+    expect(vm.configEntries.value.find(e => e.key === 'FLAG')!.value)
+      .toBe(raw.trim().toLowerCase())
+    await vm.handleSubmit()
+    expect(mockSaveMainConfig).toHaveBeenCalledTimes(1)
+    expect(dotenv.parse((mockSaveMainConfig.mock.calls[0] as [string, unknown])[0]))
+      .toEqual(dotenv.parse(source))
+  })
+
+  it('saves an intentional padded boolean toggle in main config', async () => {
+    mockGetMainConfig.mockResolvedValue(mainConfig("FLAG=' true '\nAUDIT_SENTINEL=unchanged"))
+    const vm = createVm()
+    await vm.loadConfig()
+    vm.configEntries.value.find(e => e.key === 'FLAG')!.value = 'false'
+    await vm.handleSubmit()
+    expect(dotenv.parse((mockSaveMainConfig.mock.calls[0] as [string, unknown])[0])).toEqual({
+      FLAG: 'false', AUDIT_SENTINEL: 'unchanged',
+    })
+  })
+
   it('loads, edits and saves through the shared lossless serializer', async () => {
     const source = [
       '# heading',
