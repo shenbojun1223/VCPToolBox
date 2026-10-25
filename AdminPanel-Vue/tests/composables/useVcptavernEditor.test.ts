@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as VueModule from "vue";
+import { nextTick } from "vue";
 import {
   createMockHTMLElement,
   installPointerDomTestGlobals,
@@ -59,7 +60,6 @@ describe("useVcptavernEditor", () => {
     mockSavePreset.mockReset();
     mockShowMessage.mockReset();
     mockLoggerError.mockReset();
-    vi.stubGlobal("confirm", vi.fn(() => true));
     vi.unstubAllGlobals();
     vi.stubGlobal("confirm", vi.fn(() => true));
   });
@@ -83,7 +83,12 @@ describe("useVcptavernEditor", () => {
 
     const state = useVcptavernEditor();
     await state.fetchPresets();
-    await state.loadPreset("p1");
+    await state.selectPreset("p1");
+    expect(mockGetPreset).toHaveBeenCalledWith(
+      "p1", { showLoader: false, loadingKey: "vcptavern.preset.load" }
+    );
+    expect(state.selectedPresetName.value).toBe("p1");
+    expect(state.isDirty.value).toBe(false);
 
     expect(state.presetNames.value).toEqual(["p1", "p2"]);
     expect(state.editorState.name).toBe("p1");
@@ -93,10 +98,10 @@ describe("useVcptavernEditor", () => {
     expect(state.isNewPreset.value).toBe(false);
   });
 
-  it("supports new preset, rule add/remove and pointer drag reorder", () => {
+  it("supports new preset, rule add/remove and pointer drag reorder", async () => {
     const state = useVcptavernEditor();
 
-    state.createNewPreset();
+    await state.createNewPreset();
     expect(state.isEditorVisible.value).toBe(true);
     expect(state.isNewPreset.value).toBe(true);
 
@@ -122,7 +127,7 @@ describe("useVcptavernEditor", () => {
       "[data-rule-id]",
       draggedRule
     );
-    installPointerDomTestGlobals(() => hoveredRule);
+    const dom = installPointerDomTestGlobals(() => hoveredRule);
 
     state.handleRulePointerDown(
       state.editorState.rules[0].id,
@@ -137,7 +142,7 @@ describe("useVcptavernEditor", () => {
         currentTarget: captureTarget,
       } as unknown as PointerEvent
     );
-    state.handlePointerMove(
+    dom.windowMock.dispatch("pointermove",
       {
         pointerId: 1,
         clientX: 10,
@@ -145,7 +150,8 @@ describe("useVcptavernEditor", () => {
         preventDefault: vi.fn(),
       } as unknown as PointerEvent
     );
-    state.handlePointerUp(
+    dom.flushAnimationFrame();
+    dom.windowMock.dispatch("pointerup",
       {
         pointerId: 1,
         preventDefault: vi.fn(),
@@ -155,7 +161,9 @@ describe("useVcptavernEditor", () => {
     expect(state.editorState.rules[0].name).toBe("B");
     expect(state.editorState.rules[1].name).toBe("A");
 
-    state.removeRule(1);
+    expect(captureTarget.hasPointerCapture(1)).toBe(false);
+    expect(dom.windowMock.listenerCount("pointermove")).toBe(0);
+    await state.removeRule(1);
     expect(state.editorState.rules).toHaveLength(1);
   });
 
@@ -219,6 +227,34 @@ describe("useVcptavernEditor", () => {
     expect(state.isNewPreset.value).toBe(false);
   });
 
+  it("preserves unsaved edits when switching or creating a preset is declined", async () => {
+    mockGetPreset.mockResolvedValueOnce({ description: "original", rules: [] });
+    const state = useVcptavernEditor();
+    await state.selectPreset("p1");
+    state.editorState.description = "pending edit";
+    await nextTick();
+    expect(state.isDirty.value).toBe(true);
+    vi.stubGlobal("confirm", vi.fn(() => false));
+    await state.selectPreset("p2");
+    await state.createNewPreset();
+    expect(state.selectedPresetName.value).toBe("p1");
+    expect(state.editorState.description).toBe("pending edit");
+    expect(state.isNewPreset.value).toBe(false);
+    expect(mockGetPreset).toHaveBeenCalledTimes(1);
+    expect(mockSavePreset).not.toHaveBeenCalled();
+  });
+
+  it("preserves a rule when deletion confirmation is declined", async () => {
+    const state = useVcptavernEditor();
+    await state.createNewPreset();
+    state.addRule();
+    const id = state.editorState.rules[0].id;
+    vi.stubGlobal("confirm", vi.fn(() => false));
+    await state.removeRule(0);
+    expect(state.editorState.rules.map(rule => rule.id)).toEqual([id]);
+    expect(mockSavePreset).not.toHaveBeenCalled();
+  });
+
   it("exposes stable feature contract for vcptavern editor integration", () => {
     const state = useVcptavernEditor();
 
@@ -232,14 +268,20 @@ describe("useVcptavernEditor", () => {
         "dragState",
         "editorState",
         "fetchPresets",
-        "handlePointerMove",
-        "handlePointerUp",
         "handleRulePointerDown",
         "isEditorVisible",
         "isLoading",
         "isNewPreset",
         "isSaving",
-        "loadPreset",
+        "selectPreset",
+        "isDirty",
+        "nameValidationError",
+        "nameConflictWarning",
+        "suppressListAnimation",
+        "confirmDiscardChanges",
+        "duplicateRule",
+        "toggleRuleCollapse",
+        "isRuleCollapsed",
         "orderedRules",
         "presetNames",
         "removeRule",

@@ -45,7 +45,7 @@ const mockAppStore = {
     { target: "dashboard", label: "Dashboard" },
     { pluginName: "demo", label: "Demo Plugin" },
   ],
-  plugins: [],
+  plugins: [] as Array<{ name: string; manifest: { name: string; displayName?: string }; enabled: boolean }>,
   pinnedPluginNames: [],
   loadPlugins: vi.fn(),
   markPluginsLoaded: vi.fn(),
@@ -122,10 +122,14 @@ describe("useMainLayoutState", () => {
     mockRoute.fullPath = "/plugin/demo/config";
     mockRoute.name = "PluginConfig";
     mockRoute.params = { pluginName: "demo" };
+    mockAppStore.plugins = [{
+      name: "demo", enabled: true,
+      manifest: { name: "demo", displayName: "Demo Plugin" },
+    }];
 
     const state = useMainLayoutState();
 
-    expect(state.currentPageTitle.value).toBe("Demo Plugin");
+    expect(state.currentPageTitle.value).toBe("插件配置 · Demo Plugin");
 
     state.navigateTo("ignored", "demo");
     expect(mockPush).toHaveBeenCalledWith({

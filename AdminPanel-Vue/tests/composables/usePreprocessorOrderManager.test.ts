@@ -63,7 +63,7 @@ describe("usePreprocessorOrderManager", () => {
     mockGetPreprocessorOrder
       .mockResolvedValueOnce([
         { name: "a", displayName: "A" },
-        { name: "b" },
+        { name: "b", kind: "stage" },
       ])
       .mockResolvedValueOnce([{ name: "c", displayName: "C" }]);
 
@@ -71,13 +71,13 @@ describe("usePreprocessorOrderManager", () => {
 
     await state.loadPreprocessors();
     expect(state.preprocessors.value).toEqual([
-      { name: "a", displayName: "A", description: undefined },
-      { name: "b", displayName: "b", description: undefined },
+      { name: "a", kind: "preprocessor", displayName: "A", description: undefined },
+      { name: "b", kind: "stage", displayName: "b", description: undefined },
     ]);
 
     await state.loadPreprocessors();
     expect(state.preprocessors.value).toEqual([
-      { name: "c", displayName: "C", description: undefined },
+      { name: "c", kind: "preprocessor", displayName: "C", description: undefined },
     ]);
   });
 
@@ -106,7 +106,7 @@ describe("usePreprocessorOrderManager", () => {
       "[data-preprocessor-name]",
       draggedItem
     );
-    installPointerDomTestGlobals(() => hoveredItem);
+    const dom = installPointerDomTestGlobals(() => hoveredItem);
 
     state.handleDragHandlePointerDown(
       "a",
@@ -130,6 +130,7 @@ describe("usePreprocessorOrderManager", () => {
         preventDefault: vi.fn(),
       } as unknown as PointerEvent
     );
+    dom.flushAnimationFrame();
     state.handlePointerUp(
       {
         pointerId: 1,
@@ -164,11 +165,55 @@ describe("usePreprocessorOrderManager", () => {
     expect(mockShowMessage).toHaveBeenCalledWith("顺序已保存！", "success");
   });
 
+  it("blocks unchanged saves and restores the loaded order on reset", async () => {
+    mockGetPreprocessorOrder.mockResolvedValueOnce([
+      { name: "first", displayName: "First" },
+      { name: "second", displayName: "Second", kind: "stage" },
+    ]);
+    const state = usePreprocessorOrderManager();
+    await state.loadPreprocessors();
+    expect(state.hasChanges.value).toBe(false);
+    expect(state.changedItemCount.value).toBe(0);
+    await state.saveOrder();
+    expect(mockSavePreprocessorOrder).not.toHaveBeenCalled();
+    state.preprocessors.value.reverse();
+    expect(state.hasChanges.value).toBe(true);
+    expect(state.changedItemCount.value).toBe(2);
+    state.resetOrder();
+    expect(state.preprocessors.value.map(item => item.name)).toEqual(["first", "second"]);
+    expect(state.hasChanges.value).toBe(false);
+    expect(state.statusType.value).toBe("info");
+    expect(mockSavePreprocessorOrder).not.toHaveBeenCalled();
+  });
+
+  it("saves a changed order once and resets the dirty baseline", async () => {
+    mockGetPreprocessorOrder.mockResolvedValueOnce([
+      { name: "first", displayName: "First" }, { name: "second", displayName: "Second" },
+    ]);
+    mockSavePreprocessorOrder.mockResolvedValueOnce(undefined);
+    const state = usePreprocessorOrderManager();
+    await state.loadPreprocessors();
+    state.preprocessors.value.reverse();
+    await state.saveOrder();
+    expect(mockSavePreprocessorOrder).toHaveBeenCalledTimes(1);
+    expect(mockSavePreprocessorOrder).toHaveBeenCalledWith(
+      ["second", "first"], { loadingKey: "preprocessors.order.save" }
+    );
+    expect(state.hasChanges.value).toBe(false);
+    expect(state.isSaving.value).toBe(false);
+    await state.saveOrder();
+    expect(mockSavePreprocessorOrder).toHaveBeenCalledTimes(1);
+  });
+
   it("exposes stable feature contract for preprocessor order manager integration", () => {
     const state = usePreprocessorOrderManager();
 
     expect(Object.keys(state).sort()).toEqual(
       [
+        "changedItemCount",
+        "hasChanges",
+        "isSaving",
+        "resetOrder",
         "dragGhost",
         "dragGhostElement",
         "dragOverPluginName",

@@ -17,6 +17,7 @@ const {
   mockLoggerError,
   mockCreateLogger,
   mockGetSystemResources,
+  mockGetMemoryProfile,
   mockGetPM2Processes,
   mockGetUserAuthCode,
   mockGetServerLog,
@@ -41,6 +42,7 @@ const {
     mockLoggerError: loggerError,
     mockCreateLogger: createLogger,
     mockGetSystemResources: vi.fn(async () => ({})),
+    mockGetMemoryProfile: vi.fn(async () => ({})),
     mockGetPM2Processes: vi.fn(async () => []),
     mockGetUserAuthCode: vi.fn(async () => ({ code: "" })),
     mockGetServerLog: vi.fn(async () => ({ content: "", offset: 0 })),
@@ -73,6 +75,7 @@ vi.mock("@/composables/usePolling", () => ({
 vi.mock("@/api", () => ({
   systemApi: {
     getSystemResources: (...args: unknown[]) => mockGetSystemResources(...args),
+    getMemoryProfile: (...args: unknown[]) => mockGetMemoryProfile(...args),
     getPM2Processes: (...args: unknown[]) => mockGetPM2Processes(...args),
     getUserAuthCode: (...args: unknown[]) => mockGetUserAuthCode(...args),
     getServerLog: (...args: unknown[]) => mockGetServerLog(...args),
@@ -98,8 +101,12 @@ import { useDashboardState } from "@/composables/useDashboardState";
 describe("useDashboardState", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Clear queued implementations, not just call counts.
+    mockUseRequest.mockReset();
+    mockUsePolling.mockReset();
 
     mockUseRequest
+      .mockReturnValueOnce({ data: ref(null), execute: vi.fn() })
       .mockReturnValueOnce({ data: ref(null), execute: vi.fn() })
       .mockReturnValueOnce({ data: ref(null), execute: vi.fn() })
       .mockReturnValueOnce({ data: ref(null), execute: vi.fn() });
@@ -117,7 +124,7 @@ describe("useDashboardState", () => {
 
     expect(mockLoggerError).not.toHaveBeenCalled();
 
-    expect(mockUseRequest).toHaveBeenCalledTimes(3);
+    expect(mockUseRequest).toHaveBeenCalledTimes(4);
     expect(mockUsePolling).toHaveBeenCalledTimes(5);
 
     expect(mockUsePolling.mock.calls[0]?.[1]).toMatchObject({
@@ -159,7 +166,10 @@ describe("useDashboardState", () => {
     const pm2Request = mockUseRequest.mock.calls[1]?.[0] as (
       context?: { signal: AbortSignal }
     ) => Promise<unknown>;
-    const authCodeRequest = mockUseRequest.mock.calls[2]?.[0] as (
+    const memoryRequest = mockUseRequest.mock.calls[2]?.[0] as (
+      context?: { signal: AbortSignal }
+    ) => Promise<unknown>;
+    const authCodeRequest = mockUseRequest.mock.calls[3]?.[0] as (
       context?: { signal: AbortSignal }
     ) => Promise<unknown>;
 
@@ -173,6 +183,11 @@ describe("useDashboardState", () => {
     expect(mockGetPM2Processes).toHaveBeenCalledWith(
       { signal, timeoutMs: 10000 },
       { showLoader: false }
+    );
+
+    await memoryRequest({ signal });
+    expect(mockGetMemoryProfile).toHaveBeenCalledWith(
+      { signal, timeoutMs: 10000 }, { showLoader: false }
     );
 
     await authCodeRequest({ signal });

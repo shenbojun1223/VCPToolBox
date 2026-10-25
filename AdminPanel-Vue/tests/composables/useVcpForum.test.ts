@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ref, type Ref } from "vue";
+import { nextTick, ref, type Ref } from "vue";
+import { createPinia, setActivePinia } from "pinia";
+import { useAuthStore } from "@/stores/auth";
 
 const {
   mockGetPosts,
@@ -44,6 +46,7 @@ vi.mock("@/utils/logger", () => ({
 
 vi.mock("marked", () => ({
   marked: {
+    use: vi.fn(),
     parse: vi.fn((content: string) => `<p>${content}</p>`),
   },
 }));
@@ -78,7 +81,8 @@ import {
 
 describe("useVcpForum", () => {
   beforeEach(() => {
-    mockGetPosts.mockReset();
+    setActivePinia(createPinia());
+    mockGetPosts.mockReset().mockResolvedValue([]);
     mockGetPostContent.mockReset();
     mockSubmitReply.mockReset();
     mockDeletePost.mockReset();
@@ -128,6 +132,7 @@ describe("useVcpForum", () => {
 
     state.onSearchInput("a");
     state.onBoardChange("General");
+    await nextTick();
 
     expect(mockResetPagination).toHaveBeenCalled();
     expect(state.boards.value).toContain("General");
@@ -203,7 +208,9 @@ describe("useVcpForum", () => {
     expect(mockShowMessage).toHaveBeenCalled();
   });
 
-  it("deletes the selected post after confirmation and returns to list", async () => {
+  it("deletes the selected post for an authorized admin and returns to list", async () => {
+    // Confirmation belongs to the view; this composable enforces role permission.
+    useAuthStore().user = { username: "SyntheticAdmin", role: "admin" };
     mockDeletePost.mockResolvedValueOnce("帖子删除成功");
 
     const state = useVcpForum();
@@ -234,11 +241,35 @@ describe("useVcpForum", () => {
     expect(mockShowMessage).toHaveBeenCalledWith("帖子删除成功", "success");
   });
 
+  it("blocks deleting posts and replies without admin permission", async () => {
+    useAuthStore().user = { username: "SyntheticReader", role: "user" };
+    const state = useVcpForum();
+    state.selectedPost.value = {
+      uid: "p1", title: "T", author: "A", board: "B", timestamp: "now",
+      contentHtml: "x", replies: 0, repliesList: [],
+    };
+    expect(state.canDelete.value).toBe(false);
+    await state.deletePost();
+    await state.deleteReply(1);
+    expect(mockDeletePost).not.toHaveBeenCalled();
+    expect(mockDeleteReply).not.toHaveBeenCalled();
+    expect(mockShowMessage).toHaveBeenCalledWith("当前账号无删除权限", "error");
+    expect(state.selectedPost.value?.uid).toBe("p1");
+  });
+
   it("exposes stable feature contract for forum view integration", () => {
     const state = useVcpForum();
 
     expect(Object.keys(state).sort()).toEqual(
       [
+        "canDelete",
+        "replyAuthor",
+        "isLoadingPosts",
+        "isLoadingDetail",
+        "isSubmitting",
+        "isDeletingPost",
+        "deletingReplyFloor",
+        "scrollToReplyFloor",
         "backToList",
         "boards",
         "currentPage",

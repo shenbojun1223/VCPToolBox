@@ -6,6 +6,7 @@ vi.mock("vue", async () => {
   return {
     ...actual,
     onMounted: () => {},
+    onUnmounted: () => {},
   };
 });
 
@@ -92,6 +93,10 @@ describe("useAgentAssistantConfig", () => {
       maxHistory: 9,
       contextTtl: 48,
       globalSystemPrompt: "global-prompt",
+      delegationMaxRounds: 15,
+      delegationTimeout: 300000,
+      delegationSystemPrompt: "",
+      delegationHeartbeatPrompt: "",
     });
 
     expect(state.agents.value).toHaveLength(2);
@@ -113,7 +118,7 @@ describe("useAgentAssistantConfig", () => {
     expect(state.availableAgents.value).toEqual(["Nova", "Atlas"]);
   });
 
-  it("supports creating/removing assistants from existing agent and custom template", () => {
+  it("supports creating/removing assistants from existing agent and custom template", async () => {
     const state = useAgentAssistantConfig();
 
     state.selectedExistingAgent.value = "Nova";
@@ -135,8 +140,36 @@ describe("useAgentAssistantConfig", () => {
       temperature: 0.7,
     });
 
-    state.removeAgent(1);
+    await state.removeAgent(1);
     expect(state.agents.value).toHaveLength(1);
+  });
+
+  it("keeps the assistant when removal confirmation is declined", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => false));
+    const state = useAgentAssistantConfig();
+    state.addCustomAgent();
+    const id = state.agents.value[0].localId;
+    await state.removeAgent(0);
+    expect(state.agents.value).toHaveLength(1);
+    expect(state.agents.value[0].localId).toBe(id);
+    expect(mockSaveAgentConfig).not.toHaveBeenCalled();
+  });
+
+  it("loads explicit delegation settings instead of silently using defaults", async () => {
+    mockGetAgentConfig.mockResolvedValueOnce({
+      agents: [], delegationMaxRounds: 21, delegationTimeout: 120000,
+      delegationSystemPrompt: "delegation fixture",
+      delegationHeartbeatPrompt: "heartbeat fixture",
+    });
+    mockGetAgentMap.mockResolvedValueOnce({});
+    const state = useAgentAssistantConfig();
+    await state.loadConfig();
+    expect(state.globalConfig.value).toEqual({
+      maxHistory: 7, contextTtl: 24, globalSystemPrompt: "",
+      delegationMaxRounds: 21, delegationTimeout: 120000,
+      delegationSystemPrompt: "delegation fixture",
+      delegationHeartbeatPrompt: "heartbeat fixture",
+    });
   });
 
   it("validates before save and posts normalized payload on success", async () => {
@@ -163,6 +196,10 @@ describe("useAgentAssistantConfig", () => {
 
     state.globalConfig.value.maxHistory = 10;
     state.globalConfig.value.contextTtl = 72;
+    state.globalConfig.value.delegationMaxRounds = 12;
+    state.globalConfig.value.delegationTimeout = 180000;
+    state.globalConfig.value.delegationSystemPrompt = "synthetic delegation";
+    state.globalConfig.value.delegationHeartbeatPrompt = "synthetic heartbeat";
     state.globalConfig.value.globalSystemPrompt = "缁熶竴琛ュ厖";
     state.agents.value = [
       {
@@ -193,6 +230,10 @@ describe("useAgentAssistantConfig", () => {
       {
         maxHistoryRounds: 10,
         contextTtlHours: 72,
+        delegationMaxRounds: 12,
+        delegationTimeout: 180000,
+        delegationSystemPrompt: "synthetic delegation",
+        delegationHeartbeatPrompt: "synthetic heartbeat",
         globalSystemPrompt: "缁熶竴琛ュ厖",
         agents: [
           {
@@ -220,6 +261,12 @@ describe("useAgentAssistantConfig", () => {
 
     expect(Object.keys(state).sort()).toEqual(
       [
+        "activeDelegations",
+        "recentDelegations",
+        "delegationStatusMessage",
+        "delegationLoading",
+        "loadDelegations",
+        "cancelDelegation",
         "addCustomAgent",
         "addFromExisting",
         "agents",

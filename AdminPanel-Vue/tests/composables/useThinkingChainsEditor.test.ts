@@ -112,6 +112,7 @@ function createPointerHarness(
     ...dom,
     move(event: PointerEvent) {
       getWindowListener("pointermove")(event);
+      dom.flushAnimationFrame();
     },
     up(event: PointerEvent) {
       getWindowListener("pointerup")(event);

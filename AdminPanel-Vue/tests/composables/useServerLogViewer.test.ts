@@ -15,6 +15,8 @@ const {
   mockGetServerLog,
   mockGetIncrementalServerLog,
   mockShowMessage,
+  mockCopyToClipboard,
+  mockAskConfirm,
   mockSetScrollTop,
   mockLoggerWarn,
   mockUseVirtualScroll,
@@ -22,6 +24,8 @@ const {
   mockGetServerLog: vi.fn(async () => ({})),
   mockGetIncrementalServerLog: vi.fn(async () => ({})),
   mockShowMessage: vi.fn(),
+  mockCopyToClipboard: vi.fn(async () => true),
+  mockAskConfirm: vi.fn(async () => true),
   mockSetScrollTop: vi.fn(),
   mockLoggerWarn: vi.fn(),
   mockUseVirtualScroll: vi.fn(),
@@ -37,6 +41,10 @@ vi.mock("@/api", () => ({
 
 vi.mock("@/utils", () => ({
   showMessage: (...args: unknown[]) => mockShowMessage(...args),
+  copyToClipboard: mockCopyToClipboard,
+}));
+vi.mock("@/platform/feedback/feedbackBus", () => ({
+  askConfirm: mockAskConfirm,
 }));
 
 vi.mock("@/utils/logger", () => ({
@@ -66,6 +74,8 @@ describe("useServerLogViewer", () => {
     mockGetServerLog.mockReset();
     mockGetIncrementalServerLog.mockReset();
     mockShowMessage.mockReset();
+    mockCopyToClipboard.mockReset().mockResolvedValue(true);
+    mockAskConfirm.mockReset().mockResolvedValue(true);
     mockSetScrollTop.mockReset();
     mockLoggerWarn.mockReset();
     mockUseVirtualScroll.mockReset();
@@ -128,11 +138,26 @@ describe("useServerLogViewer", () => {
     state.toggleAutoScroll();
     expect(state.autoScroll.value).toBe(false);
 
-    state.copyLog();
-    expect(mockShowMessage).toHaveBeenCalled();
+    await state.copyLog();
+    expect(mockCopyToClipboard).toHaveBeenCalledWith("[ERROR] failed");
+    expect(mockShowMessage).toHaveBeenCalledWith("日志已复制到剪贴板", "success");
 
-    state.clearLog();
+    await state.clearLog();
     expect(state.totalLines.value).toBe(0);
+  });
+
+  it("reports clipboard failure and keeps log contents when clearing is declined", async () => {
+    mockGetServerLog.mockResolvedValueOnce({ content: "keep me", path: "synthetic.log" });
+    const state = useServerLogViewer();
+    await state.loadLog();
+    mockCopyToClipboard.mockResolvedValueOnce(false);
+    await state.copyLog();
+    expect(mockCopyToClipboard).toHaveBeenCalledWith("keep me");
+    expect(mockShowMessage).toHaveBeenCalledWith("复制失败，请手动选择文本复制", "error");
+    mockAskConfirm.mockResolvedValueOnce(false);
+    await state.clearLog();
+    expect(state.totalLines.value).toBe(1);
+    expect(state.displayedLines.value[0].content).toBe("keep me");
   });
 
   it("marks polling failures by logger warn when initial load already succeeded", async () => {

@@ -73,17 +73,50 @@ describe("diary store", () => {
     expect(store.ragTagsConfig.threshold).toBe(0.8);
   });
 
-  it("filters notes by query", async () => {
+  it("sends trimmed queries to the server and displays its content-search results", async () => {
     const store = useDiaryStore();
-
+    store.selectedFolder = "knowledge";
     store.notes = [
       { file: "alpha.md", title: "Alpha", modified: "" },
       { file: "beta.md", title: "Beta", modified: "" },
     ];
+    store.setSearchQuery("  alp  ");
+    expect(mockGetDiaryList).not.toHaveBeenCalled();
+    expect(store.filteredNotes).toHaveLength(2);
 
-    store.setSearchQuery("alp");
+    // The server can match body text even when the file/title do not contain "alp".
+    mockGetDiaryList.mockResolvedValueOnce({
+      notes: [{ file: "beta.md", title: "Beta", modified: "", preview: "contains alp" }],
+      total: 1, page: 1, pageSize: 1,
+    });
+    await store.filterNotes();
+    expect(mockGetDiaryList).toHaveBeenCalledTimes(1);
+    expect(mockGetDiaryList).toHaveBeenCalledWith({
+      folder: "knowledge", search: "alp", basePath: "/admin_api/dailynotes",
+    });
+    expect(store.filteredNotes).toEqual([{
+      file: "beta.md", title: "Beta", modified: "", preview: "contains alp",
+    }]);
+    expect(store.loadingNotes).toBe(false);
+  });
 
-    expect(store.filteredNotes).toHaveLength(1);
-    expect(store.filteredNotes[0]?.file).toBe("alpha.md");
+  it("does not let an older search response overwrite the latest results", async () => {
+    const store = useDiaryStore();
+    store.selectedFolder = "knowledge";
+    type Response = { notes: Array<{ file: string; modified: string }>; total: number; page: number; pageSize: number };
+    let resolveOld!: (value: Response) => void;
+    mockGetDiaryList.mockImplementationOnce(() => new Promise<Response>(resolve => { resolveOld = resolve; }));
+    store.setSearchQuery("old");
+    const oldRequest = store.filterNotes();
+    mockGetDiaryList.mockResolvedValueOnce({
+      notes: [{ file: "new.md", modified: "" }], total: 1, page: 1, pageSize: 1,
+    });
+    store.setSearchQuery("new");
+    await store.filterNotes();
+    resolveOld({ notes: [{ file: "old.md", modified: "" }], total: 1, page: 1, pageSize: 1 });
+    await oldRequest;
+    expect(mockGetDiaryList).toHaveBeenNthCalledWith(1, { folder: "knowledge", search: "old", basePath: "/admin_api/dailynotes" });
+    expect(mockGetDiaryList).toHaveBeenNthCalledWith(2, { folder: "knowledge", search: "new", basePath: "/admin_api/dailynotes" });
+    expect(store.filteredNotes.map(n => n.file)).toEqual(["new.md"]);
   });
 });
