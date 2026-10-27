@@ -25,7 +25,8 @@ function load(relative, mocks = {}, globals = {}) {
       const reviewedPureModules = new Set([
         'modules/opencodeGoSession.js',
         'modules/sourcePrivacyPolicy.js',
-        'modules/vcpLoop/historySanitizer.js'
+        'modules/vcpLoop/historySanitizer.js',
+        'modules/vcpLoop/modelOutputGuard.js'
       ]);
       if (id.startsWith('./') || id.startsWith('../')) {
         const resolved = path.resolve(path.dirname(filename), id);

@@ -2,7 +2,7 @@ const { UpstreamError, assertResponseOk, throwIfAborted } = require('../upstream
 // modules/handlers/streamHandler.js
 const { StringDecoder } = require('string_decoder');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
-const roleDivider = require('../roleDivider.js');
+const { ModelOutputGuard, NOTICE: modelProtocolNotice } = require('../vcpLoop/modelOutputGuard');
 const {
   extractReasoningText,
   removeReasoningFields,
@@ -43,11 +43,7 @@ class StreamHandler {
       apiRetryDelay,
       RAGMemoRefresh,
       enableRoleDivider,
-      enableRoleDividerInLoop,
-      roleDividerIgnoreList,
-      roleDividerSwitches,
-      roleDividerScanSwitches,
-      roleDividerRemoveDisabledTags,
+
       toolExecutor,
       ToolCallParser,
       abortController,
@@ -94,6 +90,8 @@ class StreamHandler {
     let lastUpstreamFinishReason = null;
     let lastUpstreamError = null;
     let completed = false;
+    let protocolHalt = null;
+    let currentExecutionText = '';
 
     const finalUpstreamFinishReason = () => validUpstreamTurns ? 'stop'
       : (lastUpstreamFinishReason && lastUpstreamFinishReason !== 'stop' ? lastUpstreamFinishReason : null);
@@ -195,6 +193,7 @@ class StreamHandler {
       return new Promise((resolve, reject) => {
         const decoder = new StringDecoder('utf8');
         let collectedContentThisTurn = '';
+        const outputGuard = new ModelOutputGuard();
         let sseLineBuffer = '';
         let streamAborted = false;
         let keepAliveTimer = null;
@@ -211,10 +210,12 @@ class StreamHandler {
         let upstreamEnded = false;
         const result = () => ({
           content: collectedContentThisTurn,
+          executionText: outputGuard.executionText(),
+          halt: outputGuard.halt,
           message,
           finishReason,
           streamError,
-          completed: !streamAborted && !invalidPayload && aiResponse.ok &&
+          completed: !outputGuard.halt && !streamAborted && !invalidPayload && aiResponse.ok &&
             collectedContentThisTurn.trim().length > 0 &&
             (finishReason === 'stop' || (!finishReason && sawDone))
         });
@@ -227,18 +228,19 @@ class StreamHandler {
           if (reason) finishReason = reason;
         };
 
-        const appendDelta = (delta) => {
-          if (delta && delta.content) {
-            collectedContentThisTurn += delta.content;
-            message.content += delta.content;
+        const collectAndGuardPayload = (payload) => {
+          const delta = payload.choices?.[0]?.delta;
+          const visible = typeof delta?.content === 'string' ? delta.content : '';
+          // Raw upstream text is retained only in the diagnostic response object.
+          message.content += visible;
+          message.reasoning_content += extractReasoningText(delta) || '';
+          const safeText = outputGuard.push(visible);
+          collectedContentThisTurn += safeText;
+          const clientPayload = JSON.parse(JSON.stringify(payload));
+          if (clientPayload.choices?.[0]?.delta) {
+            clientPayload.choices[0].delta.content = safeText;
           }
-
-          const reasoningText = extractReasoningText(delta);
-          if (reasoningText) {
-            // 推理内容只保留在日志字段中，绝不混入 collectedContentThisTurn。
-            // 客户端展示转换在独立副本上进行，避免进入 VCP Loop、OneRing 和日记。
-            message.reasoning_content += reasoningText;
-          }
+          return clientPayload;
         };
 
         const transformParsedDataForClient = (parsedData) => {
@@ -387,8 +389,7 @@ class StreamHandler {
                 try {
                   parsedData = JSON.parse(jsonData);
                   observePayload(parsedData);
-                  // 后台始终收集未经展示转换的原始 delta。
-                  appendDelta(parsedData.choices?.[0]?.delta);
+                  parsedData = collectAndGuardPayload(parsedData);
                 } catch (e) { invalidPayload = true; }
               }
             }
@@ -398,7 +399,7 @@ class StreamHandler {
               try {
                 if (isDoneLine) {
                   writeClientReasoningCloseChunk();
-                } else if (parsedData && (reasoningToContentEnabled || parsedData.choices?.some(choice => choice.finish_reason))) {
+                } else if (parsedData) {
                   const transformedData = reasoningToContentEnabled
                     ? transformParsedDataForClient(parsedData)
                     : JSON.parse(JSON.stringify(parsedData));
@@ -442,7 +443,7 @@ class StreamHandler {
                 try {
                   parsedData = JSON.parse(jsonData);
                   observePayload(parsedData);
-                  appendDelta(parsedData.choices?.[0]?.delta);
+                  parsedData = collectAndGuardPayload(parsedData);
                 } catch (e) { invalidPayload = true; }
               }
             }
@@ -451,7 +452,7 @@ class StreamHandler {
               try {
                 if (isDoneLine) {
                   writeClientReasoningCloseChunk();
-                } else if (parsedData && (reasoningToContentEnabled || parsedData.choices?.some(choice => choice.finish_reason))) {
+                } else if (parsedData) {
                   const transformedData = reasoningToContentEnabled
                     ? transformParsedDataForClient(parsedData)
                     : JSON.parse(JSON.stringify(parsedData));
@@ -466,7 +467,17 @@ class StreamHandler {
             }
           }
 
+          const tail = outputGuard.finish();
+          collectedContentThisTurn += tail;
           writeClientReasoningCloseChunk();
+          if (tail && !res.writableEnded && !res.destroyed) {
+            res.write(`data: ${JSON.stringify({
+              id: `chatcmpl-VCP-guard-tail-${Date.now()}`,
+              object: 'chat.completion.chunk',
+              model: originalBody.model,
+              choices: [{ index: 0, delta: { content: tail }, finish_reason: null }]
+            })}\n\n`);
+          }
           cleanupStream();
           resolve(result());
         };
@@ -486,8 +497,10 @@ class StreamHandler {
     lastUpstreamFinishReason = initialAIResponseData.finishReason;
     if (initialAIResponseData.streamError) lastUpstreamError = initialAIResponseData.streamError;
     currentAIContentForLoop = initialAIResponseData.content;
+    currentExecutionText = initialAIResponseData.executionText;
+    protocolHalt = initialAIResponseData.halt;
     if (writeChatLog) chatLogs.push({ request: originalBody, response: initialAIResponseData.message });
-    if (currentAIContentForLoop && currentAIContentForLoop.trim()) {
+    if (!protocolHalt && currentAIContentForLoop && currentAIContentForLoop.trim()) {
       oneRingAssistantTurnParts.push(currentAIContentForLoop);
     }
 
@@ -499,33 +512,26 @@ class StreamHandler {
         break;
       }
 
+      // Check before role processing AND before either normal or archery dispatch.
+      if (protocolHalt) break;
       const rollInjection = rollKeeper.evaluate({ recursionDepth, messages: currentMessagesForLoop });
       if (rollInjection && rollInjection.kind === 'repeat_halt') {
         // 同指纹连续失败达到阈值：硬暂停本轮工具循环，未派发的工具一律不执行。
         stuckHalt = rollInjection;
         break;
       }
-      let assistantMessages = [{ role: 'assistant', content: currentAIContentForLoop }];
-      if (enableRoleDivider && enableRoleDividerInLoop) {
-        assistantMessages = roleDivider.process(assistantMessages, {
-          ignoreList: roleDividerIgnoreList,
-          switches: roleDividerSwitches,
-          scanSwitches: roleDividerScanSwitches,
-          removeDisabledTags: roleDividerRemoveDisabledTags,
-          skipCount: 0
-        });
-      }
-      currentMessagesForLoop.push(...assistantMessages);
+      // New model output has no authority to change its protocol role.
+      currentMessagesForLoop.push({ role: 'assistant', content: currentAIContentForLoop });
       // Append reminders after the response so signature replay retains its history position.
       if (rollInjection && rollInjection.kind && rollInjection.content) {
         currentMessagesForLoop.push({ role: 'system', content: rollInjection.content });
       }
 
-      const toolCalls = vcpToolUseForbidden ? [] : ToolCallParser.parse(currentAIContentForLoop);
+      const toolCalls = vcpToolUseForbidden ? [] : ToolCallParser.parse(currentExecutionText);
       if (toolCalls.length === 0) {
         if (DEBUG_MODE) console.log('[VCP Stream Loop] No tool calls found. Exiting loop.');
         const hasUnclosedToolBlock = !vcpToolUseForbidden &&
-          inspectToolBlockClosure(currentAIContentForLoop).hasUnclosed;
+          inspectToolBlockClosure(currentExecutionText).hasUnclosed;
         if (!res.writableEnded) {
           const finalFinishReason = hasUnclosedToolBlock ? null : finalUpstreamFinishReason();
           const incompleteToolStatus = hasUnclosedToolBlock ? { code: 'VCP_TOOL_BLOCK_INCOMPLETE' } : null;
@@ -656,7 +662,9 @@ class StreamHandler {
           lastUpstreamFinishReason = nextAIResponseData.finishReason;
           if (nextAIResponseData.streamError) lastUpstreamError = nextAIResponseData.streamError;
           currentAIContentForLoop = nextAIResponseData.content;
-          if (currentAIContentForLoop && currentAIContentForLoop.trim()) {
+          currentExecutionText = nextAIResponseData.executionText;
+          protocolHalt = nextAIResponseData.halt;
+          if (!protocolHalt && currentAIContentForLoop && currentAIContentForLoop.trim()) {
             oneRingAssistantTurnParts.push(currentAIContentForLoop);
           }
           if (writeChatLog) {
@@ -776,7 +784,7 @@ class StreamHandler {
           })}\n\n`);
         } catch (e) {}
       }
-      
+
       if (hasStartedUserBlock && !res.writableEnded && !res.destroyed && enableRoleDivider) {
          try {
             // close the user block
@@ -896,7 +904,9 @@ class StreamHandler {
       lastUpstreamFinishReason = nextAIResponseData.finishReason;
       if (nextAIResponseData.streamError) lastUpstreamError = nextAIResponseData.streamError;
       currentAIContentForLoop = nextAIResponseData.content;
-      if (currentAIContentForLoop && currentAIContentForLoop.trim()) {
+      currentExecutionText = nextAIResponseData.executionText;
+      protocolHalt = nextAIResponseData.halt;
+      if (!protocolHalt && currentAIContentForLoop && currentAIContentForLoop.trim()) {
         oneRingAssistantTurnParts.push(currentAIContentForLoop);
       }
       if (writeChatLog) {
@@ -915,7 +925,7 @@ class StreamHandler {
 
     // ★ 熔断收口前，将尾部未闭合的 VCP 工具块残片从 OneRing 记忆流中剥除，
     //   防止残片进入 Agent 长期记忆并污染未来的 RAG 检索。
-    if ((stuckHalt || recursionDepth >= maxRecursion) && oneRingAssistantTurnParts.length > 0) {
+    if (!protocolHalt && (stuckHalt || recursionDepth >= maxRecursion) && oneRingAssistantTurnParts.length > 0) {
       try {
         const { sanitizeContent } = require('../vcpLoop/historySanitizer.js');
         const lastIdx = oneRingAssistantTurnParts.length - 1;
@@ -928,12 +938,22 @@ class StreamHandler {
     if (writeChatLog) writeChatLog(originalBody, chatLogs);
     // OneRing 由主流程在整轮完成且响应发送完成后提交。
 
-    if (stuckHalt && !res.writableEnded && !res.destroyed) {
+    if (protocolHalt && !res.writableEnded && !res.destroyed) {
+      completed = false;
+      res.write(`data: ${JSON.stringify({
+        id: `chatcmpl-VCP-protocol-halt-${Date.now()}`,
+        object: 'chat.completion.chunk',
+        model: originalBody.model,
+        choices: [{ index: 0, delta: { content: modelProtocolNotice }, finish_reason: 'stop' }],
+        vcp_status: protocolHalt
+      })}\n\n`);
+      res.write('data: [DONE]\n\n', () => res.end());
+    } else if (stuckHalt && !res.writableEnded && !res.destroyed) {
       // 独立暂停原因：同一工具同参数连续失败达到阈值。与 limit 分支互斥，各自只结束一次响应。
       let pendingToolCallsAtStuck = [];
       if (!vcpToolUseForbidden) {
         try {
-          pendingToolCallsAtStuck = ToolCallParser.parse(currentAIContentForLoop);
+          pendingToolCallsAtStuck = ToolCallParser.parse(currentExecutionText);
         } catch (parseError) {
           console.error('[VCP Stream Loop] Failed to inspect pending tool calls at stuck halt:', parseError);
         }
@@ -976,7 +996,7 @@ class StreamHandler {
       let pendingToolCallsAtLimit = [];
       if (!vcpToolUseForbidden) {
         try {
-          pendingToolCallsAtLimit = ToolCallParser.parse(currentAIContentForLoop);
+          pendingToolCallsAtLimit = ToolCallParser.parse(currentExecutionText);
         } catch (parseError) {
           console.error('[VCP Stream Loop] Failed to inspect pending tool calls at loop limit:', parseError);
         }

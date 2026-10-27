@@ -8,6 +8,9 @@
  * <<<[ROLE_DIVIDE_USER]>>> ... <<<[END_ROLE_DIVIDE_USER]>>>
  */
 
+const ToolCallParser = require('./vcpLoop/toolCallParser');
+const toolMarkerMatcher = require('./vcpLoop/toolMarkerFuzzyMatcher');
+
 const TAGS = {
     SYSTEM: {
         START: '<<<[ROLE_DIVIDE_SYSTEM]>>>',
@@ -88,9 +91,18 @@ function protectToolContent(message) {
                 start = index;
             }
         }
+        // Use the same marker recognition and ESCAPE boundaries as dispatch.
+        const requestStart = toolMarkerMatcher.findBlockStartMarker(text, cursor);
+        if (requestStart && (start === -1 || requestStart.index <= start)) {
+            const block = ToolCallParser.extractNextToolBlock(text, requestStart.index);
+            const end = block ? block.nextOffset : text.length;
+            ranges.push({ start: requestStart.index, end });
+            cursor = end;
+            continue;
+        }
         if (!selected) break;
 
-        // Balance nested blocks; an incomplete tool block protects the remainder.
+        // Receipts may nest (e.g. AgentAssistant); incomplete receipts stay opaque.
         let depth = 1;
         let end = start + selected.start.length;
         while (depth > 0) {

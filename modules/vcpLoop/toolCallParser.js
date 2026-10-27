@@ -185,34 +185,32 @@ class ToolCallParser {
   }
 
   static _findBlockEnd(content, fromIndex) {
+    return this.scanBlockEnd(content, fromIndex).match;
+  }
+
+  // Segments must end on a line boundary: protocol markers cannot span newlines.
+  // ESCAPE is non-nesting, exactly as in _scanFields. Share this lexer with guards.
+  static scanBlockEnd(content, fromIndex = 0, inEscape = false) {
     let cursor = fromIndex;
     const escapeStartRegex = toolMarkerFuzzyMatcher.getEscapeStartRegex(false);
     const escapeEndRegex = toolMarkerFuzzyMatcher.getEscapeEndRegex(false);
-
     while (cursor < content.length) {
-      const remaining = content.slice(cursor);
-      const startMatch = escapeStartRegex.exec(remaining);
-      const nextEscapeStart = startMatch ? cursor + startMatch.index : -1;
-      
-      const endMatch = toolMarkerFuzzyMatcher.findBlockEndMarker(content, cursor);
-
-      if (!endMatch) return null;
-      if (nextEscapeStart === -1 || endMatch.index < nextEscapeStart) {
-        return endMatch;
+      if (inEscape) {
+        const close = escapeEndRegex.exec(content.slice(cursor));
+        if (!close) return { match: null, inEscape: true };
+        cursor += close.index + close[0].length;
+        inEscape = false;
+        continue;
       }
-
-      const searchStartFrom = nextEscapeStart + startMatch[0].length;
-      const escapeEndMatch = escapeEndRegex.exec(content.slice(searchStartFrom));
-
-      if (!escapeEndMatch) {
-        return null;
+      const open = escapeStartRegex.exec(content.slice(cursor));
+      const end = toolMarkerFuzzyMatcher.findBlockEndMarker(content, cursor);
+      if (!open || (end && end.index < cursor + open.index)) {
+        return { match: end, inEscape: false };
       }
-
-      const escapedEnd = searchStartFrom + escapeEndMatch.index;
-      cursor = escapedEnd + escapeEndMatch[0].length;
+      cursor += open.index + open[0].length;
+      inEscape = true;
     }
-
-    return null;
+    return { match: null, inEscape };
   }
 
   static _scanFields(blockContent) {

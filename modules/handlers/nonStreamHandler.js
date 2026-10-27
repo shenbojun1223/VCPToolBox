@@ -3,7 +3,7 @@ const { UpstreamError, assertResponseOk, abortableDelay, abortError, throwIfAbor
 // AICW 内层禁工具消费回执（opt-in）：仅在请求携带本机控制头时写入保留响应头。
 const { emitVcpToolForbiddenReceipt } = require('../vcpToolForbiddenReceipt.js');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
-const roleDivider = require('../roleDivider.js');
+const { inspectModelOutput, NOTICE: modelProtocolNotice } = require('../vcpLoop/modelOutputGuard');
 const {
   buildClientVisibleContent,
   removeReasoningFields,
@@ -178,11 +178,7 @@ class NonStreamHandler {
       apiRetryDelay,
       RAGMemoRefresh,
       enableRoleDivider,
-      enableRoleDividerInLoop,
-      roleDividerIgnoreList,
-      roleDividerSwitches,
-      roleDividerScanSwitches,
-      roleDividerRemoveDisabledTags,
+
       toolExecutor,
       ToolCallParser,
       abortController,
@@ -289,19 +285,23 @@ class NonStreamHandler {
     let oneRingAssistantTurnParts = [];
     let validUpstreamTurns = isCompleteNonStreamResponse(firstReadResult);
     let completed = false;
+    let protocolHalt = null;
+    let currentInspection = null;
+    let currentExecutionText = '';
 
     let fullContentFromAI = '';
     let currentAIContentForClient = '';
     const extractedResponse = (rawResponseText) => parseNonStreamResponse(rawResponseText);
     const extractVisibleContent = (message, fallbackText = '') => {
-      if (!message) return fallbackText;
-      // OneRing 入库和 VCP 循环始终只使用正文 content。
-      return message.content || '';
+      currentInspection = inspectModelOutput(message ? (message.content || '') : fallbackText);
+      protocolHalt = currentInspection.halt;
+      currentExecutionText = currentInspection.executionText;
+      return currentInspection.content;
     };
     const extractClientContent = (message, fallbackText = '', choice = null) => {
-      if (!message) return fallbackText;
+      if (!message) return currentInspection?.content || fallbackText;
       return buildClientVisibleContent(
-        message,
+        { ...message, content: currentInspection.content },
         reasoningToContentEnabled,
         reasoningTag,
         choice,
@@ -315,11 +315,11 @@ class NonStreamHandler {
       fullContentFromAI = extractVisibleContent(initMessage);
       currentAIContentForClient = extractClientContent(initMessage, '', initParsedResponse.choice);
     } else {
-      fullContentFromAI = aiResponseText;
-      currentAIContentForClient = aiResponseText;
+      fullContentFromAI = extractVisibleContent(null, aiResponseText);
+      currentAIContentForClient = fullContentFromAI;
     }
     if (writeChatLog) chatLogs.push({ request: originalBody, response: initMessage || fullContentFromAI});
-    if (fullContentFromAI && fullContentFromAI.trim()) {
+    if (!protocolHalt && fullContentFromAI && fullContentFromAI.trim()) {
       oneRingAssistantTurnParts.push(fullContentFromAI);
     }
 
@@ -346,6 +346,11 @@ class NonStreamHandler {
         break;
       }
 
+      if (protocolHalt) {
+        conversationHistoryForClient.push(modelProtocolNotice);
+        completed = false;
+        break;
+      }
       const rollInjection = rollKeeper.evaluate({ recursionDepth, messages: currentMessagesForNonStreamLoop });
       if (rollInjection && rollInjection.kind === 'repeat_halt') {
         // 同指纹连续失败达到阈值：硬暂停本轮工具循环，未派发的工具一律不执行。
@@ -357,7 +362,7 @@ class NonStreamHandler {
 
       // Overlay: 记录本轮真实采用的分支（回执只能申报真实发生的分支）。
       toolParseSkippedThisRequest = vcpToolUseForbidden === true;
-      const toolCalls = vcpToolUseForbidden ? [] : ToolCallParser.parse(currentAIContentForLoop);
+      const toolCalls = vcpToolUseForbidden ? [] : ToolCallParser.parse(currentExecutionText);
 
       if (toolCalls.length > 0) {
         anyToolProcessedInCurrentIteration = true;
@@ -393,17 +398,7 @@ class NonStreamHandler {
 
         // 处理纯 Archery 且有错误的情况
         if (normalCalls.length === 0 && archeryErrorContents.length > 0) {
-          let assistantMessages = [{ role: 'assistant', content: currentAIContentForLoop }];
-          if (enableRoleDivider && enableRoleDividerInLoop) {
-            assistantMessages = roleDivider.process(assistantMessages, {
-              ignoreList: roleDividerIgnoreList,
-              switches: roleDividerSwitches,
-              scanSwitches: roleDividerScanSwitches,
-              removeDisabledTags: roleDividerRemoveDisabledTags,
-              skipCount: 0
-            });
-          }
-          currentMessagesForNonStreamLoop.push(...assistantMessages);
+          currentMessagesForNonStreamLoop.push({ role: 'assistant', content: currentAIContentForLoop });
           // Keep the response at its original position for upstream signature replay.
           if (rollInjection && rollInjection.kind && rollInjection.content) {
             currentMessagesForNonStreamLoop.push({ role: 'system', content: rollInjection.content });
@@ -448,10 +443,10 @@ class NonStreamHandler {
               currentAIContentForLoop = extractVisibleContent(recursionMessage);
               currentAIContentForClient = '\n' + extractClientContent(recursionMessage, '', recursionParsedResponse.choice);
             } else {
-              currentAIContentForLoop = recursionText;
-              currentAIContentForClient = '\n' + recursionText;
+              currentAIContentForLoop = extractVisibleContent(null, recursionText);
+              currentAIContentForClient = '\n' + currentAIContentForLoop;
             }
-            if (currentAIContentForLoop && currentAIContentForLoop.trim()) {
+            if (!protocolHalt && currentAIContentForLoop && currentAIContentForLoop.trim()) {
               oneRingAssistantTurnParts.push(currentAIContentForLoop);
             }
             if (writeChatLog) {
@@ -473,17 +468,8 @@ class NonStreamHandler {
         }
 
         // 执行普通调用
-        let assistantMessages = [{ role: 'assistant', content: currentAIContentForLoop }];
-        if (enableRoleDivider && enableRoleDividerInLoop) {
-          assistantMessages = roleDivider.process(assistantMessages, {
-            ignoreList: roleDividerIgnoreList,
-            switches: roleDividerSwitches,
-            scanSwitches: roleDividerScanSwitches,
-            removeDisabledTags: roleDividerRemoveDisabledTags,
-            skipCount: 0
-          });
-        }
-        currentMessagesForNonStreamLoop.push(...assistantMessages);
+        // Model-generated text stays assistant; only the executor adds result messages.
+        currentMessagesForNonStreamLoop.push({ role: 'assistant', content: currentAIContentForLoop });
         // Keep the response at its original position for upstream signature replay.
         if (rollInjection && rollInjection.kind && rollInjection.content) {
           currentMessagesForNonStreamLoop.push({ role: 'system', content: rollInjection.content });
@@ -656,10 +642,10 @@ class NonStreamHandler {
           currentAIContentForLoop = extractVisibleContent(recursionMessage);
           currentAIContentForClient = '\n' + extractClientContent(recursionMessage, '', recursionParsedResponse.choice);
         } else {
-          currentAIContentForLoop = recursionText;
-          currentAIContentForClient = '\n' + recursionText;
+          currentAIContentForLoop = extractVisibleContent(null, recursionText);
+          currentAIContentForClient = '\n' + currentAIContentForLoop;
         }
-        if (currentAIContentForLoop && currentAIContentForLoop.trim()) {
+        if (!protocolHalt && currentAIContentForLoop && currentAIContentForLoop.trim()) {
           oneRingAssistantTurnParts.push(currentAIContentForLoop);
         }
         if (writeChatLog) {
@@ -684,12 +670,15 @@ class NonStreamHandler {
 
     throwIfAborted(abortController.signal);
     if (res.writableEnded || res.destroyed) return;
-    const loopEndedAtLimit = recursionDepth >= maxRecursion
+    if (protocolHalt && !conversationHistoryForClient.includes(modelProtocolNotice)) {
+      conversationHistoryForClient.push(modelProtocolNotice);
+    }
+    const loopEndedAtLimit = !protocolHalt && recursionDepth >= maxRecursion
       && !(abortController && abortController.signal.aborted);
     let pendingToolCallsAtLimit = [];
     if (loopEndedAtLimit && !vcpToolUseForbidden) {
       try {
-        pendingToolCallsAtLimit = ToolCallParser.parse(currentAIContentForLoop);
+        pendingToolCallsAtLimit = ToolCallParser.parse(currentExecutionText);
       } catch (parseError) {
         console.error('[VCP NonStream Loop] Failed to inspect pending tool calls at loop limit:', parseError);
       }
@@ -703,7 +692,7 @@ class NonStreamHandler {
     let pendingToolCallsAtStuck = [];
     if (loopEndedAtStuck && !vcpToolUseForbidden) {
       try {
-        pendingToolCallsAtStuck = ToolCallParser.parse(currentAIContentForLoop);
+        pendingToolCallsAtStuck = ToolCallParser.parse(currentExecutionText);
       } catch (parseError) {
         console.error('[VCP NonStream Loop] Failed to inspect pending tool calls at stuck halt:', parseError);
       }
@@ -759,7 +748,9 @@ class NonStreamHandler {
       };
     }
 
-    if (loopEndedAtStuck) {
+    if (protocolHalt) {
+      finalJsonResponse.vcp_status = protocolHalt;
+    } else if (loopEndedAtStuck) {
       finalJsonResponse.vcp_status = {
         code: 'VCP_TOOL_LOOP_STUCK',
         current: recursionDepth,
