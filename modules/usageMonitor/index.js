@@ -38,6 +38,220 @@ function parseFiniteNumber(value) {
     return Number.isFinite(num) ? num : null;
 }
 
+const CLAUDE_QUOTA_STAGES = new Set([
+    'auth', 'residential', 'account', 'cache', 'usage', 'service', 'guard',
+    'local', 'probe', 'transport'
+]);
+const CLAUDE_QUOTA_REMOTE_CODES = new Set([
+    'auth_required', 'credentials_untrusted', 'credentials_missing',
+    'credential_expiry_invalid', 'account_identity_missing',
+    'account_identity_invalid', 'residential_proxy_config_invalid',
+    'local_probe_failed', 'local_file_untrusted', 'local_file_oversize',
+    'local_file_invalid', 'local_file_missing', 'cache_missing',
+    'invalid_payload', 'usage_payload_invalid', 'usage_proxy_request_failed',
+    'usage_response_oversize', 'usage_endpoint_refused', 'refresh_token_missing',
+    'credentials_changed', 'credentials_changed_after_refresh',
+    'credentials_persist_failed', 'refresh_payload_invalid',
+    'refresh_proxy_request_failed', 'refresh_response_oversize',
+    'quota_cooldown', 'quota_cooldown_invalid', 'quota_cli_active',
+    'quota_service_busy', 'quota_guard_failed', 'quota_probe_timeout',
+    'live_not_enabled', 'ssh_config_invalid', 'ssh_spawn_failed',
+    'ssh_transport_error', 'output_overflow', 'invalid_probe_output',
+    'invalid_probe_json', 'invalid_probe_shape', 'probe_error',
+    'pending_probe', 'legacy_cooldown', 'success_interval'
+]);
+const CLAUDE_QUOTA_FIXED_CODES = new Set(['UPSTREAM_ERROR', 'CLAUDE_QUOTA_UNAVAILABLE']);
+const CLAUDE_QUOTA_HTTP_RE = /^(?:usage|refresh)_http_[1-5][0-9]{2}$/;
+const CLAUDE_WINDOW_DEFS = [
+    { key: 'five_hour', id: 'five-hour', label: '五小时' },
+    { key: 'seven_day', id: 'weekly', label: '周度' },
+    { key: 'seven_day_sonnet', id: 'weekly-sonnet', label: 'Sonnet (周)' },
+    { key: 'seven_day_opus', id: 'weekly-opus', label: 'Opus (周)' }
+];
+const CLAUDE_MAX_SAFE_MS = 8_640_000_000_000_000;
+
+function safeClaudeStatusCode(value) {
+    if (typeof value !== 'string') return null;
+    if (CLAUDE_QUOTA_REMOTE_CODES.has(value) || CLAUDE_QUOTA_FIXED_CODES.has(value)
+        || CLAUDE_QUOTA_HTTP_RE.test(value)) return value;
+    return null;
+}
+
+function claudeStageForCode(code) {
+    if (typeof code !== 'string') return null;
+    if (code.startsWith('usage_')) return 'usage';
+    if (/^(?:refresh_|credential_|credentials_|auth_)/.test(code)) return 'auth';
+    if (code.startsWith('account_')) return 'account';
+    if (code.startsWith('residential_')) return 'residential';
+    if (code.startsWith('local_') || code.startsWith('cache_')) return 'local';
+    if (/^(?:ssh_|invalid_probe|output_)/.test(code) || code === 'quota_probe_timeout') return 'transport';
+    if (code === 'live_not_enabled' || code === 'quota_cli_active'
+        || code === 'quota_service_busy') return 'service';
+    if (code === 'invalid_payload' || code === 'probe_error') return 'probe';
+    return CLAUDE_QUOTA_REMOTE_CODES.has(code) ? 'guard' : null;
+}
+
+function safeClaudeStage(value, code) {
+    if (CLAUDE_QUOTA_STAGES.has(value)) return value;
+    return claudeStageForCode(code);
+}
+
+function safeClaudeTimeMs(value) {
+    return Number.isSafeInteger(value) && value > 0 && value <= CLAUDE_MAX_SAFE_MS ? value : null;
+}
+
+function safeClaudeRetrySeconds(value) {
+    return Number.isSafeInteger(value) && value >= 0 && value <= 365 * 24 * 60 * 60
+        ? value : null;
+}
+
+function claudeIso(ms) {
+    const safe = safeClaudeTimeMs(ms);
+    return safe === null ? null : new Date(safe).toISOString();
+}
+
+function safeClaudeReset(value) {
+    return typeof value === 'string' && value.length <= 64
+        && !/[\u0000-\u001f\u007f]/.test(value) ? value : null;
+}
+
+function buildClaudeWindows(utilRoot, nowMs) {
+    const windows = [];
+    let staleWindow = false;
+    if (!utilRoot || typeof utilRoot !== 'object' || Array.isArray(utilRoot)) {
+        return { windows, staleWindow };
+    }
+    for (const def of CLAUDE_WINDOW_DEFS) {
+        const item = utilRoot[def.key];
+        if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+        const usedPct = parseFiniteNumber(item.utilization ?? item.percent ?? item.usedPercent);
+        const remPct = parseFiniteNumber(item.remainingPercent);
+        let remainingPercent = null;
+        let usedPercent = null;
+        if (remPct !== null) {
+            remainingPercent = roundPercent(remPct);
+            usedPercent = roundPercent(100 - remainingPercent);
+        } else if (usedPct !== null) {
+            usedPercent = roundPercent(usedPct);
+            remainingPercent = roundPercent(100 - usedPercent);
+        } else {
+            continue;
+        }
+        const resetsAt = safeClaudeReset(item.resets_at ?? item.resetsAt);
+        if (resetsAt) {
+            const resetMs = Date.parse(resetsAt);
+            if (!Number.isFinite(resetMs) || resetMs <= nowMs) staleWindow = true;
+        }
+        windows.push({ id: def.id, label: def.label, remainingPercent, usedPercent, resetsAt });
+    }
+    return { windows, staleWindow };
+}
+
+function readClaudeQuotaMeta(payload, fallbackCode) {
+    const source = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+    const observedAtMs = safeClaudeTimeMs(source.observed_at_ms);
+    const checkedAtMs = safeClaudeTimeMs(source.checked_at_ms);
+    const retryAfterSeconds = safeClaudeRetrySeconds(source.retry_after_seconds);
+    let cooldownUntilMs = safeClaudeTimeMs(source.cooldown_until_ms);
+    if (cooldownUntilMs === null && checkedAtMs !== null
+        && retryAfterSeconds !== null && retryAfterSeconds > 0) {
+        cooldownUntilMs = checkedAtMs + retryAfterSeconds * 1000;
+    }
+    const errorCode = safeClaudeStatusCode(source.error_code) || fallbackCode;
+    return {
+        errorCode,
+        errorStage: safeClaudeStage(source.error_stage, errorCode),
+        lastErrorCode: safeClaudeStatusCode(source.last_error_code),
+        observedAtMs,
+        checkedAtMs,
+        cooldownUntilMs,
+        retryAfterSeconds,
+        cacheHit: source.cache_hit === true,
+        stale: source.stale === true,
+        utilization: source.utilization && typeof source.utilization === 'object'
+            && !Array.isArray(source.utilization) ? source.utilization : null,
+        subscriptionType: typeof source.subscription_type === 'string'
+            && /^[a-z0-9_-]{1,32}$/.test(source.subscription_type)
+            ? source.subscription_type : null
+    };
+}
+
+function claudeQuotaNotice(meta, hasTrustedData, nowMs) {
+    let head;
+    if (meta.errorCode === 'quota_cooldown') {
+        const reason = safeClaudeStatusCode(meta.lastErrorCode);
+        const authReason = reason !== null && (reason === 'usage_http_401'
+            || /^(?:auth_|credential_|credentials_|refresh_)/.test(reason));
+        if (reason && reason.startsWith('refresh_')) {
+            head = `额度查询冷却中；上次认证刷新失败（${reason}），不代表当前认证状态`;
+        } else if (authReason) {
+            head = '额度查询冷却中；认证待官方 CLI 更新';
+        } else {
+            head = reason ? `额度查询冷却中（上次原因：${reason}）` : '额度查询冷却中';
+        }
+    } else if (typeof meta.errorCode === 'string' && meta.errorCode.startsWith('refresh_')) {
+        head = `上次认证刷新失败（${meta.errorCode}），不代表当前认证状态`;
+    } else if (meta.errorStage === 'auth' || meta.errorCode === 'auth_required'
+        || meta.errorCode === 'usage_http_401' || meta.errorCode === 'credentials_untrusted') {
+        head = '等待官方 CLI 更新认证';
+    } else if (meta.errorCode === 'quota_cli_active') {
+        head = 'Claude CLI 正在运行，额度查询暂缓';
+    } else if (meta.errorCode === 'quota_service_busy') {
+        head = 'Bridge 正在执行其他任务，额度查询暂缓';
+    } else if (meta.errorStage === 'usage' || CLAUDE_QUOTA_HTTP_RE.test(meta.errorCode || '')
+        || CLAUDE_QUOTA_FIXED_CODES.has(meta.errorCode)) {
+        head = meta.errorCode ? `额度接口失败（${meta.errorCode}）` : '额度接口失败';
+    } else {
+        head = meta.errorCode ? `额度状态暂不可用（${meta.errorCode}）` : '额度状态暂不可用';
+    }
+    const details = [head];
+    const observedIso = claudeIso(meta.observedAtMs);
+    if (observedIso) details.push(`最后观测：${observedIso}`);
+    const checkedIso = claudeIso(meta.checkedAtMs);
+    if (checkedIso) details.push(`最近检查：${checkedIso}`);
+    if (meta.cooldownUntilMs !== null) {
+        const cooldownIso = claudeIso(meta.cooldownUntilMs);
+        if (meta.cooldownUntilMs > nowMs) {
+            details.push(`下次允许查询：${cooldownIso}`);
+        } else {
+            details.push('冷却已结束，等待下次刷新');
+        }
+    } else if (meta.retryAfterSeconds !== null && meta.retryAfterSeconds > 0) {
+        details.push(`约 ${meta.retryAfterSeconds} 秒后可再查询`);
+    }
+    details.push(hasTrustedData ? '保留上次可信数据（stale）' : '暂无可信额度数据');
+    return details.join('；');
+}
+
+function refreshClaudeStatusCard(account, nowMs) {
+    if (!account || account.provider !== 'claude' || !account.errorCode) return account;
+    let cooldownUntilMs = null;
+    if (typeof account.cooldownUntil === 'string') {
+        const parsed = Date.parse(account.cooldownUntil);
+        if (Number.isFinite(parsed)) cooldownUntilMs = safeClaudeTimeMs(parsed);
+    }
+    let retryAfterSeconds = safeClaudeRetrySeconds(account.retryAfterSeconds);
+    if (cooldownUntilMs !== null) {
+        retryAfterSeconds = Math.max(0, Math.ceil((cooldownUntilMs - nowMs) / 1000));
+    }
+    const meta = {
+        errorCode: safeClaudeStatusCode(account.errorCode) || 'CLAUDE_QUOTA_UNAVAILABLE',
+        errorStage: safeClaudeStage(account.errorStage, account.errorCode),
+        lastErrorCode: safeClaudeStatusCode(account.lastErrorCode),
+        observedAtMs: typeof account.observedAt === 'string' ? Date.parse(account.observedAt) : null,
+        checkedAtMs: typeof account.checkedAt === 'string' ? Date.parse(account.checkedAt) : null,
+        cooldownUntilMs,
+        retryAfterSeconds
+    };
+    const hasTrustedData = Array.isArray(account.windows) && account.windows.length > 0
+        && meta.observedAtMs !== null;
+    return {
+        ...account,
+        retryAfterSeconds,
+        notice: claudeQuotaNotice(meta, hasTrustedData, nowMs)
+    };
+}
+
 function validateLoopbackBaseUrl(rawUrl) {
     if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
         throw createError('CPAMP baseUrl 不能为空', 'INVALID_CPAMP_URL', 400);
@@ -645,86 +859,116 @@ function createUsageMonitorService(options = {}) {
                             'Accept': 'application/json'
                         }
                     });
-                    const utilRoot = resp.data?.utilization;
-                    if (!resp.ok || !resp.data || resp.data.status !== 'ok' || !utilRoot || typeof utilRoot !== 'object') {
-                        throw createError('Claude Bridge 配额响应无效', resp.data?.error_code || `HTTP_${resp.status || 502}`);
+                    const payload = resp && resp.data && typeof resp.data === 'object' && !Array.isArray(resp.data)
+                        ? resp.data : {};
+                    const meta = readClaudeQuotaMeta(payload,
+                        resp && resp.ok ? 'CLAUDE_QUOTA_UNAVAILABLE' : 'UPSTREAM_ERROR');
+                    if (!resp || !resp.ok || payload.status !== 'ok' || !meta.utilization) {
+                        const err = createError('Claude Bridge 配额状态不可用', 'CLAUDE_QUOTA_UNAVAILABLE');
+                        err.claudeQuotaMeta = meta;
+                        throw err;
                     }
-                    const defs = [
-                        { key: 'five_hour', id: 'five-hour', label: '五小时' },
-                        { key: 'seven_day', id: 'weekly', label: '周度' },
-                        { key: 'seven_day_sonnet', id: 'weekly-sonnet', label: 'Sonnet (周)' },
-                        { key: 'seven_day_opus', id: 'weekly-opus', label: 'Opus (周)' }
-                    ];
-                    const windows = [];
-                    let staleWin = false;
-                    for (const def of defs) {
-                        const item = utilRoot[def.key];
-                        if (!item || typeof item !== 'object') continue;
-                        const usedPct = parseFiniteNumber(item.utilization ?? item.percent ?? item.usedPercent);
-                        const remPct = parseFiniteNumber(item.remainingPercent);
-                        let remainingPercent = null;
-                        let usedPercent = null;
-                        if (remPct !== null) {
-                            remainingPercent = roundPercent(remPct);
-                            usedPercent = roundPercent(100 - remainingPercent);
-                        } else if (usedPct !== null) {
-                            usedPercent = roundPercent(usedPct);
-                            remainingPercent = roundPercent(100 - usedPercent);
-                        } else {
-                            continue;
-                        }
-                        const resetsAt = typeof item.resets_at === 'string' && item.resets_at.trim()
-                            ? item.resets_at.trim()
-                            : (typeof item.resetsAt === 'string' && item.resetsAt.trim() ? item.resetsAt.trim() : null);
-                        if (resetsAt && Date.parse(resetsAt) <= nowMs) {
-                            staleWin = true;
-                        }
-                        windows.push({
-                            id: def.id,
-                            label: def.label,
-                            remainingPercent,
-                            usedPercent,
-                            resetsAt
-                        });
+                    let { windows, staleWindow } = buildClaudeWindows(meta.utilization, nowMs);
+                    const observedAt = claudeIso(meta.observedAtMs);
+                    if (meta.observedAtMs !== null && nowMs - meta.observedAtMs > staleAfterMs) {
+                        staleWindow = true;
                     }
-                    const obsMs = parseFiniteNumber(resp.data.observed_at_ms);
-                    if (obsMs !== null && nowMs - obsMs > staleAfterMs) {
-                        staleWin = true;
-                    }
-                    const subType = typeof resp.data.subscription_type === 'string' && resp.data.subscription_type.trim()
-                        ? resp.data.subscription_type.trim().toUpperCase()
-                        : null;
+                    const checkedAtMs = meta.checkedAtMs ?? meta.observedAtMs;
+                    const subType = meta.subscriptionType ? meta.subscriptionType.toUpperCase() : null;
+                    const stale = meta.stale || staleWindow || observedAt === null;
+                    const notice = observedAt === null
+                        ? 'Bridge 未提供可信观测时间，额度数据暂标记为 stale'
+                        : stale
+                            ? '部分窗口已过重置时间或缓存超龄，待刷新'
+                            : (sharedPool ? 'Claude 官方订阅配额（Bridge 共享池）' : 'Claude 官方订阅配额');
                     const card = {
                         ...baseCard,
                         source: 'claude-bridge',
                         scopeLabel: rawAcct.scopeLabel || (subType ? `Claude ${subType} 订阅` : '订阅账户'),
-                        status: staleWin ? 'stale' : 'ok',
-                        observedAt: obsMs !== null && obsMs > 0 ? new Date(obsMs).toISOString() : new Date(nowMs).toISOString(),
+                        status: stale ? 'stale' : 'ok',
+                        observedAt,
+                        checkedAt: claudeIso(checkedAtMs),
+                        cacheHit: meta.cacheHit,
+                        stale,
                         windows,
-                        notice: staleWin
-                            ? '部分窗口已过重置时间或缓存超龄，待刷新'
-                            : (sharedPool ? 'Claude 官方订阅配额（Bridge 共享池）' : 'Claude 官方订阅配额')
+                        errorCode: null,
+                        errorStage: null,
+                        cooldownUntil: null,
+                        retryAfterSeconds: null,
+                        lastErrorCode: null,
+                        notice
                     };
-                    lastGoodAccountByKey.set(idKey, card);
+                    if (windows.length > 0 && observedAt !== null) {
+                        lastGoodAccountByKey.set(idKey, card);
+                    }
                     results.push(card);
                 } catch (err) {
+                    const meta = err && err.claudeQuotaMeta
+                        ? err.claudeQuotaMeta
+                        : readClaudeQuotaMeta({}, 'CLAUDE_QUOTA_UNAVAILABLE');
                     const lastGood = lastGoodAccountByKey.get(idKey);
-                    if (lastGood) {
-                        results.push({
-                            ...lastGood,
+                    const remote = buildClaudeWindows(meta.utilization, nowMs);
+                    const remoteObservedMs = meta.observedAtMs;
+                    const lastGoodObservedMs = lastGood && typeof lastGood.observedAt === 'string'
+                        ? Date.parse(lastGood.observedAt) : null;
+                    const useRemote = remote.windows.length > 0 && remoteObservedMs !== null
+                        && (!lastGood || !Number.isFinite(lastGoodObservedMs)
+                            || remoteObservedMs > lastGoodObservedMs);
+                    let trustedCard = null;
+                    if (lastGood && !useRemote) {
+                        trustedCard = lastGood;
+                    } else if (useRemote) {
+                        const subType = meta.subscriptionType ? meta.subscriptionType.toUpperCase() : null;
+                        trustedCard = {
+                            ...baseCard,
+                            source: 'claude-bridge',
+                            scopeLabel: rawAcct.scopeLabel || (subType ? `Claude ${subType} 订阅` : '订阅账户'),
+                            observedAt: claudeIso(remoteObservedMs),
+                            windows: remote.windows,
+                            cacheHit: meta.cacheHit
+                        };
+                        lastGoodAccountByKey.set(idKey, trustedCard);
+                    }
+                    const hasTrustedData = Boolean(trustedCard && trustedCard.windows?.length > 0
+                        && trustedCard.observedAt);
+                    const noticeMeta = {
+                        ...meta,
+                        observedAtMs: hasTrustedData ? Date.parse(trustedCard.observedAt) : meta.observedAtMs
+                    };
+                    const effectiveCooldownMs = meta.cooldownUntilMs !== null
+                        ? meta.cooldownUntilMs
+                        : (meta.retryAfterSeconds !== null && meta.retryAfterSeconds > 0
+                            ? nowMs + meta.retryAfterSeconds * 1000 : null);
+                    const card = hasTrustedData
+                        ? {
+                            ...trustedCard,
                             status: 'stale',
-                            errorCode: err.code || 'UPSTREAM_ERROR',
-                            notice: 'Claude Bridge 配额刷新失败，保留上次观测结果'
-                        });
-                    } else {
-                        results.push({
+                            stale: true,
+                            errorCode: meta.errorCode,
+                            errorStage: meta.errorStage,
+                            checkedAt: claudeIso(meta.checkedAtMs),
+                            cooldownUntil: claudeIso(effectiveCooldownMs),
+                            retryAfterSeconds: meta.retryAfterSeconds,
+                            lastErrorCode: meta.lastErrorCode,
+                            notice: claudeQuotaNotice(noticeMeta, true, nowMs)
+                        }
+                        : {
                             ...baseCard,
                             source: 'claude-bridge',
                             status: 'error',
-                            errorCode: err.code || 'UPSTREAM_ERROR',
-                            notice: 'Claude Bridge 配额查询失败'
-                        });
-                    }
+                            observedAt: null,
+                            checkedAt: claudeIso(meta.checkedAtMs),
+                            cacheHit: meta.cacheHit,
+                            stale: false,
+                            windows: [],
+                            errorCode: meta.errorCode,
+                            errorStage: meta.errorStage,
+                            cooldownUntil: claudeIso(effectiveCooldownMs),
+                            retryAfterSeconds: meta.retryAfterSeconds,
+                            lastErrorCode: meta.lastErrorCode,
+                            notice: claudeQuotaNotice({ ...meta, observedAtMs: null }, false, nowMs)
+                        };
+                    results.push(card);
                 }
                 continue;
             }
@@ -1309,7 +1553,7 @@ function createUsageMonitorService(options = {}) {
                     end: periodRange.end,
                     timeZone: periodRange.timeZone
                 },
-                accounts,
+                accounts: accounts.map(account => refreshClaudeStatusCard(account, nowMs)),
                 activity
             };
         }
