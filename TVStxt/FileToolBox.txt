@@ -14,11 +14,18 @@
 | PowerShell | PowerShellExecutor | ServerPowerShellExecutor |
 | 插件源码 | PluginSourceViewer | ServerPluginSourceViewer |
 
-前后端路径分别确认；已知位置直接读取，不必先搜索。调查结果需要保留在上下文时使用 `ink=mark_history`。
+前后端路径分别确认；已知位置直接读取，不必先搜索。调查结果需要保留在上下文时使用 `ink=mark_history`。后端不套用前端字段；提权时按要求提供实时安全码。
 
-## 代码任务执行器入口 (AICodeWorker)
-仓库级代码调查、跨文件修改、补丁与测试可交给 AICodeWorker 异步执行；简单文件读写仍用文件工具。具体用法在下方独立折叠区按语境展开。未展开时，用 ServerFileOperator.ReadFile 读取服务器 Plugin/AICodeWorker/plugin-manifest.json（本部署绝对路径 C:\VCP\VCPToolBox\Plugin\AICodeWorker\plugin-manifest.json）的 invocationCommands 说明，不猜参数。
-Worker 不自动继承当前对话：任务书须自包含。显式 worker=codex、fastMode=false；先查 capabilities，提交成功取得 jobId 后停止自动轮询，候选交付不等于原仓库已修改。
+### 工程施工入口（ProjectForge / ServerProjectForge）
+
+前端使用 `ProjectForge`，服务器使用 `ServerProjectForge`。先 `ListWorkspaces` 确认执行端与真实根目录，再用 `ListProjects` / `GetProject` 找回工程；两端本地工程 ID 不应直接混用。
+源码探路优先 `FindSymbol` / `Outline` / `Trace`，读取与编辑优先工程工具。写操作带明确 `reason`，重要调查使用 `ink=mark_history`。完整参数以目标端当前插件声明为准。
+
+### 代码任务执行器入口（AICodeWorker）
+
+仓库级调查、跨文件修改、补丁与测试可交给 AICodeWorker；简单文件读写仍用文件工具。具体说明见下方独立折叠区。
+未展开时，用 ServerFileOperator.ReadFile 读取服务器 `Plugin/AICodeWorker/plugin-manifest.json` 的 invocationCommands，不猜参数；本部署根目录为 `C:\VCP\VCPToolBox`。
+Worker 不自动继承当前对话，任务书须自包含。显式 `worker=codex`、`fastMode=false`；先查 capabilities，取得 jobId 后不自动轮询。候选交付不等于原仓库已修改。模型、额度及路由以当前插件契约与 capabilities 为准。
 
 ### 文件定位与读取
 
@@ -52,10 +59,31 @@ ServerPowerShellExecutor
   executionType=blocking|background（可选，默认 blocking）
 ```
 
-后端不套用前端字段；提权时按要求提供实时安全码。
+[===vcp_fold:0.5::desc:AICodeWorker Codex 代码任务执行器：仓库调查、跨文件修改、补丁生成、运行测试、异步任务提交、查结果、任务状态、执行轨迹和取消。===]
 
-有什么事情或者报告可以调用`VCPClawMail`给莱恩主人的网易邮箱(红莲の狮子)发邮件。
-command:'send_mail', to:'lionsky75@163.com', subject, body
+## 9. AI 代码任务执行器 (AICodeWorker)
+基于 OpenAI Codex CLI 的专用代码工程调度中心（全面停用 OpenCode、Antigravity 等 legacy worker）。
+配置、参数、额度与路由以 `Plugin/AICodeWorker/plugin-manifest.json` 为唯一真相源。
+
+### 核心选型与门禁铁律（一票否决制）
+1. **模式选型**：
+   - **analyze（只读分析）**：架构测绘、调用链排查、影响面评估。read-only 沙箱，绝不改动任何文件。
+   - **app-server patch（单/少文件微调）**：仅限已有 tracked 普通文件极小改动。**严禁**用于新增文件、删除文件、重命名或二进制文件；diff 上限 512 KiB。
+   - **app-server write（新建/重构/实现主力通道）**：**凡涉及新建文件（如补写测试、新建模块）、删除、重构、多文件联动，必须直接走 write**（基于干净 Git 根创建独立受控 Git Worktree，生成 Candidate Commit）。
+2. **模型选型与默认主力（Profile 内部化，外层只传别名）**：
+   - **【默认主力首选】CommandCode DeepSeek V4.1 Flash Fast（调用别名 deepseek-4.1-flash-commandcode，reasoningEffort=high）**：日常工程开发、批量实现、测试编写的首选。上游为 deepseek/deepseek-v4.1-flash-fast，经本地 relay 转译；本部署 CODEX_MODEL 已设为该别名，显式 worker=codex 的已启用 app-server 路由省略 model 默认使用此通道，默认推理 high。Fast 由上游模型名启用，不等于 Codex service tier；仍显式 fastMode=false，无需外层 Profile。
+   - **deepseek-4.1-flash（官方直连通道）**：原生 Responses API 直连，1M 上下文，支持 low/high/max 档位。Sidecar 自动绑定专属物理沙箱，**官方 ChatGPT 订阅零污染、零冲突**。
+   - **gpt-6-luna（reasoningEffort=max）**：官方 ChatGPT 订阅原生通道，直连 OpenAI，仅在复杂任务或特殊需要时显式选用。架构决策与深潜审查选 gpt-6-sol。
+   - 【调用铁律】：外层与 Agent 调用时**严禁且无需指定 Profile 文件**，直接传入模型别名即可，由 Sidecar 统一调度独立沙箱执行，Worktree 锁与并发配额全局统管。
+3. **调度纪律**：
+   - 必须显式指定 `worker=codex`；默认显式 `fastMode=false`（请求 Standard 档），未获明确授权严禁私开 Fast。
+   - app-server 共享总额度 3（Write 最多 2），超额拒绝不排队。
+   - 默认 `command=run`，取得 jobId 后立即结束当轮会话释放心流，**严禁借助心流心跳（Flowlock）轮询后台任务**；用户要求继续时单次 `command=query, wait=false, responseMode=compact` 查询。
+4. **前端双模态协同与交付规范**：
+   - VCPChat 已上线伴随检查器抽屉（右上角）与独立全屏工作台（TabBar），用户可直接实时观测 Trace 与可视化 Diff。
+   - **任务验收后严禁在聊天视窗倾倒全量 Diff 或终端日志**；交付标准格式为：核心改动摘要 + 验证命令与退出码 + Candidate Commit SHA，并引导用户在侧栏/工作台中一键审查。
+
+需要发送邮件时，先由当前用户明确确认收件人、用途与内容，再按 `VCPClawMail` 当前插件契约调用。不得把官方示例或其他部署的私人邮箱当作本机默认收件人。
 
 或者直接调用插件`WaitingForUrReply` — 弹出浮窗等待用户回复。
 参数：prompt；title?；option01～option09?；placeholder?（预填文本）。
@@ -231,26 +259,39 @@ CreateCanvas(fileName, content)
 
 创建代码或文档协同编辑窗口；用文件名及扩展名标识内容类型。
 
-[===vcp_fold:0.5::desc:AICodeWorker Codex 代码任务执行器：仓库调查、跨文件修改、补丁生成、运行测试、异步任务提交、查结果、任务状态、执行轨迹和取消。===]
+[===vcp_fold:0.35::desc:ProjectForge与ServerProjectForge工程管理、AST符号查询、大纲与链路、按符号编辑、外部施工收录和快照回滚===]
 
-## 9. AI 代码任务执行器 (AICodeWorker)
-基于 OpenAI Codex CLI 的专用代码工程调度中心（全面停用 OpenCode、Antigravity 等 legacy worker）。
-配置、参数、额度与路由以 `Plugin/AICodeWorker/plugin-manifest.json` 为唯一真相源。
+## V工程施工速查
 
-### 核心选型与门禁铁律（一票否决制）
-1. **模式选型**：
-   - **analyze（只读分析）**：架构测绘、调用链排查、影响面评估。read-only 沙箱，绝不改动任何文件。
-   - **app-server patch（单/少文件微调）**：仅限已有 tracked 普通文件极小改动。**严禁**用于新增文件、删除文件、重命名或二进制文件；diff 上限 512 KiB。
-   - **app-server write（新建/重构/实现主力通道）**：**凡涉及新建文件（如补写测试、新建模块）、删除、重构、多文件联动，必须直接走 write**（基于干净 Git 根创建独立受控 Git Worktree，生成 Candidate Commit）。
-2. **模型选型与默认主力（Profile 内部化，外层只传别名）**：
-   - **【默认主力首选】CommandCode DeepSeek V4.1 Flash Fast（调用别名 deepseek-4.1-flash-commandcode，reasoningEffort=high）**：日常工程开发、批量实现、测试编写的首选。上游为 deepseek/deepseek-v4.1-flash-fast，经本地 relay 转译；本部署 CODEX_MODEL 已设为该别名，显式 worker=codex 的已启用 app-server 路由省略 model 默认使用此通道，默认推理 high。Fast 由上游模型名启用，不等于 Codex service tier；仍显式 fastMode=false，无需外层 Profile。
-   - **deepseek-4.1-flash（官方直连通道）**：原生 Responses API 直连，1M 上下文，支持 low/high/max 档位。Sidecar 自动绑定专属物理沙箱，**官方 ChatGPT 订阅零污染、零冲突**。
-   - **gpt-6-luna（reasoningEffort=max）**：官方 ChatGPT 订阅原生通道，直连 OpenAI，仅在复杂任务或特殊需要时显式选用。架构决策与深潜审查选 gpt-6-sol。
-   - 【调用铁律】：外层与 Agent 调用时**严禁且无需指定 Profile 文件**，直接传入模型别名即可，由 Sidecar 统一调度独立沙箱执行，Worktree 锁与并发配额全局统管。
-3. **调度纪律**：
-   - 必须显式指定 `worker=codex`；默认显式 `fastMode=false`（请求 Standard 档），未获明确授权严禁私开 Fast。
-   - app-server 共享总额度 3（Write 最多 2），超额拒绝不排队。
-   - 默认 `command=run`，取得 jobId 后立即结束当轮会话释放心流，**严禁借助心流心跳（Flowlock）轮询后台任务**；用户要求继续时单次 `command=query, wait=false, responseMode=compact` 查询。
-4. **前端双模态协同与交付规范**：
-   - VCPChat 已上线伴随检查器抽屉（右上角）与独立全屏工作台（TabBar），用户可直接实时观测 Trace 与可视化 Diff。
-   - **任务验收后严禁在聊天视窗倾倒全量 Diff 或终端日志**；交付标准格式为：核心改动摘要 + 验证命令与退出码 + Candidate Commit SHA，并引导用户在侧栏/工作台中一键审查。
+以下命令交给目标执行端的 `ProjectForge` 或 `ServerProjectForge`；文件路径相对所选工程根。
+
+### 工程与探路
+- `ListWorkspaces`：查询已登记工作区；不能凭另一台机器的同名路径猜测本机目录。
+- `ListProjects(workspace=all, limit?)`、`GetProject(projectId, timeline?)`：查询工程及待办、历史。`workspace` 与数量限制分别传递。
+- `CreateProject(name, workspace?, dir?, todos?)`、`UpdateTodos(projectId, ...)`：建立工程、维护待办。
+- `FindSymbol(projectId, name, glob?, exact?, scope?)`：按名称定位定义。
+- `Outline(projectId, path/paths, depth?, kind?)`：获取符号层级与范围。
+- `Trace(projectId, target)`：查询 `ipc:`、`api:`、`global:`、`page:`、`file:` 链路；以工具支持的语言和静态解析范围为准。
+- `ReadCode(projectId, path/paths/glob, ...)`：支持行切片、`文件#限定符号`、`symbol`、`find`；同名结果用候选序号或近似行号消歧。
+
+### 精准修改
+- `EditCode` 必须提供 `projectId`、`path`、`reason`。
+- 行替换：`start/end/content`；精确文本替换：`target/replace`。
+- 首尾锚定：`target` 用首行、单独一行 `...`、尾行表示大段内容。
+- 符号替换：`path=src/store.js#Store.putBlob` 配合 `content`；默认包括紧邻注释，具体语言支持以当前实现为准。
+- 插入：`op=insert` 配合 `after` 或 `before`；删除：`op=delete` 配合行区间或符号。
+- 同一文件多步骤使用 `op1/start1/end1/content1`、`op2/target2/replace2`，所有步骤参数都带对应编号，包括 `after2`、`before2`；共用编辑前快照，不混用编号与未编号字段。
+- 歧义票据交给 `ResolveEdit(ticketId, pick)`，不能靠重复提交碰碰运气。
+- 可用 `todo` 关联待办；多 Todo 格式须确认目标端已支持，不假设前后端插件版本相同。
+
+### 文件、履历与回退
+- `CreateFile`、`RemoveFile`、`MoveFile`：工程内文件操作；`MoveCode` / `CopyCode`：按行范围或符号搬移代码。
+- `SearchHistory`、`GetNodeDiff`：核对实际变动及署名；不是仅相信施工者自报。
+- `Rollback(projectId, batch=last 或 toNode=..., dryRun=true)`：先预演，再确认范围；不为消除漂移盲用 `force`。
+- `SubmitReport`：记录验收与遗留问题；报告通过不等于生产部署或真实跨机接续通过。
+- 支持时使用 `BeginCapture` → 外部施工 → 独立测试与范围核验 → `FinishCapture`，`GetCapture` 查询记录。Capture 是收录机制，不是操作系统沙箱。
+
+### 批处理与执行边界
+- 跨命令用独立工具调用，**不向 ProjectForge/ServerProjectForge 发送 `command1/command2`**。
+- 无依赖的只读查询可并行；同一工程文件的关联写入按序执行。
+- 工作区登记、源码检出、宿主加载和同步接入是不同阶段；查到工程不代表已取得跨端写权。

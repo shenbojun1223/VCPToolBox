@@ -215,6 +215,38 @@
           }
         }
       }
+    },
+    "desktop_control": {
+      "aliases": [
+        "桌面操控",
+        "桌面控制",
+        "电脑操控",
+        "屏幕操控",
+        "桌面交互",
+        "computeruse"
+      ],
+      "defaultTool": "screen_pilot",
+      "tools": {
+        "screen_pilot": {
+          "plugin": "ScreenPilot",
+          "aliases": [
+            "screenpilot",
+            "屏幕操控",
+            "屏幕视觉",
+            "窗口操控"
+          ]
+        },
+        "desktop_remote": {
+          "plugin": "DesktopRemote",
+          "aliases": [
+            "desktopremote",
+            "虚拟桌面",
+            "桌面挂件",
+            "桌面画布",
+            "vcpdesktop"
+          ]
+        }
+      }
     }
   }
 }
