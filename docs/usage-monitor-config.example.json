@@ -1,0 +1,74 @@
+{
+  "timeZone": "Asia/Shanghai",
+  "cpamp": {
+    "baseUrl": "http://127.0.0.1:18317",
+    "tokenEnv": "CPAMP_MANAGEMENT_KEY",
+    "staleAfterMs": 1800000
+  },
+  "accounts": [
+    {
+      "id": "codex-example",
+      "provider": "codex",
+      "label": "codex example",
+      "scopeLabel": "Example account",
+      "linkedChannels": [
+        "codex-example-channel"
+      ],
+      "sharedPool": true,
+      "queryAccount": {
+        "row_key": "codex-example-row",
+        "provider": "codex",
+        "auth_file_name": "codex-example-account.json"
+      }
+    },
+    {
+      "id": "antigravity-example",
+      "provider": "antigravity",
+      "label": "antigravity example",
+      "scopeLabel": "Example account",
+      "linkedChannels": [
+        "antigravity-example-channel"
+      ],
+      "sharedPool": false,
+      "queryAccount": {
+        "row_key": "antigravity-example-row",
+        "provider": "antigravity",
+        "auth_file_name": "antigravity-example-account.json"
+      }
+    },
+    {
+      "id": "opencodego-example",
+      "provider": "opencodego",
+      "label": "opencodego example",
+      "scopeLabel": "Example account",
+      "linkedChannels": [
+        "opencodego-example-channel"
+      ],
+      "sharedPool": false,
+      "tokenEnv": "OPENCODE_GO_MONITOR_API_KEY"
+    },
+    {
+      "id": "deepseek-example",
+      "provider": "deepseek",
+      "label": "deepseek example",
+      "scopeLabel": "Example account",
+      "linkedChannels": [
+        "deepseek-example-channel"
+      ],
+      "sharedPool": true,
+      "tokenEnv": "DEEPSEEK_MONITOR_API_KEY"
+    },
+    {
+      "id": "claude-example",
+      "provider": "claude",
+      "label": "claude example",
+      "scopeLabel": "Example account",
+      "linkedChannels": [
+        "claude-example-channel"
+      ],
+      "sharedPool": true,
+      "baseUrl": "http://127.0.0.1:8797",
+      "tokenEnv": "VCP_CLAUDE_SONNET_BRIDGE_TOKEN"
+    }
+  ]
+}
