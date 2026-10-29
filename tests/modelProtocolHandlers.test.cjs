@@ -31,7 +31,8 @@ async function run(stream, outputs, options = {}) {
     end() { this.writableEnded = true; this.ends++; },
     send(x) { this.sent = JSON.parse(x.toString()); this.end(); }
   };
-  const result = { success: !options.toolError, content: [{ type: 'text', text: 'REAL_RESULT\n' + receipt }], raw: 'REAL_RESULT\n' + receipt };
+  const resultText = options.resultText ?? ('REAL_RESULT\n' + receipt);
+  const result = { success: !options.toolError, content: [{ type: 'text', text: resultText }], raw: resultText };
   const context = {
     apiUrl: 'http://offline.invalid', apiKey: 'offline', clientIp: '127.0.0.1',
     pluginManager: { messagePreprocessors: new Map() }, DEBUG_MODE: false, SHOW_VCP_OUTPUT: true,
@@ -156,5 +157,43 @@ for (const stream of [false, true]) {
     const out = await run(stream, ['普通回复无末尾换行'], { split: true });
     assert.equal(out.visible, '普通回复无末尾换行');
     assert.equal(out.returned.completed, true);
+  });
+}
+
+const dsmlCall = '<' + '｜｜DSML｜｜ calls>';
+for (const stream of [false, true]) {
+  const label = stream ? 'stream' : 'nonstream';
+  for (const archery of [false, true]) {
+    test(`${label}: DSML stops all current calls, archery=${archery}`, async () => {
+      const text = tool('Before', archery) + '\n' + dsmlCall + '\n' +
+        '[[Flowlock::Complete]]\n' + tool('After');
+      const out = await run(stream, [text], { split: true });
+      assert.equal(out.executed.length, 0);
+      assert.equal(out.fetched.length, 0);
+      assert.equal(out.status.code, STATUS);
+      assert.equal(out.status.reason, 'unsupported_tool_protocol');
+      assert.equal(out.returned.completed, false);
+      assert.ok(!out.visible.includes(dsmlCall));
+      assert.equal(out.logs[0].response.content, text);
+      assert.equal(out.res.ends, 1);
+    });
+  }
+  test(`${label}: DSML after a real earlier turn stops without rollback or replay`, async () => {
+    const out = await run(stream, [tool('First'), dsmlCall + '\n' + tool('After')]);
+    assert.deepEqual(out.executed.map(c => c.name), ['First']);
+    assert.equal(out.fetched.length, 1);
+    assert.equal(out.status.reason, 'unsupported_tool_protocol');
+    assert.equal(out.returned.completed, false);
+  });
+  test(`${label}: DSML in documentation and real tool result is not re-inspected`, async () => {
+    const example = '```xml\n' + dsmlCall + '\n```\n';
+    const out = await run(stream, [example + tool('Read'), 'done'], {
+      split: true, resultText: 'REAL_RESULT\n' + dsmlCall
+    });
+    assert.deepEqual(out.executed.map(c => c.name), ['Read']);
+    assert.equal(out.status, undefined);
+    assert.equal(out.returned.completed, true);
+    assert.ok(out.visible.includes(dsmlCall));
+    assert.ok(JSON.stringify(out.fetched[0].messages.filter(m => m.role === 'user')).includes(dsmlCall));
   });
 }

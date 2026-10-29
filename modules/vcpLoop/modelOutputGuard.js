@@ -4,7 +4,9 @@ const Parser = require('./toolCallParser');
 const matcher = require('./toolMarkerFuzzyMatcher');
 
 const STATUS = 'VCP_MODEL_PROTOCOL_HALT';
-const NOTICE = '\n\n[VCP 已暂停：模型输出含保留的回执/角色控制标记，或超出单行检查上限。本次模型输出中的全部工具请求均未执行；此前轮次已执行的操作不回滚。请核对日志后再继续，系统不会自动重放。]\n';
+// Detect the namespace, including truncated calls and the observed doubled bars.
+const DSML_TAG_START = /^<\/?[|｜]+DSML[|｜]+/i;
+const NOTICE = '\n\n[VCP 已暂停：模型输出含保留的回执/角色控制标记、非 VCP 的 DSML 调用标记，或超出单行检查上限。本次模型输出中的全部工具请求均未执行；此前轮次已执行的操作不回滚。请核对日志后再继续，系统不会自动重放。]\n';
 
 // Only inspect NEW model content, never trusted tool results or persisted history.
 // A line is held until its boundary so arbitrary SSE chunking cannot expose a
@@ -132,6 +134,10 @@ class ModelOutputGuard {
       }
       // Do not rescan the whole remaining line for each normal character.
       if (text[cursor] === '<') {
+        if (DSML_TAG_START.test(rest)) {
+          this.stop('unsupported_tool_protocol', this.offset + cursor);
+          return '';
+        }
         const start = matcher.findBlockStartMarker(rest, 0);
         if (start && start.index === 0) {
           executable += start.marker;

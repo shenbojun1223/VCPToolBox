@@ -95,3 +95,59 @@ test('fuzzy markers match dispatch and escape stays opaque', () => {
     assert.equal(inspectModelOutput(text).halt, null);
   } finally { matcher.configure(old); }
 });
+
+const dsml = '<' + '｜｜DSML｜｜ calls>';
+for (const tag of [
+  '<' + '｜DSML｜function_calls>',
+  dsml,
+  '<' + '|DSML|invoke name="Example">',
+  '</' + '｜DSML｜invoke>',
+  '<' + '｜DSML｜'
+]) {
+  test(`DSML namespace outside documentation halts: ${tag}`, () => {
+    const text = request('Before') + '\n' + tag + '\n' + request('After');
+    const result = inspectModelOutput(text);
+    assert.equal(result.halt.code, STATUS);
+    assert.equal(result.halt.reason, 'unsupported_tool_protocol');
+    assert.equal(result.executionText, '');
+    assert.ok(!result.content.includes(tag));
+    assert.deepEqual(parse(text), []);
+  });
+}
+
+test('DSML detection is identical across every split and single character deltas', () => {
+  const text = '正文\r\n' + request('Before') + '\n' + dsml + '\n' + request('After');
+  const expected = inspectModelOutput(text);
+  assert.equal(expected.halt.reason, 'unsupported_tool_protocol');
+  for (let cut = 0; cut <= text.length; cut++) {
+    const g = new ModelOutputGuard();
+    const visible = g.push(text.slice(0, cut)) + g.push(text.slice(cut)) + g.finish();
+    assert.equal(visible, expected.content, `cut=${cut}`);
+    assert.deepEqual(g.halt, expected.halt);
+    assert.equal(g.executionText(), '');
+  }
+  const g = new ModelOutputGuard();
+  assert.equal([...text].map(c => g.push(c)).join('') + g.finish(), expected.content);
+  assert.deepEqual(g.halt, expected.halt);
+});
+
+test('DSML mentions, code examples and VCP arguments remain data', () => {
+  for (const example of [
+    '此前输出DSML失败，本次没有原生调用。\n',
+    '```xml\n' + dsml + '\n```\n',
+    '~~~~\n' + dsml + '\n~~~~\n',
+    '引用 `' + dsml + '` 不执行。\n',
+    '> ' + dsml + '\n',
+    '    ' + dsml + '\n',
+    '\t' + dsml + '\n'
+  ]) {
+    const text = example + request('Real', dsml);
+    const result = inspectModelOutput(text);
+    assert.equal(result.halt, null);
+    assert.equal(result.content, text);
+    assert.deepEqual(parse(text), ['Real']);
+    assert.equal(Parser.parse(result.executionText)[0].args.content, dsml);
+  }
+  assert.equal(inspectModelOutput('```\n' + dsml + '\n```\n' + dsml).halt.reason,
+    'unsupported_tool_protocol', 'closing documentation must restore detection');
+});

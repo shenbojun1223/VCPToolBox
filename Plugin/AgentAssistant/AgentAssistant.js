@@ -13,6 +13,7 @@ const {
     DEFAULT_HEARTBEAT_DELAY_SECONDS,
     parseFlowlockDirectives
 } = require('./flowlockProtocol.js');
+const { STATUS: MODEL_PROTOCOL_HALT } = require('../../modules/vcpLoop/modelOutputGuard');
 
 // --- State and Config Variables ---
 let VCP_SERVER_PORT;
@@ -713,7 +714,11 @@ async function processToolCall(args) {
         throwToolError("Missing 'agent_name' or 'prompt' in request.");
     }
 
-    const agentConfig = AGENTS[agent_name];
+    let agentConfig = AGENTS[agent_name];
+    if (!agentConfig) {
+        loadAgentsFromLocalConfig();
+        agentConfig = AGENTS[agent_name];
+    }
     if (!agentConfig) {
         const availableAgentNames = Object.keys(AGENTS);
         let errorMessage = `请求的 Agent '${agent_name}' 未找到。`;
@@ -796,8 +801,8 @@ async function processToolCall(args) {
 
         if (DEBUG_MODE) console.error(`[AgentAssistant Service] Starting async delegation ${delegationId} for ${agent_name}`);
 
-        // Launch the background task un-awaited
-        executeDelegation(delegationId, agentConfig, promptWithRiverAttachment, promptTextForStorage, delegationSenderName, temporaryToolsSystemPrompt).catch(async err => {
+        // Launch the background task un-awaited (pass optional session_id so distinct delegations can run concurrently)
+        executeDelegation(delegationId, agentConfig, promptWithRiverAttachment, promptTextForStorage, delegationSenderName, temporaryToolsSystemPrompt, args.session_id).catch(async err => {
             console.error(`[AgentAssistant Service] Background delegation task ${delegationId} failed:`, err);
             const state = activeDelegations.get(delegationId);
             const status = err.code === 'DELEGATION_CANCELLED' ? 'Cancelled' : 'Failed';
@@ -974,8 +979,9 @@ async function processToolCall(args) {
 /**
  * Executes a delegated task asynchronously by running a bounded conversation loop
  */
-async function executeDelegation(delegationId, agentConfig, taskPromptContent, taskPromptText, senderName, temporaryToolsSystemPrompt = '') {
-    const userSessionId = `agent_${agentConfig.baseName}_delegation_session`;
+async function executeDelegation(delegationId, agentConfig, taskPromptContent, taskPromptText, senderName, temporaryToolsSystemPrompt = '', customSessionId = '') {
+    const normalizedSessionId = String(customSessionId || '').trim();
+    const userSessionId = normalizedSessionId || `agent_${agentConfig.baseName}_delegation_${delegationId}`;
     const lockKey = `${agentConfig.baseName}::${userSessionId}`;
 
     // 我们对于代理任务也是一个持久会话，因此需要占线锁保护
@@ -1054,6 +1060,22 @@ async function executeDelegation(delegationId, agentConfig, taskPromptContent, t
                 headers: { 'Authorization': `Bearer ${VCP_SERVER_ACCESS_KEY}`, 'Content-Type': 'application/json' },
                 timeout: (parseInt(process.env.PLUGIN_COMMUNICATION_TIMEOUT) || DEFAULT_PLUGIN_COMMUNICATION_TIMEOUT_MS)
             });
+
+            // The inner handler inspected only fresh model output. Never re-scan
+            // its assembled content: it may contain trusted tool results/examples.
+            state = assertDelegationNotCancelled(delegationId);
+            if (responseFromVCP.data?.vcp_status?.code === MODEL_PROTOCOL_HALT) {
+                completionStatus = 'Failed';
+                finalReport = `【委托已停止：${MODEL_PROTOCOL_HALT}】后端输出防护已暂停本轮；不继续心跳、不自动重试。此前已执行的操作不回滚，请核对原始日志。`;
+                state.flowlockActive = false;
+                state.status = 'failed';
+                state.completionStatus = completionStatus;
+                state.lastResponsePreview = truncateText(finalReport);
+                state.finalReportPreview = truncateText(finalReport);
+                state.updatedAt = Date.now();
+                activeDelegations.set(delegationId, state);
+                break; // finally releases the lock, archives and calls back once.
+            }
 
             const assistantResponseContent = responseFromVCP.data?.choices?.[0]?.message?.content;
             if (typeof assistantResponseContent !== 'string') {
