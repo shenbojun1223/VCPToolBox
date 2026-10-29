@@ -639,7 +639,7 @@ async function fetchWithRetry(
       failure = await responseError(response, { phase, attempt: i + 1 }, { signal: externalSignal });
     }
     if (failure.name === 'AbortError') throw failure;
-    const retryable = failure.status === null || [500, 503, 429].includes(failure.status);
+    const retryable = failure.status === null || [500, 502, 503, 504, 429].includes(failure.status);
     if (failure.code === 'sensitive_words_detected' || !retryable || i === maxAttempts - 1) throw failure;
     if (debugMode) console.warn('[Fetch Retry]', safeErrorFields(failure));
     if (onRetry) await onRetry(i + 1, safeErrorFields(failure));

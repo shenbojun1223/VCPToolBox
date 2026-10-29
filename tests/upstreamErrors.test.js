@@ -26,7 +26,8 @@ function load(relative, mocks = {}, globals = {}) {
         'modules/opencodeGoSession.js',
         'modules/sourcePrivacyPolicy.js',
         'modules/vcpLoop/historySanitizer.js',
-        'modules/vcpLoop/modelOutputGuard.js'
+        'modules/vcpLoop/modelOutputGuard.js',
+        'modules/toolResultBatch.js'
       ]);
       if (id.startsWith('./') || id.startsWith('../')) {
         const resolved = path.resolve(path.dirname(filename), id);
@@ -230,7 +231,7 @@ for (const stream of [true, false]) {
   }
 }
 
-for (const [status, attempts] of [[400, 1], [401, 1], [403, 1], [500, 3], [503, 3], [429, 3]]) {
+for (const [status, attempts] of [[400, 1], [401, 1], [403, 1], [500, 3], [502, 3], [503, 3], [504, 3], [429, 3]]) {
   test(`status ${status}: bounded ${attempts} attempts, original status retained`, async () => {
     let calls = 0, waits = 0;
     const fetch = fetcher(async () => { calls++; return response(status, 'unrecognized'); });
@@ -534,3 +535,28 @@ test('network exception body, URL query and stack are not forwarded or logged by
   assert(!JSON.stringify([f.res.chunks, f.logs, f.events]).includes(marker));
   assert.equal(consumeSse(f.res.chunks).find(x => x.error).error.code, 'network_error');
 });
+
+for (const status of [502, 504]) {
+  test(`gateway status ${status}: retry recovers without consuming successful response`, async () => {
+    let calls = 0;
+    const retries = [];
+    const success = response(200);
+    const fetch = fetcher(async () => {
+      calls++;
+      return calls === 1 ? response(status, 'unrecognized') : success;
+    });
+    const result = await fetch('https://synthetic.invalid', {}, {
+      retries: 3, delay: 0,
+      onRetry: (attempt, fields) => retries.push({ attempt, fields })
+    });
+    assert.equal(result, success);
+    assert.equal(calls, 2);
+    assert.equal(retries.length, 1);
+    assert.equal(retries[0].attempt, 1);
+    assert.equal(retries[0].fields.status, status);
+    assert.equal(retries[0].fields.code, 'unknown');
+    assert.equal(success.body.readableEnded, false);
+    assert.ok(!JSON.stringify(retries).includes('synthetic private body'));
+    success.body.destroy();
+  });
+}

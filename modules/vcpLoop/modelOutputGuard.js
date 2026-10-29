@@ -126,6 +126,7 @@ class ModelOutputGuard {
       }
       const rest = text.slice(cursor, cursor + 64);
       if (/^<<<\[(?:END_)?ROLE_DIVIDE_(?:USER|SYSTEM|ASSISTANT)\]>>>/.test(rest) ||
+          /^<<<\[VCP_TOOL_BATCH_(?:START|END)(?=[:\]\r\n]|$)/.test(rest) ||
           rest.startsWith('[[VCP调用结果信息汇总:') ||
           rest.startsWith('[本轮工具调用摘要:]') ||
           rest.startsWith('<!-- VCP_TOOL_PAYLOAD -->')) {

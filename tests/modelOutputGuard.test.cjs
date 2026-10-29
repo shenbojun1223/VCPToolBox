@@ -151,3 +151,68 @@ test('DSML mentions, code examples and VCP arguments remain data', () => {
   assert.equal(inspectModelOutput('```\n' + dsml + '\n```\n' + dsml).halt.reason,
     'unsupported_tool_protocol', 'closing documentation must restore detection');
 });
+
+const batchGuardStamp = '2026-10-29T12:51:34.979Z';
+const batchGuardMarkers = [
+  mark('VCP_TOOL_BATCH_START:' + batchGuardStamp),
+  mark('VCP_TOOL_BATCH_END:' + batchGuardStamp),
+  '<'.repeat(3) + '[VCP_TOOL_BATCH_START:',
+  '<'.repeat(3) + '[VCP_TOOL_BATCH_END:',
+  '<'.repeat(3) + '[VCP_TOOL_BATCH_START',
+  mark('VCP_TOOL_BATCH_START:not-a-timestamp')
+];
+for (const marker of batchGuardMarkers) {
+  test('batch guard: raw reserved namespace halts all pending calls: ' + marker, () => {
+    const text = request('Before') + '\n' + marker + '\n' + request('Never');
+    const result = inspectModelOutput(text);
+    assert.equal(result.halt?.code, STATUS);
+    assert.equal(result.halt.reason, 'reserved_protocol');
+    assert.equal(result.executionText, '');
+    assert.ok(!result.content.includes(marker));
+    assert.ok(!result.content.includes('Never'));
+  });
+}
+test('batch guard: every stream split and single-character deltas agree', () => {
+  for (const marker of batchGuardMarkers) {
+    const text = 'prefix\r\n' + request('Before') + '\n' + marker + '\n' + request('Never');
+    const expected = inspectModelOutput(text);
+    assert.equal(expected.halt?.code, STATUS);
+    for (let cut = 0; cut <= text.length; cut++) {
+      const guard = new ModelOutputGuard();
+      const visible = guard.push(text.slice(0, cut)) + guard.push(text.slice(cut)) + guard.finish();
+      assert.equal(visible, expected.content, 'cut=' + cut);
+      assert.deepEqual(guard.halt, expected.halt);
+      assert.equal(guard.executionText(), '');
+    }
+    const guard = new ModelOutputGuard();
+    assert.equal([...text].map(c => guard.push(c)).join('') + guard.finish(), expected.content);
+    assert.deepEqual(guard.halt, expected.halt);
+  }
+});
+test('batch guard: documentation remains visible without becoming executable', () => {
+  for (const marker of batchGuardMarkers) {
+    for (const example of [
+      '```text\n' + marker + '\n```\n',
+      '`' + marker + '`\n',
+      '> ' + marker + '\n',
+      '    ' + marker + '\n'
+    ]) {
+      const text = example + request('Real');
+      const result = inspectModelOutput(text);
+      assert.equal(result.halt, null);
+      assert.equal(result.content, text);
+      assert.deepEqual(parse(text), ['Real']);
+    }
+  }
+  assert.equal(inspectModelOutput('VCP_TOOL_BATCH_START is a namespace, not a delimiter.').halt, null);
+});
+test('batch guard: real ESCAPE arguments preserve batch literals byte-for-byte', () => {
+  const payload = batchGuardMarkers.join('\n');
+  const text = request('Real', payload);
+  const result = inspectModelOutput(text);
+  assert.equal(result.halt, null);
+  assert.equal(result.content, text);
+  const calls = Parser.parse(result.executionText);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].args.content, payload);
+});

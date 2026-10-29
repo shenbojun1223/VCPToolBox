@@ -3,6 +3,7 @@ const { UpstreamError, assertResponseOk, throwIfAborted } = require('../upstream
 const { StringDecoder } = require('string_decoder');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
 const { ModelOutputGuard, NOTICE: modelProtocolNotice } = require('../vcpLoop/modelOutputGuard');
+const { formatToolResultBatch } = require('../toolResultBatch.js');
 const {
   extractReasoningText,
   removeReasoningFields,
@@ -569,6 +570,19 @@ class StreamHandler {
       const { normal: normalCalls, archery: archeryCalls } = ToolCallParser.separate(toolCalls);
       const archeryErrorContents = [];
       const archeryStatusSummaryItems = [];
+      const visibleToolResults = [];
+      const emitToolBatch = () => {
+        if (res.writableEnded || res.destroyed || abortController?.signal.aborted) return;
+        const content = formatToolResultBatch(visibleToolResults, enableRoleDivider);
+        if (!content) return;
+        res.write(`data: ${JSON.stringify({
+          id: `chatcmpl-vcp-batch-${Date.now()}`,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: originalBody.model,
+          choices: [{ index: 0, delta: { content }, finish_reason: null }]
+        })}\n\n`);
+      };
 
       // 执行 Archery 调用
       const archeryLogs = await Promise.all(archeryCalls.map(async toolCall => {
@@ -589,7 +603,8 @@ class StreamHandler {
 
           const forceThisOne = !shouldShowVCP && toolCall.markHistory;
           if ((shouldShowVCP || forceThisOne) && !res.writableEnded && (isError || forceThisOne)) {
-            vcpInfoHandler.streamVcpInfo(res, originalBody.model, result.success ? 'success' : 'error', toolCall.name, result.raw || result.error, abortController);
+            const text = vcpInfoHandler.streamVcpInfo(null, originalBody.model, toolCall.name, result.success ? 'success' : 'error', result.raw || result.error, abortController);
+            if (text) visibleToolResults.push(text);
           }
           return { tool: toolCall, result: result.content };
         } catch (e) {
@@ -610,26 +625,9 @@ class StreamHandler {
         if (!res.writableEnded && !res.destroyed) {
           try {
             if (archeryStatusSummaryItems.length > 0) {
-              if (enableRoleDivider) {
-                res.write(`data: ${JSON.stringify({
-                  id: `chatcmpl-vcp-start-${Date.now()}`,
-                  object: "chat.completion.chunk",
-                  choices: [{ index: 0, delta: { content: "\n<<<[ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
-                })}\n\n`);
-              }
-              res.write(`data: ${JSON.stringify({
-                id: `chatcmpl-vcp-summary-${Date.now()}`,
-                object: "chat.completion.chunk",
-                choices: [{ index: 0, delta: { content: `\n[本轮工具调用摘要:]\n${archeryStatusSummaryItems.join('；')}。\n[本轮工具调用摘要结束]\n` }, finish_reason: null }]
-              })}\n\n`);
-              if (enableRoleDivider) {
-                res.write(`data: ${JSON.stringify({
-                  id: `chatcmpl-vcp-end-${Date.now()}`,
-                  object: "chat.completion.chunk",
-                  choices: [{ index: 0, delta: { content: "\n<<<[END_ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
-                })}\n\n`);
-              }
+              visibleToolResults.push(`\n[本轮工具调用摘要:]\n${archeryStatusSummaryItems.join('；')}。\n[本轮工具调用摘要结束]\n`);
             }
+            emitToolBatch();
             res.write(`data: ${JSON.stringify({
               id: `chatcmpl-VCP-separator-${Date.now()}`,
               object: 'chat.completion.chunk',
@@ -680,10 +678,11 @@ class StreamHandler {
           recursionDepth++;
           continue;
         }
-        break; // 异步工具错误后的上游失败，不得当作正常工具终结轮。
+        break; // assertResponseOk above rejects unsuccessful continuations.
       }
 
       if (normalCalls.length === 0) {
+        emitToolBatch();
         if (!res.writableEnded && !res.destroyed) {
           try {
             const finalFinishReason = finalUpstreamFinishReason();
@@ -729,7 +728,6 @@ class StreamHandler {
       })();
 
       // VCP 信息展示 - 批量包裹为单个 USER 角色
-      let hasStartedUserBlock = false;
       const toolStatusSummaryItems = [...archeryStatusSummaryItems];
       for (let i = 0; i < normalCalls.length; i++) {
         const toolCall = normalCalls[i];
@@ -754,49 +752,16 @@ class StreamHandler {
         toolStatusSummaryItems.push(`${toolCall.name} ${statusText}${result?.recordId ? ` (记录ID: ${result.recordId})` : ''}`);
 
         if ((shouldShowVCP || forceThisOne) && !res.writableEnded && !res.destroyed) {
-          if (!hasStartedUserBlock && enableRoleDivider) {
-             try {
-                // start the user block
-                res.write(`data: ${JSON.stringify({
-                  id: `chatcmpl-vcp-start-${Date.now()}`,
-                  object: "chat.completion.chunk",
-                  choices: [{ index: 0, delta: { content: "\n<<<[ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
-                })}\n\n`);
-                hasStartedUserBlock = true;
-             } catch (e) {}
-          }
-          vcpInfoHandler.streamVcpInfo(res, originalBody.model, toolCall.name, result.success ? 'success' : 'error', result.raw || result.error, abortController);
+          const text = vcpInfoHandler.streamVcpInfo(null, originalBody.model, toolCall.name, result.success ? 'success' : 'error', result.raw || result.error, abortController);
+          if (text) visibleToolResults.push(text);
         }
       }
 
-      if (toolStatusSummaryItems.length > 0 && !res.writableEnded && !res.destroyed) {
-        try {
-          if (!hasStartedUserBlock && enableRoleDivider) {
-            res.write(`data: ${JSON.stringify({
-              id: `chatcmpl-vcp-start-${Date.now()}`,
-              object: "chat.completion.chunk",
-              choices: [{ index: 0, delta: { content: "\n<<<[ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
-            })}\n\n`);
-            hasStartedUserBlock = true;
-          }
-
-          res.write(`data: ${JSON.stringify({
-            id: `chatcmpl-vcp-summary-${Date.now()}`,
-            object: "chat.completion.chunk",
-            choices: [{ index: 0, delta: { content: `\n[本轮工具调用摘要:]\n${toolStatusSummaryItems.join('；')}。\n[本轮工具调用摘要结束]\n` }, finish_reason: null }]
-          })}\n\n`);
-        } catch (e) {}
+      if (toolStatusSummaryItems.length > 0) {
+        visibleToolResults.push(`\n[本轮工具调用摘要:]\n${toolStatusSummaryItems.join('；')}。\n[本轮工具调用摘要结束]\n`);
       }
-
-      if (hasStartedUserBlock && !res.writableEnded && !res.destroyed && enableRoleDivider) {
-         try {
-            // close the user block
-            res.write(`data: ${JSON.stringify({
-              id: `chatcmpl-vcp-end-${Date.now()}`,
-              object: "chat.completion.chunk",
-              choices: [{ index: 0, delta: { content: "\n<<<[END_ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
-            })}\n\n`);
-         } catch(e) {}
+      if (!res.writableEnded && !res.destroyed) {
+        try { emitToolBatch(); } catch (e) {}
       }
 
       // RAG 刷新

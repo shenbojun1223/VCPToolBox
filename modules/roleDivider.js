@@ -10,6 +10,7 @@
 
 const ToolCallParser = require('./vcpLoop/toolCallParser');
 const toolMarkerMatcher = require('./vcpLoop/toolMarkerFuzzyMatcher');
+const { createBatchStartScanner, findBatchEnd } = require('./toolResultBatch');
 
 const TAGS = {
     SYSTEM: {
@@ -80,8 +81,11 @@ function protectToolContent(message) {
         { start: '[[VCP调用结果信息汇总:', end: 'VCP调用结果结束]]' }
     ];
     const ranges = [];
+    const batchScanner = createBatchStartScanner();
     let cursor = 0;
     while (cursor < text.length) {
+        batchScanner.lastIndex = cursor;
+        const batch = batchScanner.exec(text);
         let selected = null;
         let start = -1;
         for (const marker of markers) {
@@ -91,8 +95,15 @@ function protectToolContent(message) {
                 start = index;
             }
         }
-        // Use the same marker recognition and ESCAPE boundaries as dispatch.
+        // The earliest outer region wins; batch literals inside ESCAPE stay data.
         const requestStart = toolMarkerMatcher.findBlockStartMarker(text, cursor);
+        if (batch && (start === -1 || batch.index <= start) &&
+            (!requestStart || batch.index <= requestStart.index)) {
+            const end = findBatchEnd(text, batch);
+            ranges.push({ start: batch.index, end });
+            cursor = end;
+            continue;
+        }
         if (requestStart && (start === -1 || requestStart.index <= start)) {
             const block = ToolCallParser.extractNextToolBlock(text, requestStart.index);
             const end = block ? block.nextOffset : text.length;

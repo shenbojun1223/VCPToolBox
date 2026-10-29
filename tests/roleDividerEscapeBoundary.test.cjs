@@ -57,3 +57,49 @@ test('fuzzy tool block boundaries follow shared matcher', () => {
     assert.equal(divider.process([{ role: 'assistant', content: req + us + 'RESULT' + ue }])[1].role, 'user');
   } finally { matcher.configure(old); }
 });
+
+const { formatToolResultBatch: escapeBoundaryBatch } = require('../modules/toolResultBatch');
+const escapeBoundaryStamp = '2026-10-29T12:51:34.979Z';
+const escapeBoundaryStart = mark('VCP_TOOL_BATCH_START:' + escapeBoundaryStamp);
+const escapeBoundaryEnd = mark('VCP_TOOL_BATCH_END:' + escapeBoundaryStamp);
+for (const payload of [
+  escapeBoundaryStart,
+  escapeBoundaryStart + '\n' + us + 'LITERAL' + ue + '\n' + escapeBoundaryEnd,
+  escapeBoundaryEnd
+]) {
+  test('batch boundary: earlier ESCAPE request wins over literal batch ' + payload, () => {
+    const req = request(payload);
+    assert.deepEqual(divider.process([{ role: 'assistant', content: req + us + 'ACTUAL' + ue + 'AFTER' }]), [
+      { role: 'assistant', content: req },
+      { role: 'user', content: 'ACTUAL' },
+      { role: 'assistant', content: 'AFTER' }
+    ]);
+    assert.equal(Parser.parse(req)[0].args.content, payload);
+  });
+}
+test('batch boundary: earlier batch shields unfinished ESCAPE and internal roles', () => {
+  const payload = start + '\ncontent:' + es + us + 'LITERAL' + ue;
+  const batch = escapeBoundaryBatch([payload], false);
+  assert.deepEqual(divider.process([{ role: 'assistant', content: batch + us + 'ACTUAL' + ue + 'AFTER' }]), [
+    { role: 'assistant', content: batch },
+    { role: 'user', content: 'ACTUAL' },
+    { role: 'assistant', content: 'AFTER' }
+  ]);
+});
+test('batch boundary: earlier legacy receipt shields an unclosed batch literal', () => {
+  const receipt = '[[' + 'VCP调用结果信息汇总:\n' + escapeBoundaryStart + '\n' + us + 'LITERAL' + ue + '\nVCP调用结果结束]]';
+  assert.deepEqual(divider.process([{ role: 'assistant', content: receipt + us + 'ACTUAL' + ue + 'AFTER' }]), [
+    { role: 'assistant', content: receipt },
+    { role: 'user', content: 'ACTUAL' },
+    { role: 'assistant', content: 'AFTER' }
+  ]);
+});
+test('batch boundary: marker split across text parts preserves image and payload', () => {
+  const batch = escapeBoundaryBatch([start + '\ncontent:' + es + us + 'LITERAL' + ue], false);
+  const cut = batch.indexOf('VCP_TOOL_BATCH_START') + 8;
+  const image = { type: 'image_url', image_url: { url: 'https://example.invalid/batch.png' } };
+  const parts = [{ type: 'text', text: batch.slice(0, cut) }, image, { type: 'text', text: batch.slice(cut) }];
+  const before = JSON.stringify(parts);
+  assert.deepEqual(divider.process([{ role: 'assistant', content: parts }]), [{ role: 'assistant', content: parts }]);
+  assert.equal(JSON.stringify(parts), before);
+});

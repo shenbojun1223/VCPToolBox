@@ -110,3 +110,39 @@ test('regression fixture exercises the real system-user filter', async () => {
     assert.equal(view.removedItems[0].reason, 'system-user');
     assert.equal(view.removedItems[0].message.content, task);
 });
+
+test('official scenario: pseudo-system tasks and leading notices survive untriggered OneRing', async () => {
+    const { ring, observed } = loadRing();
+    const messages = [
+        { role: 'system', content: 'Fixture without OneRing trigger.' },
+        { role: 'user', content: 'first question' },
+        { role: 'assistant', content: 'first answer' },
+        { role: 'user', content: '[系统提示:]\nMemory tray fixture' },
+        { role: 'user', content: '[系统通知]\nVCP protocol fixture\n[系统通知结束]\nsecond question' }
+    ];
+    const before = JSON.stringify(messages);
+    const result = await ring.processMessages(messages, {});
+    assert.equal(JSON.stringify(result), before);
+    assert.equal(JSON.stringify(messages), before);
+    assert.equal(result.__oneRingMeta, undefined);
+    assert.equal(observed.memoCalls, 1);
+});
+
+test('official scenario: real MemoryThinkingTray output passes inactive OneRing unchanged', async () => {
+    const tray = require('../Plugin/MemoryThinkingTray/MemoryThinkingTray.js');
+    const { ring, observed } = loadRing();
+    const input = [
+        { role: 'system', content: 'Fixture.\n<---VCP记忆思维区Start--->\nTRAY_SENTINEL_73\n<---VCP记忆思维区End--->' },
+        { role: 'user', content: 'What is the sentinel?' }
+    ];
+    const original = JSON.stringify(input);
+    const moved = await tray.processMessages(input, {});
+    assert.equal(JSON.stringify(input), original);
+    assert.ok(moved.some(m => m.role === 'user' && String(m.content).includes('TRAY_SENTINEL_73')));
+    const before = JSON.stringify(moved);
+    const result = await ring.processMessages(moved, {});
+    assert.equal(JSON.stringify(result), before);
+    assert.equal(JSON.stringify(moved), before);
+    assert.equal(result.__oneRingMeta, undefined);
+    assert.equal(observed.memoCalls, 1);
+});
