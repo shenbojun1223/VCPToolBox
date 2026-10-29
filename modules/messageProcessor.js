@@ -34,7 +34,6 @@ const toolboxManager = require('./toolboxManager.js');
 const dynamicToolRegistry = require('./dynamicToolRegistry.js');
 const sarPromptManager = require('./sarPromptManager.js');
 const jevFoldFilter = require('./jevFoldFilter.js'); // 折叠级联第二阶段：embedding 出候选后由 Jev 再筛一次
-const { isClaudeSourcePrivacyEnabled } = require('./sourcePrivacyPolicy.js');
 
 const DEFAULT_TIMEZONE = process.env.DEFAULT_TIMEZONE || 'Asia/Shanghai';
 const REPORT_TIMEZONE = process.env.REPORT_TIMEZONE || DEFAULT_TIMEZONE; // 用于控制 AI 报告的时间，默认回退到根目录 config.env 的 DEFAULT_TIMEZONE
@@ -61,24 +60,6 @@ function resolveTvsDir() {
 }
 const TVS_DIR = resolveTvsDir();
 const VCP_ASYNC_RESULTS_DIR = path.join(__dirname, '..', 'VCPAsyncResults');
-
-const CLAUDE_SOURCE_PRIVACY_PLACEHOLDER_REGEX = /\{\{(?:Date|Time|Today|Festival|VCPWeatherInfoNow|VCPWeatherInfo)\}\}/g;
-const CLAUDE_SOURCE_PRIVACY_WEATHER_REGEX = /\{\{(?:VCPWeatherInfoNow|VCPWeatherInfo)\}\}/g;
-const CLAUDE_SOURCE_PRIVACY_WEATHER_KEYS = new Set(['VCPWeatherInfo', 'VCPWeatherInfoNow']);
-
-function suppressClaudeSourcePrivacyPlaceholders(text, context, role) {
-    const value = text == null ? '' : String(text);
-    return role === 'system' && isClaudeSourcePrivacyEnabled(context)
-        ? value.replace(CLAUDE_SOURCE_PRIVACY_PLACEHOLDER_REGEX, '')
-        : value;
-}
-
-function suppressClaudeSourcePrivacyWeatherPlaceholders(text, context, role) {
-    const value = text == null ? '' : String(text);
-    return role === 'system' && isClaudeSourcePrivacyEnabled(context)
-        ? value.replace(CLAUDE_SOURCE_PRIVACY_WEATHER_REGEX, '')
-        : value;
-}
 
 function escapeRegExp(value) {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -261,7 +242,7 @@ function findLastRealUserMessage(messages, options = {}) {
 
 async function resolveAllVariables(text, model, role, context, processingStack = new Set()) {
     if (text == null) return '';
-    let processedText = suppressClaudeSourcePrivacyPlaceholders(String(text), context, role);
+    let processedText = String(text);
 
     // 🔒 安全防护：Agent 和 Toolbox 占位符仅在特权角色中展开
     // 特权角色包括：1) 标准 system 消息  2) VCPTavern 注入的以 [系统提示:] / [系统邀请指令:] 开头的 user 消息
@@ -791,11 +772,11 @@ function applyDetectorsToMessages(messages, context = {}) {
     });
 }
 
-async function injectStaticPluginPlaceholders(text, context = {}, role = 'system') {
+async function injectStaticPluginPlaceholders(text, context = {}) {
     const { pluginManager, DEBUG_MODE } = context;
     if (text == null) return '';
 
-    let processedText = suppressClaudeSourcePrivacyWeatherPlaceholders(String(text), context, role);
+    let processedText = String(text);
     const staticFoldMode = extractStaticFoldMode(processedText);
     processedText = removeStaticFoldModePlaceholders(processedText);
 
@@ -816,12 +797,6 @@ async function injectStaticPluginPlaceholders(text, context = {}, role = 'system
         }
 
         // 🔒 静态占位符去重：跨消息只展开一次
-        if (isClaudeSourcePrivacyEnabled(context) && CLAUDE_SOURCE_PRIVACY_WEATHER_KEYS.has(placeholder)) {
-            processedText = processedText.replaceAll(fullPlaceholder, '');
-            if (context.expandedStaticPlaceholders) context.expandedStaticPlaceholders.add(placeholder);
-            continue;
-        }
-
         if (context.expandedStaticPlaceholders && context.expandedStaticPlaceholders.has(placeholder)) {
             if (DEBUG_MODE) {
                 console.log(`[StaticFold] 静态占位符 ${fullPlaceholder} 已在之前消息中展开，跳过重复展开`);
@@ -868,14 +843,14 @@ async function injectStaticPluginPlaceholdersInMessages(messages, context = {}) 
             message.content = await injectStaticPluginPlaceholders(message.content, {
                 ...context,
                 messages
-            }, message.role);
+            });
         } else if (Array.isArray(message.content)) {
             for (const part of message.content) {
                 if (part && part.type === 'text' && typeof part.text === 'string') {
                     part.text = await injectStaticPluginPlaceholders(part.text, {
                         ...context,
                         messages
-                    }, message.role);
+                    });
                 }
             }
         }
@@ -887,7 +862,7 @@ async function injectStaticPluginPlaceholdersInMessages(messages, context = {}) 
 async function replaceOtherVariables(text, model, role, context) {
     const { pluginManager, cachedEmojiLists, DEBUG_MODE } = context;
     if (text == null) return '';
-    let processedText = suppressClaudeSourcePrivacyPlaceholders(String(text), context, role);
+    let processedText = String(text);
 
     // SarModel 高级预设注入，对 system 角色或 VCPTavern 注入的 user 角色生效
     const systemMarkers = ['[系统提示:]', '[系统邀请指令:]', '[系统通知:]', '[系统通知]'];
@@ -963,8 +938,6 @@ async function replaceOtherVariables(text, model, role, context) {
         }
     }
 
-    processedText = suppressClaudeSourcePrivacyPlaceholders(processedText, context, role);
-
     if (role === 'system') {
         for (const envKey in process.env) {
             if (envKey.startsWith('Tar') || envKey.startsWith('Var')) {
@@ -1000,8 +973,6 @@ async function replaceOtherVariables(text, model, role, context) {
             }
         }
 
-        processedText = suppressClaudeSourcePrivacyPlaceholders(processedText, context, role);
-
         if (processedText.includes('{{VCPDistributedServerList}}')) {
             if (context.expandedGlobalPlaceholders && context.expandedGlobalPlaceholders.has('VCPDistributedServerList')) {
                 processedText = processedText.replaceAll('{{VCPDistributedServerList}}', '');
@@ -1022,9 +993,6 @@ async function replaceOtherVariables(text, model, role, context) {
             }
         }
 
-        if (isClaudeSourcePrivacyEnabled(context)) {
-            processedText = suppressClaudeSourcePrivacyPlaceholders(processedText, context, role);
-        } else {
         const now = new Date();
         if (DEBUG_MODE) {
             console.log(`[TimeVar] Raw Date: ${now.toISOString()}`);
@@ -1054,12 +1022,11 @@ async function replaceOtherVariables(text, model, role, context) {
         let festivalInfo = `${yearName}${lunarDate.zodiac}年${lunarDate.dateStr}`;
         if (lunarDate.solarTerm) festivalInfo += ` ${lunarDate.solarTerm}`;
         processedText = processedText.replace(/\{\{Festival\}\}/g, festivalInfo);
-        }
 
         // 默认保持历史行为；主请求管线可通过 deferStaticPluginPlaceholders
         // 将静态/混合/分布式插件占位符延迟到可排序的虚拟阶段。
         if (!context.deferStaticPluginPlaceholders) {
-            processedText = await injectStaticPluginPlaceholders(processedText, context, role);
+            processedText = await injectStaticPluginPlaceholders(processedText, context);
         }
 
         const individualPluginDescriptions = pluginManager.getIndividualPluginDescriptions();

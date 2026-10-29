@@ -1768,6 +1768,24 @@ this.tagMemoV10Engine = new TagMemoV10Engine(
         result.tdbTopK = (result.tdbTopK || []).map(normalize);
         result.comparisonPool = (result.comparisonPool || []).map(normalize);
         if (Array.isArray(result.river?.results)) result.river.results = result.river.results.map(normalize);
+        if (options.abMode === true && prepared) {
+            const source = prepared.sourceObservationResult;
+            result.memoObservation = {
+                artifactSig: prepared.artifact.artifactSig,
+                queryId: prepared.observation?.queryId ?? null,
+                queryTags: {
+                    requestedCoreTags: options.coreTags || [],
+                    matchedTags: source.matchedTags,
+                    coreTagsMatched: source.coreTagsMatched,
+                    sourceMode: source.sourceMode
+                },
+                effectiveTagBoost: source.effectiveTagBoost,
+                propagation: source.propagation,
+                epa: source.epa,
+                pyramid: source.pyramid,
+                diagnostics: source.diagnostics?.nativePipeline || null
+            };
+        }
         return result;
         } finally {
             if (prepared) this.releaseMemoObservation?.(prepared);
@@ -2409,7 +2427,10 @@ this.tagMemoV10Engine = new TagMemoV10Engine(
             queryRiverGraph,
             epa: Object.freeze({ ...(pipeline.epa || {}) }),
             pyramid,
-            propagation: Object.freeze({ native: null }),
+            propagation: Object.freeze({
+                parameters: pipeline.propagationParameters || null,
+                diagnostics: pipeline.diagnostics?.sensing || null
+            }),
             matchedTags: Object.freeze(
                 Array.isArray(pipeline.matchedTags)
                     ? pipeline.matchedTags.slice()
@@ -2622,6 +2643,13 @@ this.tagMemoV10Engine = new TagMemoV10Engine(
         if (typeof runtime?.executeExternalRerank !== 'function') {
             throw new Error('NATIVE_PARALLEL_RERANK_ABI_UNAVAILABLE: rebuild rust-vexus-lite');
         }
+        if (options.annSearch !== undefined) {
+            const features = typeof runtime.capabilities === 'function'
+                ? runtime.capabilities()?.capabilities : [];
+            if (!Array.isArray(features) || !features.includes('index.query-options.v1')) {
+                throw new Error('NATIVE_ANN_SEARCH_OPTIONS_UNAVAILABLE: rebuild rust-vexus-lite');
+            }
+        }
         const diaryNames = [...new Set(
             (Array.isArray(options.diaryNames) ? options.diaryNames : [options.diaryNames])
                 .map(name => String(name || '').trim()).filter(Boolean)
@@ -2632,6 +2660,7 @@ this.tagMemoV10Engine = new TagMemoV10Engine(
             externalOnly: true, diaryNames,
             queryText: String(query.text || ''),
             topK: options.topK, candidateK: options.candidateK,
+            annSearch: options.annSearch,
             externalK: options.externalK, useJev: options.useJev,
             jevPrompt: options.jevPrompt,
             fileCandidates: options.fileCandidates || [],
@@ -2649,6 +2678,13 @@ this.tagMemoV10Engine = new TagMemoV10Engine(
         if (typeof runtime?.executeParallelRerank !== 'function') {
             throw new Error('NATIVE_PARALLEL_RERANK_ABI_UNAVAILABLE: rebuild rust-vexus-lite');
         }
+        if (options.annSearch !== undefined) {
+            const features = typeof runtime.capabilities === 'function'
+                ? runtime.capabilities()?.capabilities : [];
+            if (!Array.isArray(features) || !features.includes('index.query-options.v1')) {
+                throw new Error('NATIVE_ANN_SEARCH_OPTIONS_UNAVAILABLE: rebuild rust-vexus-lite');
+            }
+        }
         const diaryNames = [...new Set(
             (Array.isArray(options.diaryNames) ? options.diaryNames : [options.diaryNames])
                 .map(name => String(name || '').trim()).filter(Boolean)
@@ -2664,6 +2700,7 @@ this.tagMemoV10Engine = new TagMemoV10Engine(
             riverConfig: this.riverMemoEngine._nativeConfig(prepared.artifact, options),
             queryText: String(query.text || ''), topK: options.topK,
             candidateK: options.candidateK, externalK: options.externalK,
+            annSearch: options.annSearch,
             alpha: options.alpha ?? 0.5, useJev: options.useJev,
             autoRrfAlpha: options.autoRrfAlpha === true,
             jevPrompt: options.jevPrompt,
