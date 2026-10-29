@@ -36,13 +36,14 @@ VCP系统工具列表：{{VarToolList}}。
 # VCP 文件管理与系统控制工具箱能力收纳
 这里收纳了文件搜索、读写、批量操作及系统命令行工具。
 
-## 1. PowerShell 命令行工具 (PowerShellExecutor)
-直接调用并获取运行结果。支持 VCP-CLI (前端) 和紧凑的后端命令行。支持RG和FFMPEG指令集。
-tool_name:「始」PowerShellExecutor「末」, // 使用 ServerPowerShellExecutor 运行后端版本操作服务器内容。
-command:「始」Get-ChildItem「末」,
-executionType:「始」blocking/background「末」, // 默认blocking。background用于长时任务。
-newSession:「始」true「末」, // 仅前端，代表新建窗口。
-requireAdmin:「始」true「末」 // 提升权限。Server版需输入6位安全码。 // 例如tool_password:「始」123456「末」
+## 1. PowerShell 命令行工具（前后端契约分开）
+- 前端 `PowerShellExecutor`：`command=ExecutePowerShell`，脚本写入 `powershell`；多条脚本用 `powershell1/powershell2` 等编号字段，不使用 `executionType`。
+- 查询终端：`command=QueryVisible, maxLines=200`。`terminalTarget=sidebar|window` 默认 sidebar；独立窗口每次显式传 window。两个视图共享同一 PTY、目录与环境。
+- `newSession=true` 会终止旧 PTY 并重建，不是仅打开窗口；共享终端命令串行，不擅自打断已有任务。
+- `returnMode=delta|full`；`requireAdmin=true` 为独立用户提权确认路径，只支持单条命令。
+- 交互程序使用 `StartInteractive(powershell)`、`PasteInteractiveText(text, submit?)`、`SendInteractiveKey(key)`；程序退出后才用 `EndInteractive` 清除占用。`InterruptPowerShell` 仅发送中断请求，须复核退出结果。
+- 后端 `ServerPowerShellExecutor`：`command` 直接填脚本，`executionType=blocking|background`；敏感操作按宿主要求提供实时验证码，不套用前端参数。
+- 超时、后台启动或无回执均不代表执行成功或进程退出。先确认目标机器与路径；RG/FFmpeg 以实际安装为准；重要调查使用 `ink=mark_history`。
 
 ## 2. 文件快速搜索 (LocalSearchController)
 基于 Everything 模块实现秒级搜索。
