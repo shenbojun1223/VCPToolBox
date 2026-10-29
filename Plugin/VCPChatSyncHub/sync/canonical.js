@@ -263,6 +263,10 @@ function canonicalizeMessage(value, topicId, warnings = new BoundedWarnings()) {
     if (attachments.length > 0) message.attachments = attachments;
   }
 
+  if (isPlainObject(value.contextCompaction)) {
+    message.contextCompaction = value.contextCompaction;
+  }
+
   return message;
 }
 

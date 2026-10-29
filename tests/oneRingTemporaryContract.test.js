@@ -7,6 +7,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const filename = path.resolve(__dirname, '../Plugin/OneRing/OneRing.js');
+const localRequire = require('node:module').createRequire(filename);
 const fuzzy = require('../Plugin/OneRing/OneRingFuzzy.js');
 const main = '[[OneRing::小克::VCPChat]]';
 const mobile = '[[OneRing临时契约::VCPMobile]]';
@@ -29,7 +30,7 @@ function loadRing() {
                 return { getClientTimestampBindingsFromConfig: () => ({ bindings: [], rawCount: 0 }) };
             }
             if (name.startsWith('./') || name === 'chokidar') return {};
-            return require(name);
+            return localRequire(name);
         }
     };
     vm.runInNewContext(fs.readFileSync(filename, 'utf8'), sandbox, { filename });

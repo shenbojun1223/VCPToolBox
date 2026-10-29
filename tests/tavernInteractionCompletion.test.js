@@ -97,6 +97,33 @@ test('流式：仅在整轮结束时向客户端发送 finish_reason', async () 
   assert.equal((res.writes.join('').match(/data: \[DONE\]/g) || []).length, 1);
 });
 
+test('流式：工具执行等待期间仍发送心跳，完成后停止', async () => {
+  const res = response();
+  let releaseTool;
+  let toolStarted;
+  const started = new Promise(resolve => { toolStarted = resolve; });
+  const toolFinished = new Promise(resolve => { releaseTool = resolve; });
+  const ctx = context({
+    sseKeepAliveIntervalMs: 10,
+    toolExecutor: { executeAll: async () => {
+      toolStarted();
+      await toolFinished;
+      return [{ success: true, content: [{ type: 'text', text: 'ok' }] }];
+    } },
+    fetchWithRetry: async () => streamResponse('after tool')
+  });
+  const pending = new StreamHandler(ctx).handle({}, res, streamResponse('TOOL'));
+  await started;
+  await new Promise(resolve => setTimeout(resolve, 35));
+  assert.match(res.writes.join(''), /: vcp-keepalive\n\n/);
+  releaseTool();
+  await pending;
+  const written = res.writes.length;
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(res.writes.length, written);
+  assert.equal(res.writableEnded, true);
+});
+
 test('流式：上游长度截断不能被最终 stop 掩盖', async () => {
   const res = response();
   const result = await new StreamHandler(context()).handle({}, res, streamResponse('partial', 'length'));

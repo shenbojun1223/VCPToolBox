@@ -61,9 +61,12 @@ async function projectMobileMessage({
   const desktop = {
     id: canonical.id,
     role: canonical.role,
-    name: canonical.name || (isUser ? "User" : "Assistant"),
+    ...(canonical.name !== undefined ? { name: canonical.name } : {}),
     content: canonical.content,
     timestamp: canonical.timestamp,
+    ...(canonical.contextCompaction && typeof canonical.contextCompaction === "object"
+      ? { contextCompaction: canonical.contextCompaction }
+      : {}),
   };
   const neededAttachmentHashes = new Set();
   const attachmentsDir = path.join(appDataPath, "UserData", "attachments");

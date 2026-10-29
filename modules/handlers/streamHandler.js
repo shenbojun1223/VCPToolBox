@@ -74,6 +74,20 @@ class StreamHandler {
     const reasoningTag = normalizeReasoningTag(reasoningToContentTag);
     const id = originalBody.requestId || originalBody.messageId;
 
+    // Keep the client connection alive across the entire VCP request, including
+    // tool execution and the wait for a continuation response from upstream.
+    const keepAliveIntervalMs = this.context.sseKeepAliveIntervalMs || 5000;
+    const keepAliveTimer = setInterval(() => {
+      if (res.writableEnded || res.destroyed) return;
+      try { res.write(': vcp-keepalive\n\n'); } catch { /* client disconnected */ }
+    }, keepAliveIntervalMs);
+    keepAliveTimer.unref?.();
+    const stopKeepAlive = () => clearInterval(keepAliveTimer);
+    res.once?.('finish', stopKeepAlive);
+    res.once?.('close', stopKeepAlive);
+
+    try {
+
     let currentMessagesForLoop = originalBody.messages ? JSON.parse(JSON.stringify(originalBody.messages)) : [];
     let recursionDepth = 0;
     const parsedMaxRecursion = Number.parseInt(maxVCPLoopStream, 10);
@@ -196,7 +210,6 @@ class StreamHandler {
         const outputGuard = new ModelOutputGuard();
         let sseLineBuffer = '';
         let streamAborted = false;
-        let keepAliveTimer = null;
         let chunkIdleTimer = null;
         const CHUNK_IDLE_TIMEOUT = 90000; // 90 秒无新 chunk 则判定上游流冻结
         let message = { content: '', reasoning_content: '' };
@@ -312,17 +325,6 @@ class StreamHandler {
           };
           res.write(`data: ${JSON.stringify(closePayload)}\n\n`);
         };
-        // 🌟 核心修复：注入 SSE 幽灵心跳保活，防止上游卡顿时浏览器假死
-        keepAliveTimer = setInterval(() => {
-          if (!res.writableEnded && !res.destroyed) {
-            try {
-              res.write(': vcp-keepalive\n\n');
-            } catch (e) {
-              // Ignore errors
-            }
-          }
-        }, 5000); // 5秒发一次心跳
-
         // 🌟 新增：chunk 级空闲超时保护
         // 如果连续 CHUNK_IDLE_TIMEOUT 毫秒未收到任何上游 data chunk，
         // 则终止读取并抛出安全错误，不允许把部分输出送入工具补救轮。
@@ -337,7 +339,6 @@ class StreamHandler {
         resetChunkIdleTimer(); // 启动首次空闲计时
 
         const cleanupStream = () => {
-          clearInterval(keepAliveTimer);
           clearTimeout(chunkIdleTimer);
           abortController?.signal.removeEventListener('abort', abortHandler);
           aiResponse.body.removeListener('data', onData);
@@ -423,7 +424,6 @@ class StreamHandler {
 
         const onEnd = () => {
           upstreamEnded = true;
-          if (keepAliveTimer) clearInterval(keepAliveTimer);
           if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
           const remainingString = decoder.end();
           if (remainingString) {
@@ -1045,6 +1045,11 @@ class StreamHandler {
       completed: completed && !abortController?.signal.aborted && !res.destroyed,
       aiText: oneRingAssistantTurnParts.join('\n')
     };
+    } finally {
+      stopKeepAlive();
+      res.off?.('finish', stopKeepAlive);
+      res.off?.('close', stopKeepAlive);
+    }
   }
 }
 

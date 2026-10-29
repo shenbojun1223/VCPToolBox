@@ -1131,12 +1131,14 @@ class OneRingPreprocessor {
         messages = workingView ? workingView.workingMessages : messages;
 
         // ── 1. 检测触发语法：只检查开头连续 system 前缀 ────────────────────────
+        // Working-view filtering is internal; an inactive OneRing must preserve
+        // the original request, including pseudo-system user tasks and attachments.
         const systemMsg = getTopLevelOneRingSystemMessage(messages);
-        if (!systemMsg) return messages;
+        if (!systemMsg) return originalMessages || messages;
 
         const systemText = fuzzy.extractText(systemMsg.content);
         const triggerMatch = getLastTriggerMatch(systemText);
-        if (!triggerMatch) return messages;
+        if (!triggerMatch) return originalMessages || messages;
 
         const onlyTriggerMatch = getLastOnlyTriggerMatch(systemText);
         const agentName = triggerMatch[1].trim();
