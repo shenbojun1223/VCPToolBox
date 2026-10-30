@@ -4,7 +4,7 @@ const { UpstreamError, assertResponseOk, abortableDelay, abortError, throwIfAbor
 const { emitVcpToolForbiddenReceipt } = require('../vcpToolForbiddenReceipt.js');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
 const { inspectModelOutput, NOTICE: modelProtocolNotice } = require('../vcpLoop/modelOutputGuard');
-const { formatToolResultBatch } = require('../toolResultBatch.js');
+const { formatToolResultBatch, projectToolBatchForUpstream } = require('../toolResultBatch.js');
 const {
   buildClientVisibleContent,
   removeReasoningFields,
@@ -265,7 +265,7 @@ class NonStreamHandler {
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}`, ...openCodeGoSessionHeader },
-        body: JSON.stringify(body),
+        body: JSON.stringify(projectToolBatchForUpstream(body)),
         signal: abortController.signal,
       },
       { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates, phase: label === 'initial' ? 'initial' : 'tool_continuation' }

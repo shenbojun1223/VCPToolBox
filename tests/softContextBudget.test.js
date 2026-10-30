@@ -160,6 +160,7 @@ function firstSend({ count = 100000, fail = false, extension = identity() } = {}
   const originalBody = Object.freeze({ model: 'fixture-model', messages, stream: true });
   const sandbox = {
     originalBody, willStreamResponse: true,
+    projectToolBatchForUpstream: require('../modules/toolResultBatch').projectToolBatchForUpstream,
     finalContextStore: { setLastFinalContext(body, metadata) {
       captured.push({ body: JSON.parse(JSON.stringify(body)), metadata });
       if (fail) throw new Error('fixture count failure');

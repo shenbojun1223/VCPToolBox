@@ -3,7 +3,7 @@ const { UpstreamError, assertResponseOk, throwIfAborted } = require('../upstream
 const { StringDecoder } = require('string_decoder');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
 const { ModelOutputGuard, NOTICE: modelProtocolNotice } = require('../vcpLoop/modelOutputGuard');
-const { formatToolResultBatch } = require('../toolResultBatch.js');
+const { formatToolResultBatch, projectToolBatchForUpstream } = require('../toolResultBatch.js');
 const {
   extractReasoningText,
   removeReasoningFields,
@@ -650,7 +650,7 @@ class StreamHandler {
               ...openCodeGoSessionHeader,
               Accept: 'text/event-stream',
             },
-            body: JSON.stringify({ ...originalBody, messages: currentMessagesForLoop, stream: true }),
+            body: JSON.stringify(projectToolBatchForUpstream({ ...originalBody, messages: currentMessagesForLoop, stream: true })),
             signal: abortController.signal,
           },
           { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates, phase: 'tool_continuation' }
@@ -859,7 +859,7 @@ class StreamHandler {
             ...openCodeGoSessionHeader,
             Accept: 'text/event-stream',
           },
-          body: JSON.stringify({ ...originalBody, messages: messagesForUpstream, stream: true }),
+          body: JSON.stringify(projectToolBatchForUpstream({ ...originalBody, messages: messagesForUpstream, stream: true })),
           signal: abortController.signal,
         },
         { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates, phase: 'tool_continuation' }
