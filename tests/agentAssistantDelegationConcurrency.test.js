@@ -11,7 +11,7 @@ const { randomUUID } = require('node:crypto');
 const entry = path.resolve(__dirname, '../Plugin/AgentAssistant/AgentAssistant.js');
 const localRequire = createRequire(entry);
 
-function harness() {
+function harness({ forge = null } = {}) {
     const config = {
         maxHistoryRounds: 2,
         contextTtlHours: 1,
@@ -75,6 +75,9 @@ function harness() {
             if (name === 'axios') return axios;
             if (name === 'dotenv') return { parse: () => ({}) };
             if (name === 'uuid') return { v4: randomUUID };
+            if (name === '../../Plugin.js') return { getServiceModule: name =>
+                name === 'ServerProjectForge' && forge ? { delegations: forge } : null };
+            if (name === './forgeLifecycle.js') return localRequire(name);
             if (name === '../../modules/reasoningContentAdapter.js' ||
                 name === './flowlockProtocol.js' ||
                 name === '../../modules/vcpLoop/modelOutputGuard') return localRequire(name);
@@ -93,10 +96,10 @@ function harness() {
     });
     return {
         api, chats, callbacks, files, warnings,
-        async submit(prompt, session) {
+        async submit(prompt, session, binding = {}) {
             const args = {
                 agent_name: 'SyntheticWorker', prompt,
-                maid: 'OfflineTest', task_delegation: true
+                maid: 'OfflineTest', task_delegation: true, ...binding
             };
             if (session !== undefined) args.session_id = session;
             const receipt = await api.processToolCall(args);
@@ -269,4 +272,95 @@ test('delegation does not scan assembled trusted tool results for protocol tags'
     await until(() => h.callbacks.length === 1, 'normal completion');
     assert.equal(h.callbacks[0].payload.status, 'Succeed');
     assert.equal(h.chats.length, 1);
+});
+function forgeFixture() {
+    const events = [];
+    return { events,
+        async bind(args) { events.push({ kind: 'bind', ...args }); },
+        async advance(args) { events.push({ kind: 'advance', ...args }); },
+    };
+}
+test('explicit Forge binding precedes HTTP and completion projects review, not verified', async t => {
+    const forge = forgeFixture(), h = harness({ forge }); t.after(() => h.close());
+    const id = await h.submit('bound', 'forge-session', {
+        forge_project_id: 'ptest', forge_todo_seq: 1, forge_role: 'Worker#test',
+    });
+    await until(() => h.chats.length === 1, 'bound HTTP request');
+    assert.equal(forge.events[0].kind, 'bind');
+    assert.equal(forge.events[0].delegationId, id);
+    assert.equal(forge.events[0].projectId, 'ptest');
+    assert.equal(forge.events[0].role, 'Worker#test');
+    assert.deepEqual(forge.events.filter(e => e.kind === 'advance').map(e => e.status), ['running']);
+    h.finish(0);
+    await until(() => h.callbacks.length === 1, 'bound callback');
+    assert.deepEqual(forge.events.filter(e => e.kind === 'advance').map(e => e.status), ['running', 'completed']);
+    assert.ok(forge.events.every(e => e.delegationId === id));
+    assert.equal(h.api.listDelegations().recent[0].forgeBinding.todoSeq, 1);
+});
+test('Forge binding rejects missing capability and bad target before any model request', async t => {
+    const h = harness(); t.after(() => h.close());
+    await assert.rejects(h.submit('bound', 's', { forge_project_id: 'ptest', forge_todo_seq: 1 }));
+    assert.equal(h.chats.length, 0);
+    assert.equal(h.api.listDelegations().active.length, 0);
+    const forge = forgeFixture(), g = harness({ forge }); t.after(() => g.close());
+    for (const args of [
+        { forge_project_id: 'ptest' }, { forge_project_id: 'remote:p1', forge_todo_seq: 1 },
+        { forge_project_id: 'ptest', forge_todo_seq: 0 },
+        { forge_project_id: 'ptest', forge_todo_seq: 1, task_delegation: false },
+        { forge_project_id: 'ptest', forge_todo_seq: 1, timely_contact: '2099-01-01-10:00' },
+    ]) await assert.rejects(g.submit('invalid', 's', args));
+    assert.equal(g.chats.length, 0);
+    assert.equal(forge.events.length, 0);
+});
+test('failed Forge bind is not retried and launches no model', async t => {
+    const forge = forgeFixture();
+    forge.bind = async () => { throw Object.assign(Error('synthetic conflict'), { code: 'DELEGATION_BUSY' }); };
+    const h = harness({ forge }); t.after(() => h.close());
+    await assert.rejects(h.submit('bound', 's', { forge_project_id: 'ptest', forge_todo_seq: 1 }));
+    assert.equal(h.chats.length, 0); assert.equal(h.callbacks.length, 0);
+});
+test('bound model failure produces one failed lifecycle, archive and callback', async t => {
+    const forge = forgeFixture(), h = harness({ forge }); t.after(() => h.close());
+    await h.submit('failure', 's', { forge_project_id: 'ptest', forge_todo_seq: 1 });
+    await until(() => h.chats.length === 1, 'failing request');
+    h.chats[0].reject(Error('synthetic model failure'));
+    await until(() => h.api.listDelegations().active.length === 0, 'failed cleanup');
+    assert.equal(h.callbacks.length, 1);
+    assert.equal(h.callbacks[0].payload.status, 'Failed');
+    assert.equal([...h.files.keys()].filter(p => p.endsWith('.md')).length, 1);
+    assert.deepEqual(forge.events.filter(e => e.kind === 'advance').map(e => e.status), ['running', 'failed']);
+});
+test('bound wait, cancellation and cancelled lock waiter all project their own state', async t => {
+    const forge = forgeFixture(), h = harness({ forge }); t.after(() => h.close());
+    const id = await h.submit('wait', 'shared', { forge_project_id: 'ptest', forge_todo_seq: 1 });
+    await until(() => h.chats.length === 1, 'first request');
+    const waiter = await h.submit('queued', 'shared', { forge_project_id: 'ptest', forge_todo_seq: 2 });
+    h.api.cancelDelegation(waiter, 'cancel waiter');
+    await until(() => !h.api.__test.activeDelegations.has(waiter), 'waiter ended');
+    const waiterEvents = forge.events.filter(e => e.kind === 'advance' && e.delegationId === waiter);
+    assert.equal(waiterEvents.at(-1).status, 'cancelled');
+    assert.ok(!waiterEvents.some(e => e.status === 'running'));
+    assert.equal(h.api.__test.activeSessionLocks.size, 1);
+    h.chats[0].resolve({ data: { choices: [{ message: { content: 'first\n[[Flowlock::Start]]\n[[Flowlock::NextHeartbeat::1]]' } }] } });
+    await until(() => forge.events.some(e => e.delegationId === id && e.status === 'waiting'), 'wait projected');
+    h.api.cancelDelegation(id, 'cancel active');
+    if (h.chats.length > 1) h.finish(1);
+    await until(() => h.api.listDelegations().active.length === 0, 'all ended');
+    assert.equal(h.callbacks.length, 2);
+    assert.ok(h.callbacks.every(c => c.payload.status === 'Cancelled'));
+});
+test('late status sync failure is visible and does not duplicate callback or turn completion verified', async t => {
+    const forge = forgeFixture(), original = forge.advance;
+    forge.advance = async args => {
+        if (args.status === 'completed') throw Object.assign(Error('private data'), { code: 'DELEGATION_STALE' });
+        return original(args);
+    };
+    const h = harness({ forge }); t.after(() => h.close());
+    await h.submit('sync failure', 's', { forge_project_id: 'ptest', forge_todo_seq: 1 });
+    await until(() => h.chats.length === 1, 'request');
+    h.finish(0);
+    await until(() => h.callbacks.length === 1, 'single callback');
+    const done = h.api.listDelegations().recent[0];
+    assert.equal(done.forgeBinding.syncError, 'DELEGATION_STALE');
+    assert.equal(h.callbacks.length, 1);
 });

@@ -2467,7 +2467,19 @@ const gui = {
         return { deleted: done.includes(id), projectId: id };
     },
 };
+// Host capability used by AgentAssistant, not a general model-invocable mutation.
+const delegations = Object.freeze(Object.fromEntries(['bind', 'advance'].map(method => [method, async args => {
+    ensureRuntime();
+    return withLock(args.projectId, () => {
+        projectOf({ projectid: args.projectId }, { write: true });
+        const result = require('./delegationLifecycle')[method](store(), args);
+        if (result.changed) emitProjectChanged({ action: 'delegation:' + method,
+            projectId: args.projectId, todoSeq: args.todoSeq });
+        return result;
+    });
+}])));
 module.exports = {
+    delegations,
     catalogStatus: () => runtime.catalog?.status() || {
         read: false, publisher: { phase: runtime.catalogError ? 'blocked' : 'disabled' },
         error: runtime.catalogError,

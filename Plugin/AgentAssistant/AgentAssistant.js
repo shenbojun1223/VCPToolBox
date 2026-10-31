@@ -14,6 +14,7 @@ const {
     parseFlowlockDirectives
 } = require('./flowlockProtocol.js');
 const { STATUS: MODEL_PROTOCOL_HALT } = require('../../modules/vcpLoop/modelOutputGuard');
+const ForgeLifecycle = require('./forgeLifecycle.js');
 
 // --- State and Config Variables ---
 let VCP_SERVER_PORT;
@@ -564,7 +565,8 @@ function createDelegationSnapshot(state) {
         cancelRequested: !!state.cancelRequested,
         completionStatus: state.completionStatus || null,
         finalReportPreview: state.finalReportPreview || '',
-        archivePath: state.archivePath || null
+        archivePath: state.archivePath || null,
+        forgeBinding: ForgeLifecycle.snapshot(state.forgeTracking)
     };
 }
 
@@ -604,6 +606,7 @@ function cancelDelegation(delegationId, reason = '用户从管理面板请求取
     state.status = 'cancelling';
     state.updatedAt = Date.now();
     activeDelegations.set(delegationId, state);
+    void ForgeLifecycle.advance(state.forgeTracking, 'cancelling').catch(() => {});
     return { success: true, message: `已请求取消委托任务 ${delegationId}。任务会在当前等待/请求结束后尽快退出。`, task: createDelegationSnapshot(state) };
 }
 
@@ -663,6 +666,7 @@ async function processToolCall(args) {
     }
 
     const { agent_name, prompt, timely_contact, temporary_contact, maid, task_delegation, query_delegation, cancel_delegation, inject_tools, river_context, __vcp_timed_call } = args;
+    const forgeBinding = ForgeLifecycle.parse(args);
 
     // Handle cancelling a delegation
     if (cancel_delegation) {
@@ -776,8 +780,12 @@ async function processToolCall(args) {
         const delegationId = `aa-delegation-${Date.now()}-${uuidv4().slice(0, 8)}`;
         const delegationSenderName = maid || "系统任务中心";
         const temporaryToolsSystemPrompt = buildTemporaryToolsSystemPrompt(inject_tools);
+        const forgeTracking = await ForgeLifecycle.bind(forgeBinding, {
+            delegationId, agentName: agent_name, senderName: delegationSenderName, sessionId: args.session_id,
+        }, () => require('../../Plugin.js').getServiceModule('ServerProjectForge'));
 
         activeDelegations.set(delegationId, {
+            forgeTracking,
             id: delegationId,
             status: 'running',
             agentName: agent_name,
@@ -805,6 +813,8 @@ async function processToolCall(args) {
         executeDelegation(delegationId, agentConfig, promptWithRiverAttachment, promptTextForStorage, delegationSenderName, temporaryToolsSystemPrompt, args.session_id).catch(async err => {
             console.error(`[AgentAssistant Service] Background delegation task ${delegationId} failed:`, err);
             const state = activeDelegations.get(delegationId);
+            // executeDelegation's finally already archived/called back if it owned the lock.
+            if (!state) return;
             const status = err.code === 'DELEGATION_CANCELLED' ? 'Cancelled' : 'Failed';
             if (state) {
                 state.status = status === 'Cancelled' ? 'cancelled' : 'failed';
@@ -812,6 +822,9 @@ async function processToolCall(args) {
                 state.finalReportPreview = truncateText(`任务执行过程中发生异常: ${err.message}`);
                 state.endTime = Date.now();
                 state.updatedAt = Date.now();
+                await ForgeLifecycle.advance(state.forgeTracking, state.status).catch(() => {});
+                state.archivePath = await archiveDelegationReport(delegationId, agentConfig.baseName,
+                    status, state.finalReportPreview, promptTextForStorage);
                 rememberCompletedDelegation(state);
             }
             await sendDelegationCallback(delegationId, status, `任务执行过程中发生异常: ${err.message}`, agent_name);
@@ -1045,6 +1058,8 @@ async function executeDelegation(delegationId, agentConfig, taskPromptContent, t
             state.status = 'running';
             state.updatedAt = Date.now();
             activeDelegations.set(delegationId, state);
+            await ForgeLifecycle.advance(state.forgeTracking, 'running');
+            assertDelegationNotCancelled(delegationId);
 
             if (DEBUG_MODE) console.error(`[AgentAssistant Delegation] Round ${state.currentRound + 1}/${DELEGATION_MAX_ROUNDS} for ${delegationId}`);
 
@@ -1167,6 +1182,7 @@ async function executeDelegation(delegationId, agentConfig, taskPromptContent, t
             if (actualDelayMs > 0) {
                 state.status = 'waiting';
                 activeDelegations.set(delegationId, state);
+                await ForgeLifecycle.advance(state.forgeTracking, 'waiting');
                 if (DEBUG_MODE) {
                     console.error(`[AgentAssistant Delegation] Next heartbeat in ${Math.round(actualDelayMs / 1000)}s (${flowlock.hasExplicitHeartbeat ? 'explicit' : 'default'}).`);
                 }
@@ -1191,7 +1207,8 @@ async function executeDelegation(delegationId, agentConfig, taskPromptContent, t
             completionStatus = 'Cancelled';
             finalReport = `委托任务已取消。原因: ${err.message}`;
         } else {
-            throw err;
+            completionStatus = 'Failed';
+            finalReport = `任务执行过程中发生异常: ${err.message}`;
         }
     } finally {
         activeSessionLocks.delete(lockKey);
@@ -1208,6 +1225,7 @@ async function executeDelegation(delegationId, agentConfig, taskPromptContent, t
             finalState.finalReportPreview = truncateText(secureReport);
             finalState.endTime = Date.now();
             finalState.updatedAt = Date.now();
+            await ForgeLifecycle.advance(finalState.forgeTracking, finalState.status).catch(() => {});
         }
 
         // 给成功完成任务的 Agent 发放积分奖励
