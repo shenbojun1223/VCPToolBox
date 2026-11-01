@@ -21,7 +21,7 @@ const FLOWLOCK_PATTERNS = {
     stop: /\[\[Flowlock::Stop\]\]/i,
     start: /\[\[Flowlock::Start\]\]/i,
     heartbeat: /\[\[Flowlock::NextHeartbeat::(\d+)\]\]/ig,
-    nextPrompt: /\[\[Flowlock::NextPrompt\]\]([\s\S]*?)\[\[\/Flowlock::NextPrompt\]\]/ig,
+
     any: /\[\[\/?Flowlock::/i,
     legacyComplete: /\[\[TaskComplete(?:\s*\]\]|\s[\s\S]*?\]\])/i,
     legacyFail: /\[\[TaskFailed(?:\s*\]\]|\s[\s\S]*?\]\])/i,
@@ -32,7 +32,11 @@ function findMarkerIndex(source, marker, fromIndex, caseInsensitive) {
     if (!caseInsensitive) {
         return source.indexOf(marker, fromIndex);
     }
-    return source.toLowerCase().indexOf(marker.toLowerCase(), fromIndex);
+    // Lowercasing the entire source can change UTF-16 offsets (e.g. U+0130).
+    const pattern = new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig');
+    pattern.lastIndex = fromIndex;
+    const match = pattern.exec(source);
+    return match ? match.index : -1;
 }
 
 function findNextProtectedRegion(source, fromIndex) {
@@ -109,19 +113,55 @@ function getLastPositiveIntegerMatch(text, pattern) {
     return value;
 }
 
-function getLastPromptMatch(text) {
-    FLOWLOCK_PATTERNS.nextPrompt.lastIndex = 0;
+// Inspect boundaries on tool/result-masked text, but retain original offsets.
+// Nested prompts belong to the outer payload; a truncated prompt protects to EOF.
+function findNextPromptRegions(protocolSource) {
+    const boundary = /\[\[(\/?)Flowlock::NextPrompt\]\]/ig;
+    const regions = [];
+    let depth = 0;
+    let startIndex = 0;
+    let bodyStart = 0;
     let match;
-    let prompt = null;
 
-    while ((match = FLOWLOCK_PATTERNS.nextPrompt.exec(text)) !== null) {
-        const candidate = String(match[1] || '').trim();
-        if (candidate) {
-            prompt = candidate;
+    while ((match = boundary.exec(protocolSource)) !== null) {
+        if (!match[1]) {
+            if (depth++ === 0) {
+                startIndex = match.index;
+                bodyStart = boundary.lastIndex;
+            }
+        } else if (depth > 0 && --depth === 0) {
+            regions.push({
+                startIndex, bodyStart, bodyEnd: match.index,
+                endIndex: boundary.lastIndex, closed: true
+            });
         }
     }
 
-    FLOWLOCK_PATTERNS.nextPrompt.lastIndex = 0;
+    if (depth > 0) {
+        regions.push({ startIndex, endIndex: protocolSource.length, closed: false });
+    }
+    return regions;
+}
+
+function mapNextPromptRegions(source, regions, transformOutside, transformPrompt) {
+    const chunks = [];
+    let cursor = 0;
+    for (const region of regions) {
+        chunks.push(transformOutside(source.slice(cursor, region.startIndex)));
+        chunks.push(transformPrompt(source.slice(region.startIndex, region.endIndex)));
+        cursor = region.endIndex;
+    }
+    chunks.push(transformOutside(source.slice(cursor)));
+    return chunks.join('');
+}
+
+function getLastPromptMatch(source, regions) {
+    let prompt = null;
+    for (const region of regions) {
+        if (!region.closed) continue;
+        const candidate = source.slice(region.bodyStart, region.bodyEnd).trim();
+        if (candidate) prompt = candidate;
+    }
     return prompt;
 }
 
@@ -129,26 +169,43 @@ function stripDirectivesFromUnprotectedChunk(chunk) {
     return chunk
         .replace(/\[\[Flowlock::(?:Complete|Fail|Stop|Start)\]\]/ig, '')
         .replace(/\[\[Flowlock::NextHeartbeat::\d+\]\]/ig, '')
-        .replace(/\[\[Flowlock::NextPrompt\]\][\s\S]*?\[\[\/Flowlock::NextPrompt\]\]/ig, '')
+
         .replace(/\[\[TaskComplete(?:\s*\]\]|\s[\s\S]*?\]\])/ig, '')
         .replace(/\[\[TaskFailed(?:\s*\]\]|\s[\s\S]*?\]\])/ig, '')
         .replace(/\[\[NextHeartbeat::\d+\]\]/ig, '');
 }
 
-function stripProtocolDirectives(text) {
-    return mapUnprotectedRegions(
-        text,
-        stripDirectivesFromUnprotectedChunk,
-        chunk => chunk
+function buildProtocolReport(source, promptRegions) {
+    // Strip each outside slice separately: deleting a payload must not join
+    // two literal fragments into a new executable/strippable directive.
+    return mapNextPromptRegions(
+        source,
+        promptRegions,
+        chunk => mapUnprotectedRegions(
+            chunk, stripDirectivesFromUnprotectedChunk, protectedChunk => protectedChunk
+        ),
+        () => ''
     )
         .replace(/\n{3,}/g, '\n\n')
         .trim();
 }
 
+function stripProtocolDirectives(text) {
+    const source = String(text || '');
+    const regions = findNextPromptRegions(maskProtectedProtocolRegions(source));
+    return buildProtocolReport(source, regions);
+}
+
 function parseFlowlockDirectives(text) {
     const source = String(text || '');
-    const protocolSource = maskProtectedProtocolRegions(source);
-    const isFlowlockProtocol = FLOWLOCK_PATTERNS.any.test(protocolSource);
+    const protectedSource = maskProtectedProtocolRegions(source);
+    const promptRegions = findNextPromptRegions(protectedSource);
+    const protocolSource = mapNextPromptRegions(
+        protectedSource, promptRegions,
+        chunk => chunk,
+        chunk => chunk.replace(/[^\r\n]/g, ' ')
+    );
+    const isFlowlockProtocol = promptRegions.length > 0 || FLOWLOCK_PATTERNS.any.test(protocolSource);
     const complete = FLOWLOCK_PATTERNS.complete.test(protocolSource) || FLOWLOCK_PATTERNS.legacyComplete.test(protocolSource);
     const fail = FLOWLOCK_PATTERNS.fail.test(protocolSource) || FLOWLOCK_PATTERNS.legacyFail.test(protocolSource);
     const stop = FLOWLOCK_PATTERNS.stop.test(protocolSource);
@@ -177,8 +234,8 @@ function parseFlowlockDirectives(text) {
         fail,
         nextHeartbeatSeconds: flowlockDelay ?? legacyDelay ?? DEFAULT_HEARTBEAT_DELAY_SECONDS,
         hasExplicitHeartbeat: flowlockDelay !== null || legacyDelay !== null,
-        nextPrompt: getLastPromptMatch(protocolSource),
-        report: stripProtocolDirectives(source)
+        nextPrompt: getLastPromptMatch(source, promptRegions),
+        report: buildProtocolReport(source, promptRegions)
     };
 }
 
