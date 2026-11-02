@@ -216,3 +216,60 @@ test('batch guard: real ESCAPE arguments preserve batch literals byte-for-byte',
   assert.equal(calls.length, 1);
   assert.equal(calls[0].args.content, payload);
 });
+
+const futureOpen = '[[Flowlock::NextPrompt]]';
+const futureClose = '[[/Flowlock::NextPrompt]]';
+const future = body => futureOpen + body + futureClose;
+
+test('NextPrompt execution projection is identical across every split and single-code-unit deltas', () => {
+  const payload = 'İ🌿\r\n' + request('Future', futureClose + '\n' + E) +
+    '\r\n[[Flowlock::Complete]]\r\n';
+  const text = request('Before', futureOpen) + '\r\n' +
+    future(payload) + '\r\n' + request('After');
+  const expected = inspectModelOutput(text);
+  assert.equal(expected.halt, null);
+  assert.equal(expected.content, text);
+  assert.deepEqual(Parser.parse(expected.executionText).map(c => c.name), ['Before', 'After']);
+  for (let cut = 0; cut <= text.length; cut++) {
+    const guard = new ModelOutputGuard();
+    const visible = guard.push(text.slice(0, cut)) + guard.push(text.slice(cut)) + guard.finish();
+    assert.equal(visible, text, `cut=${cut}`);
+    assert.equal(guard.halt, null);
+    assert.equal(guard.executionText(), expected.executionText, `cut=${cut}`);
+  }
+  const guard = new ModelOutputGuard();
+  let visible = '';
+  for (let i = 0; i < text.length; i++) visible += guard.push(text[i]);
+  visible += guard.finish();
+  assert.equal(visible, text);
+  assert.equal(guard.executionText(), expected.executionText);
+});
+
+test('future-only execution projection has no incomplete-tool fragment', () => {
+  for (const text of [
+    future(request('Future')),
+    futureOpen + request('Future'),
+    future('格式片段\n' + S + '\ncommand:「始」Read「末」')
+  ]) {
+    const result = inspectModelOutput(text);
+    assert.equal(result.content, text);
+    assert.equal(result.halt, null);
+    assert.deepEqual(Parser.parse(result.executionText), []);
+    assert.ok(!result.executionText.includes(S));
+  }
+});
+
+test('future masking does not disable reserved protocol checks across any split', () => {
+  for (const invalid of [receipt, dsml, US]) {
+    const text = request('Before') + '\n' + future('未来说明\n' + invalid + '\n' + request('Never'));
+    const expected = inspectModelOutput(text);
+    assert.equal(expected.halt?.code, STATUS);
+    for (let cut = 0; cut <= text.length; cut++) {
+      const guard = new ModelOutputGuard();
+      const visible = guard.push(text.slice(0, cut)) + guard.push(text.slice(cut)) + guard.finish();
+      assert.equal(visible, expected.content, `cut=${cut}`);
+      assert.deepEqual(guard.halt, expected.halt);
+      assert.equal(guard.executionText(), '');
+    }
+  }
+});

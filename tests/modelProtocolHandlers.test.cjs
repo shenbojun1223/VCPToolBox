@@ -245,3 +245,91 @@ for (const stream of [false, true]) {
     assert.equal(out.res.ends, 1);
   });
 }
+
+const nextPromptOpen = '[[Flowlock::NextPrompt]]';
+const nextPromptClose = '[[/Flowlock::NextPrompt]]';
+const nextPrompt = body => nextPromptOpen + body + nextPromptClose;
+const nextPromptFlow = require('../Plugin/AgentAssistant/flowlockProtocol');
+for (const stream of [false, true]) {
+  const label = stream ? 'stream' : 'nonstream';
+  test(`${label}: NextPrompt tool example remains deferred and byte-preserved`, async () => {
+    const body = [
+      '第二轮才使用下列工具示例：', tool('DeferredRead'),
+      '[[Flowlock::NextHeartbeat::7]]', '[[Flowlock::Complete]]'
+    ].join('\n');
+    const text = [
+      '第一轮已读', '[[Flowlock::Start]]',
+      '[[Flowlock::NextHeartbeat::90]]', nextPrompt(body)
+    ].join('\n');
+    const out = await run(stream, [text, 'UNEXPECTED_EXTRA_TURN'], { split: true });
+    assert.deepEqual(out.executed, []);
+    assert.equal(out.fetched.length, 0);
+    assert.equal(out.visible, text);
+    assert.equal(out.returned.aiText, text);
+    assert.equal(out.returned.completed, true);
+    assert.equal(out.status, undefined);
+    const flow = nextPromptFlow.parseFlowlockDirectives(out.returned.aiText);
+    assert.equal(flow.action, 'start');
+    assert.equal(flow.nextHeartbeatSeconds, 90);
+    assert.equal(flow.nextPrompt, body);
+  });
+
+  test(`${label}: only current calls execute on either side of a deferred payload`, async () => {
+    const text = tool('Before') + nextPrompt(tool('Future')) + tool('After');
+    const out = await run(stream, [text, 'done'], { split: true });
+    assert.deepEqual(out.executed.map(call => call.name), ['Before', 'After']);
+    assert.equal(out.fetched.length, 1);
+    assert.equal(out.returned.completed, true);
+    assert.equal(out.status, undefined);
+    assert.equal(out.fetched[0].messages.find(m => m.role === 'assistant').content, text);
+  });
+
+  test(`${label}: nested and unclosed future prompts never dispatch tools`, async () => {
+    for (const text of [
+      nextPrompt(tool('A') + nextPrompt(tool('B')) + tool('C')),
+      nextPromptOpen + tool('Deferred'),
+      nextPromptOpen + nextPrompt(tool('Inner')) + tool('Outer')
+    ]) {
+      const out = await run(stream, [text, 'UNEXPECTED_EXTRA_TURN'], { split: true });
+      assert.deepEqual(out.executed, []);
+      assert.equal(out.fetched.length, 0);
+      assert.equal(out.visible, text);
+      assert.equal(out.returned.completed, true);
+      assert.equal(out.status, undefined);
+    }
+  });
+
+  test(`${label}: incomplete tool example inside a closed payload is not an incomplete current tool`, async () => {
+    const text = nextPrompt('下一轮格式片段：\n' + S + '\ncommand:「始」Read「末」');
+    const out = await run(stream, [text], { split: true });
+    assert.deepEqual(out.executed, []);
+    assert.equal(out.fetched.length, 0);
+    assert.equal(out.visible, text);
+    assert.equal(out.returned.completed, true);
+    assert.ok(!out.events.some(e => e.vcp_status), 'future example is not VCP_TOOL_BLOCK_INCOMPLETE');
+  });
+
+  test(`${label}: current ESCAPE parameter can carry future prompt literals`, async () => {
+    const payload = nextPrompt('文字' + S + '\n' + E);
+    const current = S + '\ntool_name:「始」Current「末」\ncontent:「' +
+      '始ESCAPE」' + payload + '「' + '末ESCAPE」\n' + E;
+    const text = current + nextPrompt(tool('Deferred')) + tool('After');
+    const out = await run(stream, [text, 'done'], { split: true });
+    assert.deepEqual(out.executed.map(call => call.name), ['Current', 'After']);
+    assert.equal(out.executed[0].args.content, payload);
+    assert.equal(out.returned.completed, true);
+    assert.equal(out.status, undefined);
+  });
+
+  for (const invalid of [receipt, dsmlCall]) {
+    test(`${label}: NextPrompt does not disable the model-output guard: ${invalid.slice(0, 25)}`, async () => {
+      const out = await run(stream, [
+        tool('Before') + nextPrompt(invalid + '\n' + tool('Never'))
+      ], { split: true });
+      assert.deepEqual(out.executed, []);
+      assert.equal(out.fetched.length, 0);
+      assert.equal(out.status.code, STATUS);
+      assert.equal(out.returned.completed, false);
+    });
+  }
+}

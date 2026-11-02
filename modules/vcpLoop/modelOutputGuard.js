@@ -155,7 +155,9 @@ class ModelOutputGuard {
   }
 
   executionText() {
-    return this.halt ? '' : this.executionParts.join('');
+    // Guard the full fresh output first. Only the execution projection hides
+    // future payloads; content and protocol-halt detection remain unchanged.
+    return this.halt ? '' : Parser.maskNextPromptRegions(this.executionParts.join(''));
   }
 }
 

@@ -67,6 +67,64 @@ class ToolCallParser {
   }
 
   /**
+   * NextPrompt is future data, never a source of current tool calls.
+   * Preserve offsets/newlines and the original response. Tool parameters and
+   * trusted receipt literals cannot open or close the surrounding prompt scope.
+   */
+  static maskNextPromptRegions(content) {
+    if (typeof content !== 'string') return '';
+    const boundary = /\[\[(\/?)Flowlock::NextPrompt\]\]/ig;
+    let match = boundary.exec(content);
+    if (!match) return content;
+
+    const receiptStart = '[[VCP调用结果信息汇总';
+    const receiptEnd = 'VCP调用结果结束]]';
+    let nextTool = toolMarkerFuzzyMatcher.findBlockStartMarker(content, 0);
+    let nextReceipt = content.indexOf(receiptStart);
+    let depth = 0, promptStart = 0, copiedTo = 0;
+    const chunks = [];
+    const maskThrough = end => {
+      chunks.push(content.slice(copiedTo, promptStart));
+      chunks.push(content.slice(promptStart, end).replace(/[^\r\n]/g, ' '));
+      copiedTo = end;
+    };
+
+    while (match) {
+      // Cache each lookahead: a missing tool/receipt must not cause repeated
+      // full-suffix scans for every nested prompt marker.
+      const toolIndex = nextTool ? nextTool.index : content.length;
+      const receiptIndex = nextReceipt < 0 ? content.length : nextReceipt;
+      if (Math.min(toolIndex, receiptIndex) <= match.index) {
+        let protectedEnd;
+        if (toolIndex <= receiptIndex) {
+          const block = this.extractNextToolBlock(content, toolIndex);
+          protectedEnd = block ? block.nextOffset : content.length;
+        } else {
+          const end = content.indexOf(receiptEnd, receiptIndex + receiptStart.length);
+          protectedEnd = end < 0 ? content.length : end + receiptEnd.length;
+        }
+        // Unclosed tools/receipts protect to EOF, including apparent prompt
+        // closers in their data; fail closed rather than release future calls.
+        if (nextTool && nextTool.index < protectedEnd) {
+          nextTool = toolMarkerFuzzyMatcher.findBlockStartMarker(content, protectedEnd);
+        }
+        if (nextReceipt >= 0 && nextReceipt < protectedEnd) {
+          nextReceipt = content.indexOf(receiptStart, protectedEnd);
+        }
+        boundary.lastIndex = protectedEnd;
+      } else if (!match[1]) {
+        if (depth++ === 0) promptStart = match.index;
+      } else if (depth > 0 && --depth === 0) {
+        maskThrough(boundary.lastIndex);
+      }
+      match = boundary.exec(content);
+    }
+    if (depth > 0) maskThrough(content.length);
+    if (!chunks.length) return content;
+    chunks.push(content.slice(copiedTo));
+    return chunks.join('');
+  }
+  /**
    * 解析AI响应中的所有工具调用
    * @param {string} content - AI响应内容
    * @returns {Array<{name: string, args: object, archery: boolean, archeryNoReply?: boolean}>}
@@ -74,7 +132,7 @@ class ToolCallParser {
   static parse(content) {
     if (!content || typeof content !== 'string') return [];
 
-    const contentWithoutThink = this.stripReasoningBlocks(content);
+    const contentWithoutThink = this.maskNextPromptRegions(this.stripReasoningBlocks(content));
     const toolCalls = [];
     let searchOffset = 0;
 
