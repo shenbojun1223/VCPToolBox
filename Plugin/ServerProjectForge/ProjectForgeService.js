@@ -657,7 +657,7 @@ async function searchProjects(args) {
 async function getProject(args) {
     const { project, rootInfo } = projectOf(args);
     const s = store();
-    const todos = s.listTodos(project.id);
+    const todos = require('./delegationReview').projectTodos(s, s.listTodos(project.id));
     const stats = s.projectStats(project.id);
     const limit = posInt(A.pick(args, 'timeline', 'limit'), 8);
     const parts = [
@@ -676,6 +676,47 @@ async function getProject(args) {
     return textResult(parts.join('\n'), { command: 'GetProject', project, todos, stats });
 }
 
+function reviewTarget(args) {
+    const integer = name => {
+        const raw = A.pick(args, name);
+        if (!((typeof raw === 'number' && Number.isSafeInteger(raw))
+            || (typeof raw === 'string' && /^\d+$/.test(raw)))) throw new Error('REVIEW_ARGUMENT');
+        const value = Number(raw);
+        if (!Number.isSafeInteger(value) || value < 0) throw new Error('REVIEW_ARGUMENT');
+        return value;
+    };
+    return { projectId: A.str(args, 'projectId'), todoSeq: integer('todoSeq'),
+        delegationId: A.str(args, 'delegationId'), integer };
+}
+
+async function recordDelegationReview(args) {
+    const { project } = projectOf(args, { write: true });
+    const target = reviewTarget(args);
+    const reviewedBy = maidOf(args);
+    if (!reviewedBy) throw new Error('REVIEW_CALLER_REQUIRED');
+    return withLock(project.id, () => {
+        const result = require('./delegationReview').record(store(), {
+            projectId: project.id, todoSeq: target.todoSeq, delegationId: target.delegationId,
+            expectedSequence: target.integer('expectedSequence'),
+            expectedRevision: target.integer('expectedRevision'),
+            requestId: A.str(args, 'requestId'), verdict: A.str(args, 'verdict'),
+            reviewedBy, scope: A.str(args, 'scope'), reason: A.str(args, 'reason'),
+            evidence: A.json(A.pick(args, 'evidence'), 'evidence'),
+        });
+        return textResult(`## 独立核验已${result.changed ? '登记' : '存在'} · ${project.id} #${target.todoSeq}\n`
+            + `- 结论：${result.review.verdict} · 核验人：${result.review.reviewedBy} · 修订：${result.review.revision}\n`
+            + '- 不修改宿主执行态、Todo 业务状态或整个工程验收。证据引用与摘要不代替内容核验。',
+        { command: 'RecordDelegationReview', projectId: project.id, ...result });
+    });
+}
+
+async function getDelegationReviews(args) {
+    const { project } = projectOf(args);
+    const target = reviewTarget(args);
+    const reviews = require('./delegationReview').history(store(), target);
+    return textResult(`## 独立核验历史 · ${project.id} #${target.todoSeq}\n${JSON.stringify(reviews, null, 2)}`,
+        { command: 'GetDelegationReviews', projectId: project.id, reviews });
+}
 async function updateTodos(args) {
     const { project } = projectOf(args);
     const s = store();
@@ -2164,6 +2205,8 @@ const COMMANDS = {
     listprojects: listProjects,
     searchprojects: searchProjects,
     getproject: getProject,
+    recorddelegationreview: recordDelegationReview,
+    getdelegationreviews: getDelegationReviews,
     updatetodos: updateTodos,
     submitreport: submitReport,
     deleteprojects: deleteProjects,
@@ -2185,10 +2228,10 @@ const COMMANDS = {
     trace: traceCmd,
 };
 
-const COMMAND_NAMES = 'BeginCapture、GetCapture、FinishCapture、ListWorkspaces、CreateProject、ListProjects、SearchProjects、GetProject、UpdateTodos、SubmitReport、DeleteProjects、RestoreProjects、PurgeProjects、ReadCode、EditCode、ResolveEdit、CreateFile、RemoveFile、MoveFile、MoveCode、CopyCode、Rollback、SearchHistory、GetNodeDiff、Outline、FindSymbol、Trace';
+const COMMAND_NAMES = 'BeginCapture、GetCapture、FinishCapture、ListWorkspaces、CreateProject、ListProjects、SearchProjects、GetProject、RecordDelegationReview、GetDelegationReviews、UpdateTodos、SubmitReport、DeleteProjects、RestoreProjects、PurgeProjects、ReadCode、EditCode、ResolveEdit、CreateFile、RemoveFile、MoveFile、MoveCode、CopyCode、Rollback、SearchHistory、GetNodeDiff、Outline、FindSymbol、Trace';
 
 const MUTATING_COMMANDS = new Set([
-    'begincapture', 'finishcapture',
+    'begincapture', 'finishcapture', 'recorddelegationreview',
     'createproject', 'updatetodos', 'submitreport', 'deleteprojects',
     'restoreprojects', 'purgeprojects', 'editcode', 'resolveedit',
     'createfile', 'removefile', 'movefile', 'movecode', 'copycode', 'rollback',
@@ -2210,7 +2253,7 @@ async function processToolCall(rawArgs = {}, _executionContext = {}) {
     const result = MUTATING_COMMANDS.has(command)
         ? await Writer.run(store(), ids, () => handler(args))
         : await handler(args);
-    if (MUTATING_COMMANDS.has(command)) {
+    if (MUTATING_COMMANDS.has(command) && (command !== 'recorddelegationreview' || result?.details?.changed)) {
         emitProjectChanged({
             action: command,
             projectId: result?.details?.projectId || args.projectid || null,
@@ -2335,7 +2378,7 @@ const gui = {
         const project = guiProjectOf(projectId);
         return {
             project: { ...guiProjectSummary(project), report: project.report || null },
-            todos: s.listTodos(project.id),
+            todos: require('./delegationReview').projectTodos(s, s.listTodos(project.id)),
             contributors: s.contributors(project.id),
             files: s.changedFiles(project.id),
             timeline: s.timeline(project.id, { limit: timelineLimit }).map(r => ({

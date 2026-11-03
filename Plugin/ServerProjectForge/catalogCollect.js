@@ -58,8 +58,9 @@ function collectCatalog(store, {
                 .get(project.id).n;
             totalTodos += count;
             check(totalTodos <= 50000, 'LIMIT_EXCEEDED');
-            const todos = db.prepare(`SELECT project_id,seq,title,status,note,updated_by,updated_at
-                FROM todos WHERE project_id=? ORDER BY seq,id`).all(project.id);
+            const todos = require('./delegationReview').projectTodos(store,
+                db.prepare(`SELECT id,project_id,seq,title,status,note,updated_by,updated_at
+                    FROM todos WHERE project_id=? ORDER BY seq,id`).all(project.id));
             records.push({
                 identity: { sourceId, localProjectId: project.id },
                 project, todos,

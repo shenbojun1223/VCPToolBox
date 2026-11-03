@@ -69,6 +69,14 @@
   "capabilities": {
     "invocationCommands": [
       {
+        "command": "RecordDelegationReview",
+        "description": "独立核验已终结的显式AA委托，不改原Todo/宿主状态块及业务完成度，不接受整个工程。必需projectId、todoSeq、delegationId、expectedSequence（当前宿主序号）、expectedRevision（首次0）、requestId（幂等键）、verdict=passed或rejected、scope（<=180字符）、reason（<=240字符）、evidence={ref:证据引用<=220字符,sha256:64位小写摘要}。核验人仅取中央maid署名，拒绝同执行角色本体自验；passed仅允许completed。旧修订保留，请求重放须内容相同，冲突先GetDelegationReviews及GetProject再核对，不自动重试。只写本工程独立核验元数据，复用写权限/租约；摘要不构成签名、证据文件存在或内容正确的证明，调用者须先独立实读核验。执行日志、模型Succeed或Todo完成不能单独作为通过依据。"
+      },
+      {
+        "command": "GetDelegationReviews",
+        "description": "只读查询指定AA委托的独立核验修订历史。必需projectId、todoSeq、delegationId，返回审核人/时间/范围/证据及通过或退回结论，不推进任何状态。"
+      },
+      {
         "command": "BeginCapture",
         "description": "外部施工前保存显式文件列表的完整快照，不改磁盘。projectId、requestId、paths、reason 必需；maid 记录操作者，todo 可选。paths 支持 JSON 数组、换行或逗号分隔，包含预期新建文件。重复 requestId 拒绝，可用 GetCapture 找回。拒绝链接、越界、超限、未归档漂移及同工程重叠未完成收录。开工与收工时外部写者必须静止；范围声明不是权限隔离。"
       },
