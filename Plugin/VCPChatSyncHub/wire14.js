@@ -1182,6 +1182,17 @@ async function pushMessages14(frame, appDataPath, { ownerDto = true } = {}) {
       db: getDb(),
       appDataPath,
     });
+    // 坏附件已在投影阶段降级丢弃（消息正文保留）。Mobile 会拒绝未知响应字段，
+    // 因此 warning 只落服务端日志，不写入 push 响应体。
+    if (projected.warningCount > 0) {
+      getLogger().logOperation(
+        "messages",
+        "legacy_attachment_warning",
+        frame.topicId,
+        "warn",
+        `count=${projected.warningCount} samples=${projected.warningSamples.join(" | ")}`,
+      );
+    }
     const messageMap = new Map(
       history
         .filter((message) => !persistedTombstones.has(message?.id))

@@ -175,7 +175,32 @@ function canonicalizeAttachment(value, messageId, index, warnings) {
   return attachment;
 }
 
-function canonicalizeMessage(value, topicId, warnings = new BoundedWarnings()) {
+// VCPChat 自身把群聊与多模态消息的 content 合法地表达为 { text } 对象或
+// [{ type: "text", text }] 数组（见 Groupmodules/groupchat.js 的 contentToText）。
+// 同步层过去对此硬失败，会让整个话题帧因单条消息永久无法入库；改为按应用既有
+// contentToText 语义展平为字符串。与 topicId 归一化同理，展平单独计数，不混入
+// 附件 warnings。无法确定语义的形态仍然拒绝，不做猜测。
+function flattenMessageContent(value) {
+  if (isPlainObject(value)) {
+    return typeof value.text === "string" ? value.text : null;
+  }
+  if (Array.isArray(value)) {
+    const parts = [];
+    for (const part of value) {
+      if (!isPlainObject(part) || typeof part.text !== "string") return null;
+      parts.push(part.text);
+    }
+    return parts.join("\n");
+  }
+  return null;
+}
+
+function canonicalizeMessage(
+  value,
+  topicId,
+  warnings = new BoundedWarnings(),
+  contentRewrites = null,
+) {
   if (!isPlainObject(value)) {
     throw new SyncProtocolError(`Topic ${topicId} contains a non-object message`);
   }
@@ -214,9 +239,21 @@ function canonicalizeMessage(value, topicId, warnings = new BoundedWarnings()) {
     message.name = value.name;
   }
   if (value.content !== undefined && value.content !== null && typeof value.content !== "string") {
-    throw new SyncProtocolError(`Message ${id} content must be a string`);
+    const flattened = flattenMessageContent(value.content);
+    if (flattened === null) {
+      throw new SyncProtocolError(`Message ${id} content must be a string`);
+    }
+    if (contentRewrites) {
+      contentRewrites.push(
+        `message=${id}: non-string content flattened (${
+          Array.isArray(value.content) ? "array" : "object"
+        })`,
+      );
+    }
+    message.content = flattened;
+  } else {
+    message.content = typeof value.content === "string" ? value.content : "";
   }
-  message.content = typeof value.content === "string" ? value.content : "";
   message.timestamp = normalizeNonNegativeInteger(
     value.timestamp,
     `Message ${id} timestamp`,
@@ -315,6 +352,8 @@ function canonicalizeTopicFrame(value, { includeContentHash = true } = {}) {
       frame: { topicId, ...ownerIdentity, messages: [], _error: error },
       warningCount: 0,
       warningSamples: [],
+      contentRewriteCount: 0,
+      contentRewriteSamples: [],
       contentHashes: [],
     };
   }
@@ -344,8 +383,10 @@ function canonicalizeTopicFrame(value, { includeContentHash = true } = {}) {
     warnings.samples = upstreamSamples.slice(0, warnings.limit);
   }
   const seen = new Set();
+  // Mobile 会拒绝未知响应字段，展平计数只向调用方返回、不写入 frame。
+  const contentRewrites = new BoundedWarnings();
   const messages = value.messages.map((rawMessage) => {
-    const message = canonicalizeMessage(rawMessage, topicId, warnings);
+    const message = canonicalizeMessage(rawMessage, topicId, warnings, contentRewrites);
     if (seen.has(message.id)) {
       throw new SyncProtocolError(
         `Topic ${topicId} contains duplicate message ${message.id}`,
@@ -372,6 +413,8 @@ function canonicalizeTopicFrame(value, { includeContentHash = true } = {}) {
     },
     warningCount: warnings.count,
     warningSamples: [...warnings.samples],
+    contentRewriteCount: contentRewrites.count,
+    contentRewriteSamples: [...contentRewrites.samples],
     contentHashes: messages.map(messageContentHash),
   };
 }
@@ -393,6 +436,7 @@ module.exports = {
   canonicalizeHistory,
   canonicalizeMessage,
   canonicalizeTopicFrame,
+  flattenMessageContent,
   messageContentHash,
   normalizeNonNegativeInteger,
 };

@@ -411,6 +411,17 @@ async function doUploadSingleTopic(safeTopicId, messages, appDataPath, row) {
       appDataPath,
     });
 
+    // 坏附件已在投影阶段降级丢弃（消息正文保留）；此处留痕以免降级静默发生。
+    if (projected.warningCount > 0) {
+      getLogger().logOperation(
+        "messages",
+        "legacy_attachment_warning",
+        safeTopicId,
+        "warn",
+        `count=${projected.warningCount} samples=${projected.warningSamples.join(" | ")}`,
+      );
+    }
+
     for (const desktopMessage of projected.messages) {
       msgMap.set(desktopMessage.id, desktopMessage);
     }

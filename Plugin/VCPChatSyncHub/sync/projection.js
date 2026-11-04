@@ -46,15 +46,17 @@ async function projectMobileMessage({
   ownerType,
   db,
   appDataPath,
+  warnings: sharedWarnings = null,
 }) {
-  const warnings = new BoundedWarnings();
+  // 坏附件采用与 Pull 路径（canonicalizeTopicFrame）一致的降级语义：
+  // canonicalizeAttachment 已丢弃该附件并记录 warning，此处不得因此拒收整条消息，
+  // 否则手机端每轮重试都会被同一条坏附件连坐，导致消息正文永久无法入库。
+  const warnings = sharedWarnings instanceof BoundedWarnings
+    ? sharedWarnings
+    : new BoundedWarnings();
+  const warningCountBefore = warnings.count;
   const canonical = canonicalizeMessage(rawMessage, topicId, warnings);
-  if (warnings.count > 0) {
-    throw new SyncProtocolError(
-      `Mobile message ${canonical.id} contains ${warnings.count} invalid attachment(s)`,
-      "MOBILE_ATTACHMENT_INVALID",
-    );
-  }
+  const warningCount = warnings.count - warningCountBefore;
 
   const isGroup = ownerType === "group";
   const isUser = canonical.role === "user";
@@ -115,6 +117,8 @@ async function projectMobileMessage({
   return {
     message: desktop,
     neededAttachmentHashes: [...neededAttachmentHashes],
+    warningCount,
+    warningSamples: [...warnings.samples],
   };
 }
 
@@ -146,6 +150,7 @@ async function projectMobileTopic({
   const projected = [];
   const needed = new Set();
   const seen = new Set();
+  const warnings = new BoundedWarnings();
   for (const rawMessage of messages) {
     const result = await projectMobileMessage({
       rawMessage,
@@ -154,6 +159,7 @@ async function projectMobileTopic({
       ownerType,
       db,
       appDataPath,
+      warnings,
     });
     if (seen.has(result.message.id)) {
       throw new SyncProtocolError(
@@ -167,6 +173,8 @@ async function projectMobileTopic({
   return {
     messages: projected,
     neededAttachmentHashes: [...needed].sort(),
+    warningCount: warnings.count,
+    warningSamples: [...warnings.samples],
   };
 }
 
