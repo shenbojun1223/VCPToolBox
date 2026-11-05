@@ -56,5 +56,4 @@ vcpAPI.post() 参数说明：
 - 未传 model 时使用 AppData/settings.json 的 desktopWidgetModel（可选字段，手动添加，设置面板保存时会保留）。两者都没有时服务器报“未指定模型名称”。
 - 只支持非流式，messages 以第一个参数为准。
 - 请求经 VCP 服务器转发并注入系统内容，每次约 2300 输入 token 起步。模型类挂件以点击触发为主，定时器里的调用照常计费。
-
-Tag: VCPdesktop Widget沙箱API, DESKTOP_PUSH, Shadow DOM代理document, vcpAPI后端访问, musicAPI播放器控制, Agent灵魂占位符
+Tag: VCPdesktop Widget沙箱API, DESKTOP_PUSH, Shadow DOM代理document, vcpAPI后端访问, musicAPI播放器控制, Agent灵魂占位符, 挂件生命周期与私有文件
