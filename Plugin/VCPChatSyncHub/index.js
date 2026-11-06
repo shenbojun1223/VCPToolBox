@@ -88,6 +88,7 @@ async function initializeRoutes(app, pluginConfig, projectBasePath) {
   await Promise.all([
     fs.mkdir(path.join(appDataPath, "Agents"), { recursive: true }),
     fs.mkdir(path.join(appDataPath, "AgentGroups"), { recursive: true }),
+    fs.mkdir(path.join(appDataPath, "LoomApps"), { recursive: true }),
     fs.mkdir(path.join(appDataPath, "UserData", "attachments"), { recursive: true }),
   ]);
 
@@ -578,6 +579,8 @@ const SYSTEM_FOLDERS = [
   "canvas",
   "DesktopData",
   "DesktopWidgets",
+  "LoomApps",
+  "LoomSkills",
   "generated_lists",
   "lyric",
   "MusicCoverCache",

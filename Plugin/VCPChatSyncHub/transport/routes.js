@@ -37,6 +37,11 @@ const {
   downloadDesktopConfigs,
   uploadDesktopConfigs,
 } = require("../sync/desktop-config");
+const {
+  compareDesktopLoomManifest,
+  downloadDesktopLoomApps,
+  uploadDesktopLoomApps,
+} = require("../sync/desktop-loom");
 const { registerWire14Routes } = require("../wire14");
 
 function entityStage(type) {
@@ -171,6 +176,40 @@ function registerRoutes(app, { syncToken, appDataPath, centralSync = null }) {
     } catch (error) {
       sendHttpError(res, 500, error, {
         code: "SYNC_DESKTOP_CONFIG_WRITE_FAILED",
+        stage: "owner_metadata",
+      });
+    }
+  });
+
+  // Desktop-only LoomApp sync (PC-to-PC only; VCPMobile does not have Loom).
+  router.post("/desktop/loom-manifest", express.json({ limit: "10mb" }), async (req, res) => {
+    try {
+      res.json(await compareDesktopLoomManifest(appDataPath, req.body || {}));
+    } catch (error) {
+      sendHttpError(res, 500, error, {
+        code: "SYNC_DESKTOP_LOOM_MANIFEST_FAILED",
+        stage: "owner_metadata",
+      });
+    }
+  });
+
+  router.post("/desktop/download-loom-apps", express.json({ limit: "10mb" }), async (req, res) => {
+    try {
+      res.json(await downloadDesktopLoomApps(appDataPath, req.body?.items));
+    } catch (error) {
+      sendHttpError(res, 500, error, {
+        code: "SYNC_DESKTOP_LOOM_READ_FAILED",
+        stage: "owner_metadata",
+      });
+    }
+  });
+
+  router.post("/desktop/upload-loom-apps", express.json({ limit: "50mb" }), async (req, res) => {
+    try {
+      res.json(await uploadDesktopLoomApps(appDataPath, req.body?.items));
+    } catch (error) {
+      sendHttpError(res, 500, error, {
+        code: "SYNC_DESKTOP_LOOM_WRITE_FAILED",
         stage: "owner_metadata",
       });
     }

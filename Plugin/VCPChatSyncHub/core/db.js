@@ -108,6 +108,17 @@ function initDb(dbPath) {
     )
   `);
 
+  // Desktop-only LoomApp index (PC-to-PC sync only; isolated from VCPMobile).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS desktop_loom_app_index (
+      id TEXT PRIMARY KEY,
+      dir_path TEXT NOT NULL,
+      hash TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      deleted_at INTEGER DEFAULT NULL
+    )
+  `);
+
   const logger = getLogger();
   logger.logInfo("reconcile", "数据库初始化完成。");
   return db;
@@ -376,6 +387,46 @@ function softDeleteDesktopConfigIndex(id, type, deletedAt = Date.now()) {
     .run({ deletedAt, id, type });
 }
 
+function getDesktopLoomAppIndex(id) {
+  if (!db) return null;
+  return db
+    .prepare("SELECT * FROM desktop_loom_app_index WHERE id = ?")
+    .get(id);
+}
+
+function getDesktopLoomApps() {
+  if (!db) return [];
+  return db.prepare("SELECT * FROM desktop_loom_app_index").all();
+}
+
+function upsertDesktopLoomAppIndex(id, dirPath, hash, updatedAt = Date.now()) {
+  if (!db) return;
+  db.prepare(`
+    INSERT INTO desktop_loom_app_index (id, dir_path, hash, updated_at, deleted_at)
+    VALUES (?, ?, ?, ?, NULL)
+    ON CONFLICT(id) DO UPDATE SET
+      dir_path = excluded.dir_path,
+      hash = excluded.hash,
+      updated_at = excluded.updated_at,
+      deleted_at = NULL
+  `).run(id, dirPath, hash, updatedAt);
+}
+
+function softDeleteDesktopLoomAppIndex(id, deletedAt = Date.now(), dirPath = "") {
+  if (!db) return;
+  return db
+    .prepare(
+      `INSERT INTO desktop_loom_app_index (id, dir_path, hash, updated_at, deleted_at)
+       VALUES (@id, @dirPath, '', @deletedAt, @deletedAt)
+       ON CONFLICT(id) DO UPDATE SET
+         deleted_at = CASE
+           WHEN desktop_loom_app_index.deleted_at IS NULL THEN @deletedAt
+           ELSE MAX(desktop_loom_app_index.deleted_at, @deletedAt)
+         END`,
+    )
+    .run({ deletedAt, dirPath: String(dirPath || ""), id });
+}
+
 /**
  * 软删除实体索引
  * @param {string} id - 实体 ID
@@ -477,14 +528,20 @@ function cleanupOldDeletedRecords() {
       `DELETE FROM desktop_config_index WHERE deleted_at IS NOT NULL AND deleted_at < ?`,
     )
     .run(thirtyDaysAgo);
+  const desktopLoomResult = db
+    .prepare(
+      `DELETE FROM desktop_loom_app_index WHERE deleted_at IS NOT NULL AND deleted_at < ?`,
+    )
+    .run(thirtyDaysAgo);
 
   if (
     entityResult.changes > 0 ||
     messageResult.changes > 0 ||
     avatarResult.changes > 0 ||
-    desktopConfigResult.changes > 0
+    desktopConfigResult.changes > 0 ||
+    desktopLoomResult.changes > 0
   ) {
-    logger.logOperation("cleanup", "purge", "batch", "success", `entity=${entityResult.changes} message=${messageResult.changes} avatar=${avatarResult.changes} desktopConfig=${desktopConfigResult.changes}`);
+    logger.logOperation("cleanup", "purge", "batch", "success", `entity=${entityResult.changes} message=${messageResult.changes} avatar=${avatarResult.changes} desktopConfig=${desktopConfigResult.changes} desktopLoom=${desktopLoomResult.changes}`);
   }
 }
 
@@ -504,6 +561,10 @@ module.exports = {
   getDesktopConfigs,
   upsertDesktopConfigIndex,
   softDeleteDesktopConfigIndex,
+  getDesktopLoomAppIndex,
+  getDesktopLoomApps,
+  upsertDesktopLoomAppIndex,
+  softDeleteDesktopLoomAppIndex,
   softDeleteEntityIndex,
   softDeleteMessageIndex,
   softDeleteAvatarIndex,
