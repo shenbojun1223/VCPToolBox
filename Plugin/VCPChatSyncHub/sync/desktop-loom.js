@@ -21,6 +21,7 @@ const SAFE_LOOM_APP_ID = /^[a-z0-9][a-z0-9_-]{1,63}$/;
 const MAX_LOOM_INJECT_BYTES = 2 * 1024 * 1024;
 const MAX_LOOM_MANIFEST_BYTES = 256 * 1024;
 const MAX_LOOM_ICON_FILE_BYTES = 5 * 1024 * 1024;
+const LOOM_SYNC_PENDING_FILE = ".sync-pending";
 
 function normalizeLoomAppId(value) {
   const id = typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -30,6 +31,24 @@ function normalizeLoomAppId(value) {
 
 function isExternalOrInlineIcon(icon) {
   return /^(?:data:|https?:|file:)/i.test(String(icon || "").trim());
+}
+
+function isReservedLoomFileName(fileName) {
+  return [
+    MANIFEST_FILE,
+    INJECT_CSS_FILE,
+    INJECT_JS_FILE,
+    LOOM_SYNC_PENDING_FILE,
+  ].includes(fileName);
+}
+
+async function pathExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function sanitizeLoomManifestForSync(manifest, id) {
@@ -93,7 +112,7 @@ async function readLocalIconFile(appDir, manifest) {
   const icon = typeof manifest?.icon === "string" ? manifest.icon.trim() : "";
   if (!icon || isExternalOrInlineIcon(icon)) return null;
   const fileName = path.basename(icon);
-  if (!fileName || fileName !== icon || [MANIFEST_FILE, INJECT_CSS_FILE, INJECT_JS_FILE].includes(fileName)) {
+  if (!fileName || fileName !== icon || isReservedLoomFileName(fileName)) {
     return null;
   }
   const filePath = path.resolve(appDir, fileName);
@@ -181,26 +200,47 @@ async function refreshDesktopLoomAppIndex(appDataPath) {
     if (error.code !== "ENOENT") throw error;
   }
 
-  const seenOnDisk = new Set();
+  // "Could not index it" must never be conflated with "it is gone". A tombstone written
+  // here is broadcast as DELETE to every PC, so a transient read failure (EBUSY from a
+  // virus scanner, a locked file, an oversized inject file) previously escalated a local
+  // hiccup into fleet-wide data loss. Only a directory that is genuinely absent -- or
+  // whose manifest is really missing -- may reach the purge loop below.
+  const presentOnDisk = new Set();
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const id = normalizeLoomAppId(entry.name);
     if (!id || id !== entry.name) continue;
     const appDir = path.join(basePath, id);
+    presentOnDisk.add(id);
+
+    if (await pathExists(path.join(appDir, LOOM_SYNC_PENDING_FILE))) {
+      // An upload died mid-bundle, or one is in flight right now (this function does not
+      // take the upload lock). Re-indexing would publish a hash matching neither peer
+      // under a brand new mtime, and every client would then PULL the torn bundle. Keep
+      // the last indexed revision instead: the client owning the newer version is told
+      // to PUSH again and repairs the hub.
+      console.warn(`[VCPChatSyncHub] LoomApp ${id} has an unfinished bundle write; keeping the last indexed revision until it is re-uploaded.`);
+      continue;
+    }
+
     try {
       const bundle = await readLoomAppBundle(appDir, id);
       const current = getDesktopLoomAppIndex(id);
       if (current && current.deleted_at != null && bundle.mtimeMs <= current.deleted_at) {
         await fs.rm(appDir, { recursive: true, force: true });
+        presentOnDisk.delete(id);
         continue;
       }
-      seenOnDisk.add(id);
       const updatedAt = current && current.deleted_at == null && current.hash === bundle.hash
         ? current.updated_at
         : bundle.mtimeMs;
       upsertDesktopLoomAppIndex(id, appDir, bundle.hash, updatedAt);
     } catch (error) {
-      if (error.code !== "ENOENT") {
+      if (error.code === "ENOENT") {
+        // No manifest and no pending marker: this is not a LoomApp any more, so the
+        // purge loop may tombstone it (unchanged from the original behaviour).
+        presentOnDisk.delete(id);
+      } else {
         console.warn(`[VCPChatSyncHub] Failed to index LoomApp ${id}: ${error.message}`);
       }
     }
@@ -208,7 +248,7 @@ async function refreshDesktopLoomAppIndex(appDataPath) {
 
   for (const row of getDesktopLoomApps()) {
     if (row.deleted_at != null) continue;
-    if (!seenOnDisk.has(row.id)) {
+    if (!presentOnDisk.has(row.id)) {
       softDeleteDesktopLoomAppIndex(row.id, Date.now(), row.dir_path);
     }
   }
@@ -300,8 +340,19 @@ async function downloadDesktopLoomApps(appDataPath, items) {
       results.push({ id, ok: false, error: "LoomApp not found" });
       continue;
     }
+    const appDir = row.dir_path || resolveLoomAppDir(appDataPath, id);
+    if (await pathExists(path.join(appDir, LOOM_SYNC_PENDING_FILE))) {
+      // Refuse rather than hand out a torn bundle. The client treats ok=false as a hard
+      // sync failure and retries, by which time the owner's PUSH has repaired the hub.
+      results.push({
+        id,
+        ok: false,
+        error: "LoomApp bundle is mid-write on the hub; retry after the owner re-uploads it",
+      });
+      continue;
+    }
     try {
-      const bundle = await readLoomAppBundle(row.dir_path || resolveLoomAppDir(appDataPath, id), id);
+      const bundle = await readLoomAppBundle(appDir, id);
       results.push({
         id,
         ok: true,
@@ -321,21 +372,31 @@ async function downloadDesktopLoomApps(appDataPath, items) {
 
 async function writeAtomicFile(filePath, content, encoding = "utf8") {
   const tempPath = `${filePath}.tmp_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  if (Buffer.isBuffer(content)) {
-    await fs.writeFile(tempPath, content);
-  } else {
-    await fs.writeFile(tempPath, String(content ?? ""), encoding);
+  try {
+    if (Buffer.isBuffer(content)) {
+      await fs.writeFile(tempPath, content);
+    } else {
+      await fs.writeFile(tempPath, String(content ?? ""), encoding);
+    }
+    await fs.rename(tempPath, filePath);
+  } finally {
+    // A failed rename would otherwise leave .tmp_* litter inside the app directory,
+    // where readLoomAppBundle and the icon resolver have to step around it.
+    await fs.rm(tempPath, { force: true }).catch(() => {});
   }
-  await fs.rename(tempPath, filePath);
 }
 
 async function applySyncedMtime(filePaths, ts) {
   const mtimeDate = new Date(Number(ts) || Date.now());
+  const failures = [];
   await Promise.all(
     filePaths.map((filePath) =>
-      fs.utimes(filePath, mtimeDate, mtimeDate).catch(() => {})
+      fs.utimes(filePath, mtimeDate, mtimeDate).catch((error) => {
+        failures.push(`${path.basename(filePath)}: ${error.message}`);
+      })
     ),
   );
+  return failures;
 }
 
 async function uploadDesktopLoomApps(appDataPath, items) {
@@ -360,26 +421,27 @@ async function uploadDesktopLoomApps(appDataPath, items) {
       continue;
     }
 
-    const appDir = resolveLoomAppDir(appDataPath, id);
-    const manifestPath = path.join(appDir, MANIFEST_FILE);
-    await fs.mkdir(appDir, { recursive: true });
-    const release = await acquireLock(manifestPath);
+    // Validate the entire payload before touching the filesystem, so a malformed item
+    // cannot create a directory or strand a pending marker that quarantines an
+    // otherwise healthy bundle.
+    let manifest;
+    let css;
+    let js;
+    let normalizedIconFile = null;
+    let iconBuffer = null;
     try {
-      const manifest = sanitizeLoomManifestForSync(item.manifest, id);
-      const css = String(item.css ?? "");
-      const js = String(item.js ?? "");
+      manifest = sanitizeLoomManifestForSync(item.manifest, id);
+      css = String(item.css ?? "");
+      js = String(item.js ?? "");
       if (Buffer.byteLength(css, "utf8") > MAX_LOOM_INJECT_BYTES) {
         throw new Error("inject.css exceeds 2 MB limit");
       }
       if (Buffer.byteLength(js, "utf8") > MAX_LOOM_INJECT_BYTES) {
         throw new Error("inject.js exceeds 2 MB limit");
       }
-
-      let normalizedIconFile = null;
-      let iconBuffer = null;
       if (item.iconFile && typeof item.iconFile === "object" && !Array.isArray(item.iconFile)) {
         const iconName = path.basename(String(item.iconFile.fileName || "").trim());
-        if (!iconName || iconName !== String(item.iconFile.fileName || "").trim() || [MANIFEST_FILE, INJECT_CSS_FILE, INJECT_JS_FILE].includes(iconName)) {
+        if (!iconName || iconName !== String(item.iconFile.fileName || "").trim() || isReservedLoomFileName(iconName)) {
           throw new Error("Invalid LoomApp icon file name");
         }
         iconBuffer = Buffer.from(String(item.iconFile.content || ""), "base64");
@@ -392,10 +454,31 @@ async function uploadDesktopLoomApps(appDataPath, items) {
         };
         manifest.icon = iconName;
       }
+    } catch (error) {
+      results.push({ id, ok: false, success: false, error: error.message });
+      continue;
+    }
 
+    const appDir = resolveLoomAppDir(appDataPath, id);
+    const manifestPath = path.join(appDir, MANIFEST_FILE);
+    const pendingPath = path.join(appDir, LOOM_SYNC_PENDING_FILE);
+    await fs.mkdir(appDir, { recursive: true });
+    const release = await acquireLock(manifestPath);
+    try {
       const cssPath = path.join(appDir, INJECT_CSS_FILE);
       const jsPath = path.join(appDir, INJECT_JS_FILE);
       const touchedPaths = [manifestPath, cssPath, jsPath];
+
+      // The bundle hash spans loom.json + inject.css + inject.js + icon, so per-file
+      // atomicity is not enough. If a crash lands between two files, upsert never runs,
+      // the DB keeps the old hash, and the next refreshDesktopLoomAppIndex recomputes a
+      // hash matching neither peer -- under a brand new mtime. Every client then sees
+      // remoteTs <= local.updated_at and PULLs the torn bundle, making the hub a poison
+      // source for the whole fleet. The marker is cleared only after the index row lands;
+      // a failed write deliberately leaves it behind so the bundle stays quarantined
+      // until the owner re-uploads. It also shields concurrent readers, because
+      // refreshDesktopLoomAppIndex does not take this lock.
+      await fs.writeFile(pendingPath, `${JSON.stringify({ id, ts: Date.now() })}\n`, "utf8");
 
       await writeAtomicFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
       await writeAtomicFile(cssPath, css, "utf8");
@@ -407,13 +490,19 @@ async function uploadDesktopLoomApps(appDataPath, items) {
         touchedPaths.push(iconPath);
       }
 
-      await applySyncedMtime(touchedPaths, updatedAt);
+      const mtimeFailures = await applySyncedMtime(touchedPaths, updatedAt);
+      if (mtimeFailures.length) {
+        // mtime feeds refreshDesktopLoomAppIndex's updated_at, the only clock behind
+        // every PUSH/PULL verdict; swallowing this makes later conflicts unexplainable.
+        console.warn(`[VCPChatSyncHub] Could not stamp synced mtime on LoomApp ${id} (${mtimeFailures.join("; ")}).`);
+      }
 
       const hash = computeDesktopLoomAppHash(
         { manifest, css, js, iconFile: normalizedIconFile },
         id,
       );
       upsertDesktopLoomAppIndex(id, appDir, hash, updatedAt);
+      await fs.rm(pendingPath, { force: true });
       results.push({ id, ok: true, success: true, hash, ts: updatedAt });
     } catch (error) {
       results.push({ id, ok: false, success: false, error: error.message });
