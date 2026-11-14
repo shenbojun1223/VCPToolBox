@@ -1,4 +1,4 @@
-const { UpstreamError, responseError, assertResponseOk, abortableDelay, abortError, throwIfAborted, safeErrorFields, sendFailure } = require('./upstreamErrors.js');
+const { UpstreamError, responseError, assertResponseOk, abortableDelay, abortError, throwIfAborted, safeErrorFields, sendFailure, isBridgeFailure, isClaudeBridgeModel } = require('./upstreamErrors.js');
 // modules/chatCompletionHandler.js
 const messageProcessor = require('./messageProcessor.js');
 const vcpInfoHandler = require('../vcpInfoHandler.js');
@@ -641,7 +641,8 @@ async function fetchWithRetry(
     }
     if (failure.name === 'AbortError') throw failure;
     const retryable = failure.status === null || [500, 502, 503, 504, 429].includes(failure.status);
-    if (failure.code === 'sensitive_words_detected' || !retryable || i === maxAttempts - 1) throw failure;
+    if (failure.code === 'sensitive_words_detected' || isBridgeFailure(failure)
+        || isClaudeBridgeModel(attemptModel) || !retryable || i === maxAttempts - 1) throw failure;
     if (debugMode) console.warn('[Fetch Retry]', safeErrorFields(failure));
     if (onRetry) await onRetry(i + 1, safeErrorFields(failure));
     await abortableDelay(delay * (i + 1), externalSignal);

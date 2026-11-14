@@ -2550,7 +2550,8 @@ class RAGDiaryPlugin {
                 : String(result.content);
 
             const beforeLength = processedContent.length;
-            processedContent = processedContent.replace(placeholder, replacementContent);
+            // Retrieved content is literal data, never a JavaScript replacement template.
+            processedContent = processedContent.replace(placeholder, () => replacementContent);
             const afterLength = processedContent.length;
 
             if (beforeLength === afterLength && placeholder.length > 0) {

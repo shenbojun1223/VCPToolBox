@@ -652,6 +652,22 @@ function createTextResult(text) {
 function throwToolError(message) {
     throw new Error(JSON.stringify({ plugin_error: String(message || 'AgentAssistant unknown error') }));
 }
+/**
+ * 会话占线锁键的唯一构造入口。
+ * 中文名、大小写变体、别名调用都必须收敛到同一把锁，否则同一显式 session_id
+ * 的普通会话与异步委托会各占一把锁，互斥失效。
+ */
+function buildSessionLockKey(agentConfig, userSessionId) {
+    const baseName = String(agentConfig && agentConfig.baseName ? agentConfig.baseName : '').trim();
+    if (!baseName) {
+        throw new Error('[AgentAssistant] buildSessionLockKey requires agentConfig.baseName.');
+    }
+    const sessionKey = String(userSessionId ?? '').trim();
+    if (!sessionKey) {
+        throw new Error('[AgentAssistant] buildSessionLockKey requires a non-empty userSessionId.');
+    }
+    return `${baseName}::${sessionKey}`;
+}
 
 /**
  * This is the main entry point for handling tool calls from PluginManager.
@@ -844,7 +860,7 @@ async function processToolCall(args) {
 
     // 占线检查：仅对持久对话生效
     if (useContext) {
-        const lockKey = `${agent_name}::${userSessionId}`;
+        const lockKey = buildSessionLockKey(agentConfig, userSessionId);
         if (activeSessionLocks.has(lockKey)) {
             const busyMsg = `[AgentAssistant] ${agent_name} 目前正在与他人进行通讯，暂时无法接听。请稍后再试。`;
             if (DEBUG_MODE) console.error(`[AgentAssistant Service] Session busy, rejecting request for ${agent_name} (session: ${userSessionId}).`);
@@ -982,7 +998,7 @@ async function processToolCall(args) {
     } finally {
         // 确保无论成功或失败，持久对话的锁都会被释放
         if (useContext) {
-            const lockKey = `${agent_name}::${userSessionId}`;
+            const lockKey = buildSessionLockKey(agentConfig, userSessionId);
             activeSessionLocks.delete(lockKey);
             if (DEBUG_MODE) console.error(`[AgentAssistant Service] Session lock released for ${agent_name} (session: ${userSessionId}).`);
         }
@@ -995,7 +1011,7 @@ async function processToolCall(args) {
 async function executeDelegation(delegationId, agentConfig, taskPromptContent, taskPromptText, senderName, temporaryToolsSystemPrompt = '', customSessionId = '') {
     const normalizedSessionId = String(customSessionId || '').trim();
     const userSessionId = normalizedSessionId || `agent_${agentConfig.baseName}_delegation_${delegationId}`;
-    const lockKey = `${agentConfig.baseName}::${userSessionId}`;
+    const lockKey = buildSessionLockKey(agentConfig, userSessionId);
 
     // 我们对于代理任务也是一个持久会话，因此需要占线锁保护
     while (activeSessionLocks.has(lockKey)) {
@@ -1322,5 +1338,7 @@ module.exports = {
     reloadConfig: loadAgentsFromLocalConfig,
     listDelegations,
     getDelegationDetail,
-    cancelDelegation
+    cancelDelegation,
+    // 测试钩子：纯函数，供单测直接验证锁键归一化，不改变插件对外契约。
+    buildSessionLockKey
 };

@@ -1,4 +1,4 @@
-const { UpstreamError, assertResponseOk, abortableDelay, abortError, throwIfAborted } = require('../upstreamErrors.js');
+const { UpstreamError, assertResponseOk, abortableDelay, abortError, throwIfAborted, isClaudeBridgeModel } = require('../upstreamErrors.js');
 // modules/handlers/nonStreamHandler.js
 // AICW 内层禁工具消费回执（opt-in）：仅在请求携带本机控制头时写入保留响应头。
 const { emitVcpToolForbiddenReceipt } = require('../vcpToolForbiddenReceipt.js');
@@ -274,7 +274,7 @@ class NonStreamHandler {
     const firstReadResult = await readNonStreamResponseWithSemanticRetry({
       initialResponse: firstAiAPIResponse,
       fetchResponse: () => fetchNonStreamCompletion(originalBody, 'initial'),
-      retries: apiRetries,
+      retries: isClaudeBridgeModel(originalBody.model) ? 1 : apiRetries,
       delay: apiRetryDelay,
       debugMode: DEBUG_MODE,
       signal: abortController.signal,
@@ -426,7 +426,7 @@ class NonStreamHandler {
           const recursionBody = { ...originalBody, messages: currentMessagesForNonStreamLoop, stream: false };
           const recursionReadResult = await readNonStreamResponseWithSemanticRetry({
             fetchResponse: () => fetchNonStreamCompletion(recursionBody, `archery_error_depth_${recursionDepth}`),
-            retries: apiRetries,
+            retries: isClaudeBridgeModel(recursionBody.model) ? 1 : apiRetries,
             delay: apiRetryDelay,
             debugMode: DEBUG_MODE,
             signal: abortController.signal,
@@ -610,7 +610,7 @@ class NonStreamHandler {
         const recursionBody = { ...originalBody, messages: messagesForUpstream, stream: false };
         const recursionReadResult = await readNonStreamResponseWithSemanticRetry({
           fetchResponse: () => fetchNonStreamCompletion(recursionBody, `tool_loop_depth_${recursionDepth}`),
-          retries: apiRetries,
+          retries: isClaudeBridgeModel(recursionBody.model) ? 1 : apiRetries,
           delay: apiRetryDelay,
           debugMode: DEBUG_MODE,
           signal: abortController.signal,

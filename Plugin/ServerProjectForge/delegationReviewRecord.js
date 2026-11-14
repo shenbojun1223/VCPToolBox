@@ -64,6 +64,15 @@
             && exact(r.evidence, ['ref', 'sha256']) && string(r.evidence.ref, 220)
             && typeof r.evidence.sha256 === 'string' && /^[a-f0-9]{64}$/.test(r.evidence.sha256);
     }
+    // The store writes arrays. Accept a detached current/history envelope as well;
+    // history may include current or contain only its predecessors.
+    function reviewList(value) {
+        if (Array.isArray(value)) return value;
+        if (!exact(value, ['current', 'history']) || !Array.isArray(value.history) || !plain(value.current)) return null;
+        const last = value.history[value.history.length - 1];
+        return last && JSON.stringify(last) === JSON.stringify(value.current)
+            ? value.history : [...value.history, value.current];
+    }
     function readReview(raw, runtime) {
         if (!runtime || typeof raw !== 'string' || !raw.startsWith(START, runtime.end)) return null;
         const current = readRuntime(raw);
@@ -85,5 +94,5 @@
         if (head.length > 2048) throw new Error('REVIEW_PREVIEW_LIMIT');
         return head + raw.slice(runtime.end);
     }
-    return Object.freeze({ START, END, readRuntime, validReview, readReview, compose, independent });
+    return Object.freeze({ START, END, readRuntime, validReview, reviewList, readReview, compose, independent });
 });

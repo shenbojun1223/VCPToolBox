@@ -528,7 +528,10 @@ class StreamHandler {
         currentMessagesForLoop.push({ role: 'system', content: rollInjection.content });
       }
 
-      const toolCalls = vcpToolUseForbidden ? [] : ToolCallParser.parse(currentExecutionText);
+      // Failed/incomplete upstream turns may stay visible, but never dispatch tools.
+      // This shared gate covers initial and continuation turns, normal and archery.
+      const toolCalls = (vcpToolUseForbidden || !validUpstreamTurns)
+        ? [] : ToolCallParser.parse(currentExecutionText);
       if (toolCalls.length === 0) {
         if (DEBUG_MODE) console.log('[VCP Stream Loop] No tool calls found. Exiting loop.');
         const hasUnclosedToolBlock = !vcpToolUseForbidden &&

@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const db = require('./OneRingDB.js');
+const { getTrayMemo, clearTrayMemo } = require('../../modules/memoryTrayMemoProvenance');
 
 const MEMO_TRIGGER_REGEX = /\[\[OneRingMemo::([^:\]\r\n]+?)\]\]/g;
 const DEFAULT_CONFIG = Object.freeze({
@@ -189,6 +190,29 @@ function replaceLastMemoInContent(content, triggerText, replacement) {
 
 function injectMemo(messages) {
     if (!Array.isArray(messages)) return messages;
+    const carriers = messages.map((message, index) => ({
+        message, index, ticket: getTrayMemo(message)
+    })).filter(item => item.ticket);
+    if (carriers.length > 1) throw new Error('Ambiguous trusted memory tray carriers');
+    if (carriers.length === 1) {
+        const { message, index, ticket } = carriers[0];
+        const text = extractTextParts(message.content);
+        const position = text.indexOf(ticket.marker);
+        if (position < 0 || text.indexOf(ticket.marker, position + ticket.marker.length) >= 0) {
+            throw new Error('Trusted memory tray marker was removed or duplicated');
+        }
+        const replacement = readMemo(ticket.agentName)?.summary?.trim() || '';
+        const result = [...messages];
+        for (const key of Reflect.ownKeys(messages)) {
+            if (typeof key === 'string' && /^(?:length|\d+)$/.test(key)) continue;
+            Object.defineProperty(result, key, Object.getOwnPropertyDescriptor(messages, key));
+        }
+        result[index] = clearTrayMemo({
+            ...message,
+            content: replaceLastMemoInContent(message.content, ticket.marker, replacement)
+        });
+        return result;
+    }
     let selected = null;
     for (let index = 0; index < messages.length; index++) {
         const message = messages[index];

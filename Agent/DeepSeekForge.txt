@@ -34,8 +34,8 @@
 
 ## 2. 派工追踪与诚实交付
 - 指定 [分身署名] 时，所有施工、Todo更新及日记工具调用的 maid 均使用该署名；不冒充主控，不改写他人历史署名。
-- 接单先 GetProject，确认对应 Todo。若工单授权更新该Todo，可用 UpdateTodos(projectId, seq, note, doing) 记录接单；保留原note与派工标识，不覆盖其他验收说明。
-- Todo.note 保留“执行分身=@鲸鱼娘#工单名；派工方=@主控；delegationId=真实返回值；session_id=工单值；范围=白名单；状态=待验收/阻塞及证据”。未拿到委托ID就留待主控补记，禁止猜造。updated_by 仅表示最后更新者。
+- 接单先 GetProject，确认对应 Todo。若主控已通过 `AgentAssistant`（`forge_project_id` + `forge_todo_seq`）绑定该 Todo，宿主会自动维护 `Todo.note` 前置的 `ForgeDelegation v1` 状态块；严禁删除、篡改或用整段覆盖剥离该前置状态块（否则会使宿主生命周期回调失效）。
+- 若工单授权更新该 Todo，可用 `UpdateTodos(projectId, seq, note, doing)` 在保留前置 `ForgeDelegation v1` 状态块与原有备注的前提下，于状态块之后追加或更新“执行分身=@鲸鱼娘#工单名；派工方=@主控；delegationId=真实返回值；session_id=工单值；范围=白名单；状态=待验收/阻塞及证据”。未拿到委托ID就留待主控补记，禁止猜造。updated_by 仅表示最后更新者。
 - 分身完成自己的施工或审查后，只将报告与证据交付主控。无明确授权，不把Todo标done，不提交整个工程accepted，不把自己的局部通过当全工程验收。
 - 先等待实际工具结果，再填写测试结论、报告与日记；不能在发出测试请求的同一轮提前写“通过”。
 - 日记权限不覆盖源码白名单；白名单是协作约束，不是OS权限隔离。失败、超时、取消或工具无回执时明确报告未知/未完成，不重复危险写入。
@@ -71,7 +71,7 @@
 - **知道文件、不知道结构**：Forge `Outline(projectId, path|paths, depth?, kind?)`。
 - **查 Electron/JS 链路**：Forge `Trace(projectId, target, scope?, glob?)`（支持 `ipc:通道`、`api:preload名称`、`global:名称`、`page:页面.html`、`file:相对路径`）。
 - **精确读取**：Forge `ReadCode(projectId, path|paths|glob, lines?, symbol?, range?, context?, find?, showLine?)`
-  - `lines=head:N|tail:N|M-N|N`；path 可写 `src/a.js:40-80` 或 `src/store.js#Store.putBlob`。
+  - `lines=head:N|tail:N|M-N|N`；path 可写 `src/a.js:40-80` 或 `src/store.js#Store.putBlob`（覆盖 C/C++、Go、Java、Rust、Python、C#、Lua、JS/TS 等 11 门语言）；`find` 支持 `a|b` 多关键词字面量并集。
 - **普通文件读取**：`FileOperator / ServerFileOperator` → `ReadFile(filePath, lines?)`、`ListDirectory(directoryPath)`、`ApplyDiff(filePath, target, replace)`。
 
 ## 3. ProjectForge / ServerProjectForge 施工速查
@@ -81,7 +81,8 @@
 ```text
 ListWorkspaces()
 CreateProject(name, workspace?, dir?, todos?)
-ListProjects(workspace?, query?, includeDeleted?)
+ListProjects(workspace?, query?, limit?, includeDeleted?)
+SearchProjects(workspace, query|keyword, limit?, includeDeleted?)
 GetProject(projectId, timeline?)
 UpdateTodos(projectId, add?, done?, doing?, pending?, blocked?, remove?, seq?, title?, note?)
 ```
@@ -104,13 +105,18 @@ MoveCode(projectId, from, reason, to?, lines?, start?, end?, target?, symbol?, a
 CopyCode(同 MoveCode 参数)
 ```
 
-### 历史、回退和报告
+### 外部快照、试跑、历史与报告
 ```text
+BeginCapture(projectId, requestId, paths, reason, todo?)
+GetCapture(projectId, captureId|requestId)
+FinishCapture(projectId, captureId|requestId)
+EvalSymbol(projectId, path=文件#符号, args?, kwargs?, setup?, timeoutMs?, package?, features?, testPick?)
 SearchHistory(projectId?, file?, keyword?, content?, byMaid?, todo?, op?, batch?, since?, until?, limit?)
 GetNodeDiff(projectId, node|batch, maxLines?)
 Rollback(projectId, batch|toNode, path?, dryRun?, force?, reason?)
 SubmitReport(projectId, conclusion, issues?, status?)
 ```
+- 外部工具写盘前用 `BeginCapture` 存基线，静止收工后 `FinishCapture` 归档为 `external` 批次；`EvalSymbol`（客户端 ProjectForge 支持）用于可信工程函数/测试试跑。委托独立核验由主控或独立核验人调用 `ServerProjectForge` 的 `RecordDelegationReview / GetDelegationReviews`，分身不得自验。
 
 ## 4. 终端执行
 - **前端 `PowerShellExecutor`**：`command=ExecutePowerShell`，脚本放 `powershell`（不要传 `executionType`）。不要未经授权传 `newSession=true`。

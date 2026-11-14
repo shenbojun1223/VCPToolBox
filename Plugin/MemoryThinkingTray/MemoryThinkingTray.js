@@ -2,6 +2,8 @@
 
 const START = '<---VCP记忆思维区Start--->';
 const END = '<---VCP记忆思维区End--->';
+const { issueTrayMemo, attachTrayMemo } = require('../../modules/memoryTrayMemoProvenance');
+const MEMO_TRIGGER = /\[\[OneRingMemo::([^:\]\r\n]+?)\]\]/g;
 
 // Only explicit system messages are sources. Ordinary user/assistant text is never promoted.
 function textSegments(content) {
@@ -68,7 +70,7 @@ function extractTray(content) {
     } else {
         cleanedContent = { ...content, text: cleanSegment(segments[0]) };
     }
-    return { content: cleanedContent, bodies };
+    return { content: cleanedContent, bodies, ranges, text };
 }
 
 function markPrefixCacheBreakpoint(messages, insertionIndex) {
@@ -125,6 +127,7 @@ class MemoryThinkingTray {
             ? NaN : Number(rawDepth);
         const depth = Number.isSafeInteger(parsedDepth) && parsedDepth >= 0 ? parsedDepth : 1;
         const replacements = new Map();
+        const extractions = new Map();
         const bodies = [];
         try {
             for (let index = 0; index < messages.length; index++) {
@@ -132,6 +135,7 @@ class MemoryThinkingTray {
                 const result = extractTray(messages[index].content);
                 if (!result) continue;
                 replacements.set(index, { ...messages[index], content: result.content });
+                extractions.set(index, { ...result, bodyOffset: bodies.length });
                 bodies.push(...result.bodies);
             }
         } catch (error) {
@@ -140,6 +144,36 @@ class MemoryThinkingTray {
             return messages;
         }
         if (replacements.size === 0) return messages;
+
+        // Preserve OneRingMemo's last declaration in the leading system prefix.
+        let selectedMemo = null;
+        for (let i = 0; messages[i]?.role === 'system'; i++) {
+            const extraction = extractions.get(i);
+            const text = extraction?.text
+                ?? textSegments(messages[i].content).map(part => part.text).join('\n');
+            const matches = [...text.matchAll(new RegExp(MEMO_TRIGGER.source, 'g'))];
+            if (!matches.length) continue;
+            const match = matches[matches.length - 1];
+            selectedMemo = null; // A later unmoved declaration retains precedence.
+            const rangeIndex = extraction?.ranges.findIndex(([start, end]) =>
+                match.index >= start + START.length
+                && match.index + match[0].length <= end - END.length) ?? -1;
+            if (rangeIndex >= 0) {
+                selectedMemo = {
+                    agentName: match[1].trim(),
+                    trigger: match[0],
+                    bodyIndex: extraction.bodyOffset + rangeIndex,
+                    offset: match.index - extraction.ranges[rangeIndex][0] - START.length
+                };
+            }
+        }
+        let memoTicket = null;
+        if (selectedMemo) {
+            memoTicket = issueTrayMemo(selectedMemo.agentName);
+            const { bodyIndex, offset, trigger } = selectedMemo;
+            bodies[bodyIndex] = bodies[bodyIndex].slice(0, offset)
+                + memoTicket.marker + bodies[bodyIndex].slice(offset + trigger.length);
+        }
 
         const output = messages.map((message, index) => replacements.get(index) || message);
         // Preserve request-local non-index array metadata without serializing it upstream.
@@ -157,7 +191,9 @@ class MemoryThinkingTray {
         while (index > leadingSystemCount && output[index]?.role === 'tool') index--;
         const cacheEnabled = String(effective.MEMORY_THINKING_TRAY_CACHE_BREAKPOINT).toLowerCase() === 'true';
         const cacheIndex = cacheEnabled ? markPrefixCacheBreakpoint(output, index) : -1;
-        output.splice(index, 0, { role: 'user', content: `[系统提示:]\n${body}` });
+        output.splice(index, 0, attachTrayMemo(
+            { role: 'user', content: `[系统提示:]\n${body}` }, memoTicket
+        ));
         if (effective.DebugMode === true) {
             console.log(`[MemoryThinkingTray] 已搬移 ${bodies.length} 个托盘区，depth=${depth}, index=${index}, cacheIndex=${cacheIndex}`);
         }

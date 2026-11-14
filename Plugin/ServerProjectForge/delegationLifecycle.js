@@ -54,6 +54,16 @@ function metadata(store, id) {
     const row = store.db.prepare('SELECT value FROM meta WHERE key=?').get(PREFIX + id);
     return row ? JSON.parse(row.value) : null;
 }
+// Local import provenance is deliberately separate from the portable runtime codec.
+// It is not a writer lease, and cannot be supplied by an incoming bundle.
+function imported(store, data) {
+    if (!data) return false;
+    const row = store.db.prepare('SELECT value FROM meta WHERE key=?')
+        .get('aa_delegation_import:' + data.delegationId);
+    if (!row) return false;
+    const mark = JSON.parse(row.value);
+    return mark.projectId === data.projectId && mark.todoId === data.todoId;
+}
 function getTarget(store, args) {
     store.assertProjectAvailable(args.projectId);
     check(store.getProject(args.projectId), 'DELEGATION_TARGET');
@@ -79,6 +89,7 @@ function bind(store, args) {
     return store.db.transaction(() => {
         const row = getTarget(store, args), parsed = readNote(row.note);
         const existing = metadata(store, args.delegationId);
+        check(!imported(store, { ...args, todoId: row.id }), 'DELEGATION_IMPORTED');
         if (existing) {
             check(existing.todoId === row.id && existing.projectId === args.projectId &&
                 existing.todoSeq === args.todoSeq && existing.role === role &&
@@ -87,8 +98,9 @@ function bind(store, args) {
             return { ...existing, changed: false };
         }
         if (parsed.data) {
-            check(same(metadata(store, parsed.data.delegationId), parsed.data), 'DELEGATION_STALE');
-            check(TERMINAL.has(parsed.data.runtimeStatus), 'DELEGATION_BUSY');
+            const historical = imported(store, parsed.data);
+            check(historical || same(metadata(store, parsed.data.delegationId), parsed.data), 'DELEGATION_STALE');
+            check(historical || TERMINAL.has(parsed.data.runtimeStatus), 'DELEGATION_BUSY');
         } else check(!String(row.note || '').startsWith('[[ForgeDelegation::'), 'DELEGATION_STALE');
         const data = {
             version: 1, projectId: args.projectId, todoId: row.id, todoSeq: args.todoSeq,
@@ -106,10 +118,11 @@ function advance(store, args) {
         const row = getTarget(store, args), saved = metadata(store, args.delegationId), parsed = readNote(row.note);
         check(saved && saved.projectId === args.projectId && saved.todoSeq === args.todoSeq &&
             saved.todoId === row.id && same(parsed.data, saved), 'DELEGATION_STALE');
+        check(!imported(store, saved), 'DELEGATION_IMPORTED');
         if (args.sequence <= saved.sequence || TERMINAL.has(saved.runtimeStatus)) return { ...saved, changed: false };
         const data = { ...saved, runtimeStatus: args.status, stage: STATES[args.status],
             sequence: args.sequence, updatedAt: new Date().toISOString() };
         return write(store, row, data, parsed.original);
     }).immediate();
 }
-module.exports = { bind, advance, readNote, STATES };
+module.exports = { bind, advance, readNote, noteOf, validData, imported, STATES };

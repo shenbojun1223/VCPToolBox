@@ -4,9 +4,21 @@
 // Bound decoded bytes and wall time independently of the connection timeout.
 const ERROR_BODY_MAX_BYTES = 16 * 1024;
 const ERROR_BODY_TIMEOUT_MS = 1000;
+const BRIDGE_CODES = new Set(['bridge_unclean', 'cleanup_unknown', 'cleanup_failed',
+  'busy', 'runner_result_missing', 'runner_result_invalid', 'session_mismatch',
+  'turn_mismatch', 'prompt_id_mismatch', 'unconfirmed_stop', 'duplicate_event',
+  'duplicate_result', 'missing_reply', 'unexpected_exit', 'cancelled', 'client_aborted',
+  'timeout', 'stop_failure', 'auth_error_upstream', 'permission_error_upstream',
+  'limit_error_upstream', 'runner_protocol', 'output_limit', 'event_limit',
+  'terminal_overflow', 'echo_not_reply']);
 const CODES = new Set(['sensitive_words_detected', 'invalid_api_key', 'rate_limit_exceeded',
-  'unknown', 'network_error', 'upstream_timeout', 'stream_error', 'aborted', 'internal_error']);
-const REMOTE_CODES = new Set(['sensitive_words_detected', 'invalid_api_key', 'rate_limit_exceeded']);
+  'unknown', 'network_error', 'upstream_timeout', 'stream_error', 'aborted', 'internal_error',
+  ...BRIDGE_CODES]);
+const REMOTE_CODES = new Set(['sensitive_words_detected', 'invalid_api_key', 'rate_limit_exceeded', ...BRIDGE_CODES]);
+const isBridgeFailure = error => BRIDGE_CODES.has(error?.code);
+const isClaudeBridgeModel = model => typeof model === 'string'
+  && /^claude-vcp-(sonnet|opus|haiku|opusplan)(?:-(low|medium|high|xhigh|max))?$/.test(model);
+const GENERIC_BRIDGE_CODES = new Set(['busy', 'timeout', 'cancelled', 'client_aborted']);
 const safeCode = value => CODES.has(value) ? value : 'unknown';
 const safeRequestId = value => typeof value === 'string' && value.length <= 96 &&
   /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value) ? value : null;
@@ -99,7 +111,9 @@ async function responseError(response, fields = {}, readOptions = {}) {
     try {
       const parsed = JSON.parse(text);
       const value = parsed?.error?.code ?? parsed?.code;
-      code = REMOTE_CODES.has(value) ? value : 'unknown';
+      code = REMOTE_CODES.has(value)
+        && (!GENERIC_BRIDGE_CODES.has(value) || parsed?.error?.type === 'bridge_error')
+        ? value : 'unknown';
       requestId ||= safeRequestId(parsed?.request_id) || safeRequestId(parsed?.error?.request_id);
     } catch (_) { /* Never retain the raw body, parser message or stack. */ }
   }
@@ -148,6 +162,6 @@ function sendFailure(res, error, streaming, signal) {
   }
 }
 
-module.exports = { UpstreamError, safeCode, safeRequestId, safeErrorFields, readErrorBody,
+module.exports = { UpstreamError, safeCode, safeRequestId, safeErrorFields, readErrorBody, isBridgeFailure, isClaudeBridgeModel,
   responseError, assertResponseOk, abortableDelay, abortError, throwIfAborted, sendFailure,
   ERROR_BODY_MAX_BYTES, ERROR_BODY_TIMEOUT_MS };

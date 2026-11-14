@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { execFileSync } = require('node:child_process');
+const {buildFableWindows, withFableNotice} = require('./fableQuota');
 
 const VALID_PERIODS = new Set(['today', '7d', 'month']);
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
@@ -144,7 +145,9 @@ function buildClaudeWindows(utilRoot, nowMs) {
         }
         windows.push({ id: def.id, label: def.label, remainingPercent, usedPercent, resetsAt });
     }
-    return { windows, staleWindow };
+    const scoped = buildFableWindows(utilRoot.limits, nowMs);
+    windows.push(...scoped.windows);
+    return { windows, staleWindow: staleWindow || scoped.staleWindow };
 }
 
 function readClaudeQuotaMeta(payload, fallbackCode) {
@@ -182,7 +185,9 @@ function claudeQuotaNotice(meta, hasTrustedData, nowMs) {
         const reason = safeClaudeStatusCode(meta.lastErrorCode);
         const authReason = reason !== null && (reason === 'usage_http_401'
             || /^(?:auth_|credential_|credentials_|refresh_)/.test(reason));
-        if (reason && reason.startsWith('refresh_')) {
+        if (reason === 'usage_http_403') {
+            head = '额度查询冷却中；上次额度读取被拒（403），不代表模型登录失效';
+        } else if (reason && reason.startsWith('refresh_')) {
             head = `额度查询冷却中；上次认证刷新失败（${reason}），不代表当前认证状态`;
         } else if (authReason) {
             head = '额度查询冷却中；认证待官方 CLI 更新';
@@ -191,9 +196,11 @@ function claudeQuotaNotice(meta, hasTrustedData, nowMs) {
         }
     } else if (typeof meta.errorCode === 'string' && meta.errorCode.startsWith('refresh_')) {
         head = `上次认证刷新失败（${meta.errorCode}），不代表当前认证状态`;
+    } else if (meta.errorCode === 'usage_http_403') {
+        head = '额度读取被拒（403）；需核验普通登录的 user:profile 权限，不代表模型登录失效';
     } else if (meta.errorStage === 'auth' || meta.errorCode === 'auth_required'
         || meta.errorCode === 'usage_http_401' || meta.errorCode === 'credentials_untrusted') {
-        head = '等待官方 CLI 更新认证';
+        head = '额度查询等待官方普通登录更新认证（user:profile）；不代表长期模型令牌失效';
     } else if (meta.errorCode === 'quota_cli_active') {
         head = 'Claude CLI 正在运行，额度查询暂缓';
     } else if (meta.errorCode === 'quota_service_busy') {
@@ -1553,7 +1560,7 @@ function createUsageMonitorService(options = {}) {
                     end: periodRange.end,
                     timeZone: periodRange.timeZone
                 },
-                accounts: accounts.map(account => refreshClaudeStatusCard(account, nowMs)),
+                accounts: accounts.map(account => withFableNotice(refreshClaudeStatusCard(account, nowMs))),
                 activity
             };
         }

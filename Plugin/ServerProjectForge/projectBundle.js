@@ -6,6 +6,8 @@ const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 const Availability = require('./projectAvailability');
 const Writer = require('./projectWriteGate');
+const Lifecycle = require('./delegationLifecycle');
+const Review = require('./delegationReviewRecord');
 const { metadataHash } = Availability;
 
 const FORMAT = 'projectforge-records';
@@ -25,6 +27,7 @@ const COLUMNS = {
     capture_files: 'capture_id file_path before_hash',
     files: 'file_path hash',
     blobs: 'hash size base64',
+    meta: 'key value',
 };
 const HASH = /^[0-9a-f]{64}$/;
 const TODO_STATES = new Set(['pending', 'doing', 'done', 'blocked']);
@@ -175,6 +178,97 @@ function diskHash(root, relative, limits) {
     } finally { fs.closeSync(fd); }
 }
 
+// Only project-scoped history is portable. Leases, writer bindings and host
+// capabilities are never selected. JSON guards also avoid parsing unrelated meta.
+function delegationRows(db, projectId, limit, includeImports = false) {
+    return db.prepare(`SELECT key,value FROM meta WHERE
+        (key GLOB 'aa_delegation:*' OR key GLOB 'aa_delegation_review:*'
+            ${includeImports ? "OR key GLOB 'aa_delegation_import:*'" : ''})
+        AND CASE WHEN json_valid(value) THEN coalesce(
+            json_extract(value,'$.projectId'),json_extract(value,'$[0].projectId'),
+            json_extract(value,'$.current.projectId'),json_extract(value,'$.history[0].projectId')) END=?
+        ORDER BY key LIMIT ?`).all(projectId, limit);
+}
+function delegationHash(db, projectId) {
+    return digest(Buffer.from(JSON.stringify(delegationRows(db, projectId, DEFAULT_LIMITS.maxRows + 1, true))));
+}
+function validateDelegations(data, todos) {
+    const runtime = new Map(), entries = indexRows(data.meta, 'key');
+    for (const row of data.meta) {
+        text(row.key, { empty: false });
+        check(/^(?:aa_delegation|aa_delegation_review):aa-delegation-\d{10,16}-[a-f0-9]{8}$/.test(row.key),
+            'INVALID_BUNDLE', 'Only delegation history metadata is portable');
+        if (!row.key.startsWith('aa_delegation:')) continue;
+        const d = row.value;
+        check(Lifecycle.validData(d), 'INVALID_BUNDLE', 'Invalid delegation runtime metadata');
+        reference(d.todoId, todos, { nullable: false });
+        check(d.projectId === data.project.id && todos.get(d.todoId).seq === d.todoSeq &&
+            row.key === 'aa_delegation:' + d.delegationId, 'INVALID_BUNDLE', 'Delegation target mismatch');
+        runtime.set(d.delegationId, d);
+    }
+    for (const row of data.meta) {
+        if (!row.key.startsWith('aa_delegation_review:')) continue;
+        const id = row.key.slice('aa_delegation_review:'.length), d = runtime.get(id);
+        check(d, 'DANGLING_REFERENCE', 'Review has no runtime binding');
+        const list = Review.reviewList(row.value), requests = new Set();
+        check(Array.isArray(list) && list.length > 0 && list.length <= 64,
+            'INVALID_BUNDLE', 'Invalid review history');
+        for (const [i, r] of list.entries()) {
+            check(Review.validReview(r, { data: d }) && r.revision === i + 1 && !requests.has(r.requestId),
+                'INVALID_BUNDLE', 'Invalid or mismatched review revision');
+            requests.add(r.requestId);
+        }
+    }
+    for (const row of data.todos) {
+        const parsed = Lifecycle.readNote(row.note);
+        if (!parsed.data) continue;
+        const d = parsed.data;
+        check(d.projectId === data.project.id && d.todoId === row.id && d.todoSeq === row.seq,
+            'INVALID_BUNDLE', 'Todo delegation block points to a different row');
+        const saved = entries.get('aa_delegation:' + d.delegationId);
+        check(!saved || JSON.stringify(saved.value) === JSON.stringify(d),
+            'INVALID_BUNDLE', 'Todo delegation block and metadata disagree');
+    }
+}
+function insertDelegations(db, data, maps, projectId, sha256) {
+    const remap = d => ({ ...d, projectId, todoId: maps.todos.get(d.todoId) });
+    const marks = new Map();
+    const update = db.prepare('UPDATE todos SET note=? WHERE id=? AND project_id=?');
+    for (const row of data.todos) {
+        const parsed = Lifecycle.readNote(row.note);
+        if (!parsed.data) continue;
+        const d = remap(parsed.data);
+        update.run(Lifecycle.noteOf(d, parsed.original), d.todoId, projectId);
+        marks.set(d.delegationId, d);
+    }
+    const insert = db.prepare('INSERT INTO meta(key,value) VALUES(?,?)');
+    for (const row of data.meta) {
+        let value;
+        if (row.key.startsWith('aa_delegation:')) {
+            value = remap(row.value);
+            marks.set(value.delegationId, value);
+        } else if (Array.isArray(row.value)) value = row.value.map(remap);
+        else value = { current: remap(row.value.current), history: row.value.history.map(remap) };
+        insert.run(row.key, JSON.stringify(value));
+    }
+    for (const [id, d] of marks) {
+        // History remains byte-semantic execution history, not a resumable worker.
+        // Even a legacy bundle without authoritative meta gets a local quarantine.
+        insert.run('aa_delegation_import:' + id, JSON.stringify({
+            projectId, todoId: d.todoId, sourceProjectId: data.project.id, bundleHash: sha256,
+        }));
+    }
+}
+function assertDelegationIdsFree(db, data) {
+    const ids = new Set(data.meta.map(row => row.key.slice(row.key.indexOf(':') + 1)));
+    for (const row of data.todos) {
+        const d = Lifecycle.readNote(row.note).data;
+        if (d) ids.add(d.delegationId);
+    }
+    const occupied = db.prepare('SELECT 1 FROM meta WHERE key IN (?,?,?) LIMIT 1');
+    for (const id of ids) check(!occupied.get('aa_delegation:' + id, 'aa_delegation_review:' + id,
+        'aa_delegation_import:' + id), 'DELEGATION_CONFLICT', 'Delegation ID already belongs to this receiving store');
+}
 function decode(bytes, { expectedHash, limits: overrides } = {}) {
     const limits = limitsOf(overrides);
     check(Buffer.isBuffer(bytes) && bytes.length <= limits.maxBundleBytes,
@@ -193,8 +287,9 @@ function decode(bytes, { expectedHash, limits: overrides } = {}) {
         if (error instanceof BundleError) throw error;
         fail('INVALID_BUNDLE', 'Invalid bundle JSON');
     }
+    if (data && typeof data === 'object' && !Array.isArray(data) && !Object.hasOwn(data, 'meta')) data.meta = [];
     keys(data, ['format', 'version', 'schema', 'project', 'todos', 'batches', 'nodes',
-        'captures', 'capture_files', 'files', 'blobs']);
+        'captures', 'capture_files', 'files', 'blobs', 'meta']);
     check(data.format === FORMAT && data.version === VERSION && data.schema === 3,
         'SCHEMA_VERSION', 'Unsupported bundle version');
     shape(data.project, 'project');
@@ -204,7 +299,7 @@ function decode(bytes, { expectedHash, limits: overrides } = {}) {
     for (const key of ['report', 'created_by', 'deleted_by', 'report_by']) text(data.project[key], { nullable: true });
     for (const key of ['created_at', 'updated_at']) text(data.project[key], { empty: false });
     let rowCount = 0;
-    for (const table of ['todos', 'batches', 'nodes', 'captures', 'capture_files', 'files', 'blobs']) {
+    for (const table of ['todos', 'batches', 'nodes', 'captures', 'capture_files', 'files', 'blobs', 'meta']) {
         check(Array.isArray(data[table]), 'INVALID_BUNDLE', 'Missing record array');
         rowCount += data[table].length;
         check(rowCount <= limits.maxRows, 'LIMIT_EXCEEDED', 'Record count bound exceeded');
@@ -221,6 +316,7 @@ function decode(bytes, { expectedHash, limits: overrides } = {}) {
         check(TODO_STATES.has(row.status), 'INVALID_BUNDLE', 'Invalid Todo status');
     }
     const todos = indexRows(data.todos);
+    validateDelegations(data, todos);
     for (const row of data.batches) {
         number(row.id, 1);
         check(BATCH_KINDS.has(row.kind), 'INVALID_BUNDLE', 'Unknown batch kind');
@@ -351,7 +447,10 @@ function exportProjectBundle(store, projectId, { limits: overrides } = {}) {
         }
         for (const [file, state] of captureOnly) files.set(file, { file_path: file, hash: state.hash });
         data.files = [...files.values()].sort((a, b) => a.file_path < b.file_path ? -1 : a.file_path > b.file_path ? 1 : 0);
-        const rowCount = ['todos', 'batches', 'nodes', 'captures', 'capture_files', 'files']
+        data.meta = delegationRows(db, projectId, limits.maxRows + 1).map(row => ({
+            key: row.key, value: JSON.parse(row.value),
+        }));
+        const rowCount = ['todos', 'batches', 'nodes', 'captures', 'capture_files', 'files', 'meta']
             .reduce((sum, table) => sum + data[table].length, 0);
         check(rowCount <= limits.maxRows, 'LIMIT_EXCEEDED', 'Record count bound exceeded');
         const needed = new Set();
@@ -452,6 +551,7 @@ function assertImportDestination(db, root) {
 function insertImportedProject(store, decoded, target, availability = 'ready') {
     const { data, buffers, limits } = decoded;
     const db = store.db;
+    assertDelegationIdsFree(db, data);
     for (const [id, buffer] of buffers) {
         const existing = db.prepare('SELECT 1 FROM blobs WHERE hash=?').get(id);
         if (existing) check(readBlob(db, id, limits).equals(buffer), 'CORRUPT_BLOB', 'Destination snapshot mismatch');
@@ -475,6 +575,7 @@ function insertImportedProject(store, decoded, target, availability = 'ready') {
         }
     };
     insertNumeric('todos', data.todos);
+    insertDelegations(db, data, maps, projectId, decoded.sha256);
     insertNumeric('batches', [...data.batches].sort((a, b) => a.id - b.id));
     const mapped = (map, id) => id === null ? null : map.get(id);
     insertNumeric('nodes', data.nodes.map(row => ({
@@ -499,6 +600,8 @@ function insertImportedProject(store, decoded, target, availability = 'ready') {
     return {
         projectId, sourceProjectId: data.project.id, sha256: decoded.sha256,
         requiresMaterialization: true,
+        delegationMetadataHash: delegationHash(db, projectId),
+        currentWorktreeVerified: false,
         idMap: Object.fromEntries(Object.entries(maps).map(([key, map]) => [key, Object.fromEntries(map)])),
     };
 }
@@ -559,6 +662,9 @@ function assertReceipt(row, decoded, target, publication) {
 function assertImportedState(db, row, decoded) {
     check(row.state !== 'purged', 'IMPORT_PURGED', 'Import was purged; request identity is retained');
     check(metadataHash(db, row.project_id) === row.metadata_hash, 'IMPORT_DRIFT', 'Imported metadata changed');
+    const delegationDigest = JSON.parse(row.result_json).delegationMetadataHash;
+    check(!delegationDigest || delegationHash(db, row.project_id) === delegationDigest,
+        'IMPORT_DRIFT', 'Imported delegation history changed');
     const project = db.prepare('SELECT availability,deleted_at,deleted_by FROM projects WHERE id=?').get(row.project_id);
     check(project.deleted_at === null && project.deleted_by === row.source_deleted_by,
         'IMPORT_DRIFT', 'Imported deletion state changed');

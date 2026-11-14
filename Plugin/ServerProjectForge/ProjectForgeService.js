@@ -713,9 +713,14 @@ async function recordDelegationReview(args) {
 async function getDelegationReviews(args) {
     const { project } = projectOf(args);
     const target = reviewTarget(args);
-    const reviews = require('./delegationReview').history(store(), target);
-    return textResult(`## 独立核验历史 · ${project.id} #${target.todoSeq}\n${JSON.stringify(reviews, null, 2)}`,
-        { command: 'GetDelegationReviews', projectId: project.id, reviews });
+    const R = require('./delegationReview');
+    const reviews = R.history(store(), target);
+    const changes = R.relatedChanges(store(), target);
+    return textResult(`## 独立核验历史 · ${project.id} #${target.todoSeq}\n${JSON.stringify(reviews, null, 2)}\n`
+        + `- 关联改动：${changes.batches.length} 批次 / ${changes.nodes.length} 节点${changes.truncated ? '（已截断至1000节点）' : ''}。\n`
+        + '- 按真实Todo行ID及执行角色检索，不是精确委托归属证明；历史通过不代表当前工作树已重测。\n'
+        + JSON.stringify({ batches: changes.batches, nodes: changes.nodes }),
+        { command: 'GetDelegationReviews', projectId: project.id, reviews, current: reviews.at(-1) || null, ...changes });
 }
 async function updateTodos(args) {
     const { project } = projectOf(args);

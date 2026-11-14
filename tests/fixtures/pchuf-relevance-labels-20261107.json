@@ -1,0 +1,176 @@
+{
+  "schema": "pchuf-relevance-labels-v1",
+  "annotator": "赞妮",
+  "annotationStatus": "single_agent_provisional_not_blind",
+  "scope": "当前问题的第一轮方案判断；不是实施过程中所有潜在用途",
+  "reportSha256": "ba49b9d4b6e60d0d5697d63189c47872deb247aa113f3f9d7bc77c8000d9ee26",
+  "sourceSha256": "29c8974571e878a9e9e3a9483ceca6e1147f12d8de1012f66c2d885805d21037",
+  "categories": {
+    "D": "直接提供所问对象、架构或机制的证据",
+    "B": "影响方案选择或纠正状态的必要背景",
+    "T": "有关联但不是回答当前问题所必需的可选背景",
+    "N": "对当前问题缺少具体帮助；不代表该记录无永久价值",
+    "W": "名称相似但方向或对象不同，直接用作当前方案会误导"
+  },
+  "originalCases": {
+    "short-question": {
+      "query": "我们能不能像类似于claude bridge",
+      "interpretation": "不完整问句；仅探索性标注为恢复既有ClaudeBridge背景，不借用后续Antigravity意图",
+      "scored": true
+    },
+    "full-question": {
+      "query": "我们能不能像类似于claude bridge一样，做一个antigravity bridge？",
+      "interpretation": "需要恢复既有桥接的架构与约束，并判断能否类比；配额接通不能证明推理桥可行",
+      "scored": true
+    }
+  },
+  "candidates": [
+    {
+      "id": 311,
+      "sha256": "35719e95e7c92a3d61d31973bbb683667554de12b44b680e2ee0a6626cec2925",
+      "labels": {"short-question": "N", "full-question": "N"},
+      "reason": "GravityStub上下文折叠设计，不能说明ClaudeBridge或Antigravity入口；旧完成声明不能当当前部署事实",
+      "freshness": "historical_status_not_reverified"
+    },
+    {
+      "id": 519,
+      "sha256": "e829eeee587b7693a9c55a7823c8bac0957adc3abc356303488142ef41a9ba3a",
+      "labels": {"short-question": "N", "full-question": "N"},
+      "reason": "工具示例误触发的通用纪律，不回答两种桥接的架构和可行性；实施协议时可能有用",
+      "freshness": "not_reverified"
+    },
+    {
+      "id": 897,
+      "sha256": "7150b585d3b49727294f2b2ea228ecb417fa9765d6253e0e0db68a6d1e1d5168",
+      "labels": {"short-question": "D", "full-question": "D"},
+      "reason": "给出现有VCP经NewAPI、本机桥、SSH到远端CLI的方向及真实工具回填经验；完整问题融合池没有这条，末端过滤无法补回",
+      "freshness": "historical_architecture_current_process_state_not_reverified"
+    },
+    {
+      "id": 908,
+      "sha256": "07a449292e1afd9e0d1476d695eb04841f71fc29e6320c11cbb78b2e1da202e5",
+      "labels": {"short-question": "W", "full-question": "W"},
+      "reason": "讲CLI经VCPBridgeServer访问上游的相反方向，不是VCP调用订阅CLI；其中Codex唯一路径结论只属旧时点，不作为当前选型依据",
+      "freshness": "direction_mismatch_and_historical_exclusivity_claim"
+    },
+    {
+      "id": 921,
+      "sha256": "59226512777a74dca6cf83dc2b7aee58e343751e164d92e4df9ad2423ae6da64",
+      "labels": {"short-question": "N", "full-question": "N"},
+      "reason": "AICodeWorker工具箱与Lucy调度规则整理，不提供当前所问桥接实现依据",
+      "freshness": "not_reverified"
+    },
+    {
+      "id": 975,
+      "sha256": "c49f4fcf8bafbd628f3d11cbbdae33161108a63c5a4455fa9a96b94b9131d328",
+      "labels": {"short-question": "T", "full-question": "T"},
+      "reason": "同一ClaudeBridge的模型和effort路由经验，初步可行性判断并不需要整篇模型矩阵",
+      "freshness": "version_specific_flags_not_transferable_to_antigravity"
+    },
+    {
+      "id": 981,
+      "sha256": "b69777fd3fcef4647e982fbc5dd15839ad9982cd4ce4365f94c41fdc50ad9f6a",
+      "labels": {"short-question": "B", "full-question": "B"},
+      "reason": "记录选择交互PTY而非headless的历史动机及流式路线；不能把旧等待参数或其订阅风险推断当当前正确配置或官方保证",
+      "freshness": "historical_rationale_only_old_timings_require_current_verification"
+    },
+    {
+      "id": 1081,
+      "sha256": "0b8db314d1fc5fb182ed0c6e4f8338fa02e4242ce0f6aaa44c18aa9a85ba4148",
+      "labels": {"short-question": "N", "full-question": "T"},
+      "reason": "提供Antigravity配额监控背景，但额度管理API不是模型推理接口，不能据此证明Bridge可行",
+      "freshness": "historical_quota_values_not_current"
+    },
+    {
+      "id": 1191,
+      "sha256": "039cc43e5b469815137d200e20bcfca8dd108ad1e65a4a0014509efcd21bf662",
+      "labels": {"short-question": "T", "full-question": "B"},
+      "reason": "用户曾要求先核验最小外部协议假设并停止无功能交付的扩建；对是否复用旧桥路线有约束价值，不能当永久冻结全部后续图片任务",
+      "freshness": "process_preference_relevant_freeze_status_historical"
+    },
+    {
+      "id": 1236,
+      "sha256": "ba4ee1fe7c40cf9b76fa6060d16446c522d435326a397b592ca05771e30a297d",
+      "labels": {"short-question": "N", "full-question": "N"},
+      "reason": "旧图片实验答案诊断脚本与当时授权状态，不是当前文本桥方案判断所需",
+      "freshness": "intermediate_image_experiment_not_current_authorization"
+    },
+    {
+      "id": 1237,
+      "sha256": "a2ae1ace58c7c0f307bcf75b88b92c94dc6bfb6fadde4815a58fa2df1efd9546",
+      "labels": {"short-question": "N", "full-question": "N"},
+      "reason": "旧单图JSON失败和清理记录；与当前文本桥可行性关系弱，与1236属同一支线但不是完全重复",
+      "freshness": "intermediate_image_experiment_not_current_status"
+    },
+    {
+      "id": 1242,
+      "sha256": "ce3f6e8486c4898a291ebf6b862d6b93bad657cec67842c56e5d0e88a03c2b71",
+      "labels": {"short-question": "D", "full-question": "D"},
+      "reason": "直接说明PTY、system prompt、关闭原生工具及VCP文本工具循环分层；末尾未实施状态需与1243后续部署记录区别",
+      "freshness": "configuration_observed_then_unimplemented_advice_superseded_by_1243"
+    },
+    {
+      "id": 1243,
+      "sha256": "fb3e2516cc9f87d70dd81df22878bc572e5438cbadb0e8b44510863846fce70c",
+      "labels": {"short-question": "B", "full-question": "B"},
+      "reason": "补足1242之后已部署回合边界提示词的状态与验收边界，避免把旧建议当仍待实施；敏感标记行被屏蔽",
+      "freshness": "later_resolution_of_1242_not_current_runtime_probe"
+    },
+    {
+      "id": 1405,
+      "sha256": "7bc9fb777ec223647116f29f8f09d90ab4aecf29b02c625b8786a40101ff7885",
+      "labels": {"short-question": "N", "full-question": "N"},
+      "reason": "DeepSeek研究原型与Forge委托可靠性审计，含通用纪律但不回答两种桥接的接口和架构",
+      "freshness": "not_reverified"
+    }
+  ],
+  "relations": [
+    {"from": 1243, "to": 1242, "type": "resolves_proposed_change_not_duplicate"},
+    {"from": 1237, "to": 1236, "type": "same_image_branch_followup_not_exact_duplicate"}
+  ],
+  "unscoredControls": [
+    {
+      "id": "quota-positive",
+      "query": "Antigravity的Claude和Gemini四个额度窗口分别通过什么接口获取？",
+      "positiveIds": [1081],
+      "purpose": "同一条记录在配额问题上有直接价值，禁止按全局文件黑名单处理",
+      "status": "labels_only_no_retrieval_or_reranker_evaluation"
+    },
+    {
+      "id": "turn-boundary-positive",
+      "query": "ClaudeBridge为什么提问后继续跑工具？后来是否补过提示词约束？",
+      "positiveIds": [1242, 1243],
+      "purpose": "因果诊断与后续解决状态同时需要，不能当完全重复丢弃",
+      "status": "labels_only_no_retrieval_or_reranker_evaluation"
+    },
+    {
+      "id": "reverse-bridge-positive",
+      "query": "以前核查的VCPBridgeServer在chat响应侧是否透传？",
+      "positiveIds": [908],
+      "purpose": "对象方向正确时旧记录可作历史证据，不代表其全部结论仍然适用",
+      "status": "labels_only_no_retrieval_or_reranker_evaluation"
+    },
+    {
+      "id": "cooking-negative",
+      "query": "番茄炒蛋怎么做？",
+      "positiveIds": [],
+      "purpose": "本固定14条集合无必要烹饪证据，不能强制保留冠军",
+      "status": "labels_only_no_retrieval_or_reranker_evaluation"
+    },
+    {
+      "id": "gameplay-negative",
+      "query": "Unity角色跳跃如何实现输入缓冲和土狼时间？",
+      "positiveIds": [],
+      "purpose": "本固定14条集合无必要游戏实现证据，不能以泛工程相关放行",
+      "status": "labels_only_no_retrieval_or_reranker_evaluation"
+    }
+  ],
+  "limitations": [
+    "主控已看过目标和排序，存在事后与确认偏差；不是人工金标、盲标或独立双标",
+    "只标注保存的候选chunk，不声称完整知识库召回率或全文状态链完备",
+    "新对照只有标签和预期，无其查询向量、Choice或独立相关性分数；禁止移用原查询分数",
+    "候选正文仅经脱敏阅读，不写入本夹具；哈希和长度基于原始快照文本",
+    "按D+B为严格有用集合，同时用D+B+T检查分类敏感性",
+    "人工挑选集合只作标注参考，不是可部署过滤算法"
+  ]
+}

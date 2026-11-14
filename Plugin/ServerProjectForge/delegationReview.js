@@ -23,7 +23,7 @@ function saved(store, args) {
     const row = store.db.prepare('SELECT value FROM meta WHERE key=?').get(PREFIX + args.delegationId);
     if (!row) return [];
     try {
-        const list = JSON.parse(row.value), runtime = { data: state(store, args.delegationId) };
+        const list = C.reviewList(JSON.parse(row.value)), runtime = { data: state(store, args.delegationId) };
         check(Array.isArray(list) && list.length > 0 && list.length <= MAX_REVISIONS, 'REVIEW_CORRUPT');
         const requests = new Set();
         for (const [i, r] of list.entries()) {
@@ -92,6 +92,43 @@ function record(store, args) {
         return { changed: true, review: clone(review) };
     }).immediate();
 }
+// A scoped discovery aid, not an immutable claim that every edit belongs to this
+// particular execution: the same role can work on a Todo more than once.
+function relatedChanges(store, args) {
+    target(args);
+    store.assertProjectAvailable(args.projectId);
+    check(store.getProject(args.projectId), 'REVIEW_TARGET');
+    const d = state(store, args.delegationId);
+    const base = { association: 'todoId+batch.maid=delegation.role (not exact execution attribution)',
+        currentWorktreeVerified: false, historicalImport: false, staleTarget: false,
+        batches: [], nodes: [], truncated: false };
+    if (!d) return base;
+    const L = require('./delegationLifecycle');
+    check(L.validData(d) && d.projectId === args.projectId && d.todoSeq === args.todoSeq, 'REVIEW_STALE');
+    base.historicalImport = L.imported(store, d);
+    const todo = store.getTodoBySeq(args.projectId, args.todoSeq);
+    if (!todo || todo.id !== d.todoId) return { ...base, staleTarget: true };
+    const rows = store.db.prepare(`SELECT n.*,b.maid,b.kind AS batch_kind,b.reason AS batch_reason,
+        b.summary AS batch_summary,b.created_at AS batch_created_at
+        FROM nodes n JOIN batches b ON b.id=n.batch_id AND b.project_id=n.project_id
+        WHERE n.project_id=? AND n.todo_id=?
+        AND lower(ltrim(trim(b.maid),'@'))=lower(ltrim(trim(?),'@'))
+        ORDER BY n.id LIMIT 1001`).all(d.projectId, d.todoId, d.role);
+    base.truncated = rows.length > 1000;
+    const batches = new Map();
+    for (const row of rows.slice(0, 1000)) {
+        if (!batches.has(row.batch_id)) batches.set(row.batch_id, {
+            batchId: row.batch_id, kind: row.batch_kind, maid: row.maid,
+            reason: row.batch_reason, summary: row.batch_summary, createdAt: row.batch_created_at, nodeIds: [],
+        });
+        batches.get(row.batch_id).nodeIds.push(row.id);
+        base.nodes.push({ nodeId: row.id, batchId: row.batch_id, todoId: row.todo_id,
+            filePath: row.file_path, op: row.op, maid: row.maid, beforeHash: row.before_hash,
+            afterHash: row.after_hash, reason: row.reason, summary: row.summary, createdAt: row.created_at });
+    }
+    base.batches = [...batches.values()];
+    return base;
+}
 function projectTodos(store, todos) {
     return todos.map(row => {
         // Even a stale row may contain a copied complete old projection. Never
@@ -111,4 +148,4 @@ function projectTodos(store, todos) {
         catch { return { ...row }; }
     });
 }
-module.exports = { record, history, projectTodos };
+module.exports = { record, history, relatedChanges, projectTodos };
