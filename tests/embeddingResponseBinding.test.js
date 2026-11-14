@@ -4,6 +4,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(require.resolve('../EmbeddingUtils.js'), 'utf8');
+const helperStart = source.indexOf('const DEFAULT_INFLIGHT_TIMEOUT_MS');
+const helperEnd = source.indexOf('const EMBEDDING_AUDIT_LOG_ENABLED', helperStart);
+assert(helperStart >= 0 && helperEnd > helperStart);
+const helpers = source.slice(helperStart, helperEnd);
 const start = source.indexOf('async function _sendBatch(');
 const end = source.indexOf('\nasync function getEmbeddingsBatch(', start);
 assert(start >= 0 && end > start);
@@ -15,7 +19,7 @@ assert(!body.includes("await import('node-fetch')"), 'network seam must be repla
 async function run(data) {
   let requests=0;
   const audited=[];
-  const send = vm.runInNewContext('('+body+'\n)', {
+  const send = vm.runInNewContext(helpers+'('+body+'\n)', {
     process:{env:{}},
     fixtureFetch: async()=>{
       requests++;
@@ -24,7 +28,7 @@ async function run(data) {
     _getEmbeddingModelCandidates:()=>['fixture-model'],
     _writeEmbeddingAuditLog:async texts=>audited.push(...texts),
     console:{log(){},warn(){},error(){}},
-    setTimeout
+    AbortSignal, setTimeout, clearTimeout
   });
   const result=await send(['alpha','beta','gamma'],
     {apiUrl:'http://fixture.invalid',apiKey:'fixture-only'},1);
@@ -86,10 +90,10 @@ async function runBatches(texts, responder) {
     _writeEmbeddingAuditLog:async()=>{},
     encoding:{encode:text=>({length:text==='oversize'?101:1})},
     safeMaxTokens:100,MAX_BATCH_ITEMS:3,DEFAULT_CONCURRENCY:2,
-    console:{log(){},warn(){},error(){}},setTimeout
+    console:{log(){},warn(){},error(){}},AbortSignal,setTimeout,clearTimeout
   };
   const batch=vm.runInNewContext(
-    body+'\n'+source.slice(batchStart,batchEnd)+'\ngetEmbeddingsBatch',context);
+    helpers+body+'\n'+source.slice(batchStart,batchEnd)+'\ngetEmbeddingsBatch',context);
   const vectors=await batch(texts,{apiUrl:'http://fixture.invalid',apiKey:'fixture-only'});
   return {vectors:JSON.parse(JSON.stringify(vectors)),calls,completed};
 }

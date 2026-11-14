@@ -1,5 +1,11 @@
 'use strict';
 
+const dayjs = require('dayjs');
+dayjs.extend(require('dayjs/plugin/utc'));
+dayjs.extend(require('dayjs/plugin/timezone'));
+
+const DEFAULT_TIMEZONE = process.env.DEFAULT_TIMEZONE || 'Asia/Shanghai';
+
 function formatResultPathLine(result) {
     const rawPath = result?.fullPath || result?.sourceFile || result?.path || '';
     if (!rawPath) return '';
@@ -19,7 +25,11 @@ function formatMemoryEntry(result, { prefix = '* ', text = null } = {}) {
 
 function buildRagBlock(innerContent, metadata) {
     const metadataString = JSON.stringify(metadata).replace(/-->/g, '--\\>');
-    return `<!-- VCP_RAG_BLOCK_START ${metadataString} -->${innerContent}<!-- VCP_RAG_BLOCK_END -->`;
+    const safeInnerContent = String(innerContent ?? '').replace(
+        /<!--\s*(VCP_RAG_BLOCK_(?:START|END))\b([\s\S]*?)-->/gi,
+        '<!-- $1$2--\\>'
+    );
+    return `<!-- VCP_RAG_BLOCK_START ${metadataString} -->${safeInnerContent}<!-- VCP_RAG_BLOCK_END -->`;
 }
 
 function formatStandardResults(searchResults, displayName, metadata) {
@@ -45,10 +55,7 @@ function formatStandardResults(searchResults, displayName, metadata) {
 
 function formatCombinedTimeAwareResults(results, timeRanges, dbName, metadata) {
     const displayName = dbName + '日记本';
-    const formatDate = (date) => {
-        const d = new Date(date);
-        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-    };
+    const formatDate = (date) => dayjs(date).tz(DEFAULT_TIMEZONE).format('YYYY-MM-DD');
 
     let innerContent = `\n[--- "${displayName}" 多时间感知检索结果 ---]\n`;
 

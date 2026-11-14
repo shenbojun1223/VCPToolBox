@@ -339,3 +339,5 @@ image/cpa-image-recovery-*/
 /Plugin/ServerProjectForge/bin/*/
 # Local native artifact archives; retain outside disposable build caches.
 /.vcp-native-archive/
+# Local SoVITS voice catalog (copied from VChat, not source)
+Plugin/MimoDubbing/presets.json

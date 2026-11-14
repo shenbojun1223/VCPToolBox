@@ -117,8 +117,16 @@ async function responseError(response, fields = {}, readOptions = {}) {
       requestId ||= safeRequestId(parsed?.request_id) || safeRequestId(parsed?.error?.request_id);
     } catch (_) { /* Never retain the raw body, parser message or stack. */ }
   }
-  return new UpstreamError({ ...fields, status: response.status,
+  const error = new UpstreamError({ ...fields, status: response.status,
     code: outcome === 'aborted' || readOptions.signal?.aborted ? 'aborted' : code, requestId });
+  // Preserve upstream's transient token-401 retry without cloning or retaining raw
+  // bodies. Only a complete bounded read may classify an otherwise unknown error.
+  // Explicit authentication/bridge errors and cancellation remain non-retryable.
+  Object.defineProperty(error, 'retryableTokenFailure', {
+    value: response.status === 401 && outcome === 'eof' &&
+      error.code === 'unknown' && /token/i.test(text)
+  });
+  return error;
 }
 
 async function assertResponseOk(response, fields, signal) {

@@ -5,6 +5,8 @@ const vcpInfoHandler = require('../vcpInfoHandler.js');
 const contextManager = require('./contextManager.js');
 const roleDivider = require('./roleDivider.js');
 const { projectToolBatchForUpstream } = require('./toolResultBatch.js');
+const { isolateNativeToolsForUpstream, isolateNativeToolRequestOptions } = require('./nativeToolIsolation.js');
+const { createHandoffGate } = require('./vcpLoop/handoffGate.js');
 const fs = require('fs').promises;
 const path = require('path');
 const http = require('http');
@@ -282,7 +284,7 @@ class ResponseReplayCache {
   }
 }
 
-function installResponseCacheRecorder(res, { cache, cacheKey, id, clientIp, streamMode, debugMode }) {
+function installResponseCacheRecorder(res, { cache, cacheKey, id, clientIp, streamMode, debugMode, shouldSkipCache = null }) {
   if (!cache?.enabled || !cacheKey || res.__vcpReplayCacheRecorderInstalled) {
     return () => {};
   }
@@ -316,6 +318,13 @@ function installResponseCacheRecorder(res, { cache, cacheKey, id, clientIp, stre
   const finalize = () => {
     if (finalized) return;
     finalized = true;
+
+    if (typeof shouldSkipCache === 'function' && shouldSkipCache()) {
+      if (debugMode) {
+        console.log(`[ResponseReplayCache] Skip caching aborted request key=${cacheKey}`);
+      }
+      return;
+    }
 
     const statusCode = res.statusCode || 200;
     if (statusCode >= 200 && statusCode < 500 && capturedChunks.length > 0) {
@@ -610,11 +619,12 @@ async function fetchWithRetry(
     // Only the actual fetch is in the network-error catch. HTTP failures and
     // observational callbacks must never be reclassified as network failures.
     try {
-      const attemptOptions = applyModelFallbackForAttempt(options, modelFallbackCandidates, i, debugMode);
+      const attemptOptions = isolateNativeToolRequestOptions(
+        applyModelFallbackForAttempt(options, modelFallbackCandidates, i, debugMode)
+      );
       attemptModel = readDispatchedModel(attemptOptions);
       try { onRequestSent?.(); } catch (_) { /* observational */ }
-      // `redirect` is only ever supplied by the opt-in single-attempt wrapper (which
-      // pins it to "error"); an ordinary request keeps node-fetch default behaviour.
+      // Only the opt-in single-attempt wrapper pins redirect to "error".
       response = await fetch(url, { ...attemptOptions, agent: getFetchAgent, signal: attemptController.signal, ...(redirect ? { redirect } : {}) });
     } catch (_) {
       failure = externalSignal?.aborted ? abortError({ phase, attempt: i + 1 })
@@ -640,7 +650,8 @@ async function fetchWithRetry(
       failure = await responseError(response, { phase, attempt: i + 1 }, { signal: externalSignal });
     }
     if (failure.name === 'AbortError') throw failure;
-    const retryable = failure.status === null || [500, 502, 503, 504, 429].includes(failure.status);
+    const retryable = failure.status === null || [500, 502, 503, 504, 429].includes(failure.status) ||
+      (failure.status === 401 && failure.retryableTokenFailure === true);
     if (failure.code === 'sensitive_words_detected' || isBridgeFailure(failure)
         || isClaudeBridgeModel(attemptModel) || !retryable || i === maxAttempts - 1) throw failure;
     if (debugMode) console.warn('[Fetch Retry]', safeErrorFields(failure));
@@ -960,6 +971,16 @@ class ChatCompletionHandler {
     }
 
     const abortController = new AbortController();
+    const handoffGate = createHandoffGate(abortController.signal);
+    requestPreprocessorConfig.signal = abortController.signal;
+
+    const throwIfRequestAborted = () => {
+      if (abortController.signal.aborted || activeRequests.get(id)?.aborted) {
+        const abortErr = new Error('Request aborted during preprocessing');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      }
+    };
 
     let clientDisconnectedAbortReason = null;
     let cleanupClientDisconnectListeners = () => {};
@@ -974,18 +995,27 @@ class ChatCompletionHandler {
         id,
         clientIp,
         streamMode: isOriginalRequestStreaming,
-        debugMode: DEBUG_MODE
+        debugMode: DEBUG_MODE,
+        shouldSkipCache: () => Boolean(
+          abortController.signal.aborted
+          || clientDisconnectedAbortReason
+          || activeRequests.get(id)?.aborted
+        )
       });
     }
 
     if (id) {
+      if (isOriginalRequestStreaming && !res.headersSent) {
+        res.setHeader('x-vcp-tool-loop-handoff', '1');
+      }
       activeRequests.set(id, {
         req,
         res,
         abortController,
         timestamp: Date.now(),
         aborted: false, // 修复 Bug #4: 添加中止标志
-        abortReason: null
+        abortReason: null,
+        handoffGate
       });
     }
 
@@ -1236,6 +1266,7 @@ class ChatCompletionHandler {
 
       // --- 统一处理所有变量替换 ---
       // 创建一个包含所有所需依赖的统一上下文
+      throwIfRequestAborted();
       const processingContext = {
         pluginManager,
         sourcePrivacyPolicy,
@@ -1244,6 +1275,7 @@ class ChatCompletionHandler {
         detectors: this.config.detectors,
         superDetectors: this.config.superDetectors,
         DEBUG_MODE,
+        signal: abortController.signal,
         messages: tavernProcessedMessages, // 将近期消息列表传递下去，用于支持上下文动态折叠 (Contextual Folding)
         // 静态/混合/分布式插件上报内容由 preprocessor_order.json 中的
         // $StaticPlaceholderInjection 虚拟阶段注入，避免动态网页文本在
@@ -1264,6 +1296,7 @@ class ChatCompletionHandler {
       // 如果使用 Promise.all 并发，多条消息可能同时展开同一个 agent，违反"只展开一个"的约束
       let processedMessages = [];
       for (const msg of tavernProcessedMessages) {
+        throwIfRequestAborted();
         const newMessage = JSON.parse(JSON.stringify(msg));
         if (newMessage.content && typeof newMessage.content === 'string') {
           newMessage.content = await messageProcessor.replaceAgentVariables(
@@ -1317,6 +1350,7 @@ class ChatCompletionHandler {
         : Array.from(pluginManager.messagePreprocessors.keys());
 
       for (const name of orderedPipeline) {
+        throwIfRequestAborted();
         if (name === 'VCPTavern') continue;
 
         if (name === STATIC_PLACEHOLDER_INJECTION_STAGE) {
@@ -1345,6 +1379,10 @@ class ChatCompletionHandler {
             requestPreprocessorConfig
           );
         } catch (pluginError) {
+          if (pluginError?.name === 'AbortError' || abortController.signal.aborted) {
+            throwIfRequestAborted();
+            throw pluginError;
+          }
           if (sourcePrivacyPolicy.enabled && name === 'OneRing') {
             sourcePrivacyPolicy.state.oneRing = 'failed';
             throw new SourcePrivacyProcessingError();
@@ -1458,7 +1496,7 @@ class ChatCompletionHandler {
 
       let budgetTokenCount;
       try {
-        budgetTokenCount = finalContextStore.setLastFinalContext(finalUpstreamBody, {
+        budgetTokenCount = finalContextStore.setLastFinalContext(isolateNativeToolsForUpstream(finalUpstreamBody), {
           requestId: req.body.requestId || null,
           messageId: req.body.messageId || null,
           clientIp,
@@ -1470,13 +1508,13 @@ class ChatCompletionHandler {
         console.warn('[FinalContextStore] Snapshot/count failed; continuing chat.');
       }
 
-      // Outbound-only copy: originalBody remains the unmodified input to tool
-      // loops/RAG. Check growth again on the next external request, not each loop.
+      // Outbound-only copy: preserve the unmodified tool-loop/RAG input.
       finalUpstreamBody.messages = appendBudgetNotice(
         finalUpstreamBody.messages, vcpchatExtensions, budgetTokenCount
       );
 
-      await writeDebugLog('LogOutputAfterProcessing', finalUpstreamBody);
+      throwIfRequestAborted();
+      await writeDebugLog('LogOutputAfterProcessing', isolateNativeToolsForUpstream(finalUpstreamBody));
 
       if (requestDiagnostic) requestDiagnostic.stage('preprocess_end');
 
@@ -1538,7 +1576,7 @@ class ChatCompletionHandler {
         res.status(upstreamStatus);
         firstAiAPIResponse.headers.forEach((value, name) => {
           if (
-            !['content-encoding', 'transfer-encoding', 'connection', 'content-length', 'keep-alive'].includes(
+            !['content-encoding', 'transfer-encoding', 'connection', 'content-length', 'keep-alive', 'x-vcp-tool-loop-handoff'].includes(
               name.toLowerCase(),
             )
           ) {
@@ -1552,8 +1590,13 @@ class ChatCompletionHandler {
         }
       }
 
+      if (isUpstreamStreaming && id && !res.headersSent) {
+        res.setHeader('x-vcp-tool-loop-handoff', '1');
+        res.flushHeaders?.();
+      }
       const context = {
         ...this.config,
+        handoffGate,
         toolExecutor: this.toolExecutor,
         ToolCallParser,
         abortController,
@@ -1622,6 +1665,7 @@ class ChatCompletionHandler {
     } finally {
       if (!interactionOutcomeAccepted) interactionCompletion?.fail();
       cleanupClientDisconnectListeners();
+      handoffGate.dispose();
 
       if (!res.writableEnded && !res.destroyed) {
         // 仍未结束的异常路径不应写入缓存；正常 finish 会自动 finalize。
@@ -1648,7 +1692,7 @@ class ChatCompletionHandler {
           // 无论如何都要删除 Map 条目以释放内存
           // 但使用 setImmediate 延迟删除，确保 interrupt 路由完成操作
           setImmediate(() => {
-            activeRequests.delete(id);
+            if (activeRequests.get(id)?.abortController === abortController) activeRequests.delete(id);
             if (DEBUG_MODE) console.log(`[ChatHandler Cleanup] Removed request ${id} from activeRequests.`);
           });
         }

@@ -4,10 +4,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(require.resolve('../EmbeddingUtils'), 'utf8');
+const helperStart = source.indexOf('const DEFAULT_INFLIGHT_TIMEOUT_MS');
+const helperEnd = source.indexOf('const EMBEDDING_AUDIT_LOG_ENABLED', helperStart);
+assert(helperStart >= 0 && helperEnd > helperStart);
+const helpers = source.slice(helperStart, helperEnd);
 const start = source.indexOf('async function _sendBatch(');
 const end = source.indexOf('\nfunction cosineSimilarity(', start);
 assert(start >= 0 && end > start);
-const body = source.slice(start, end).replace(
+const body = helpers + source.slice(start, end).replace(
   "const { default: fetch } = await import('node-fetch');",
   'const fetch = fixtureFetch;'
 );
@@ -32,6 +36,7 @@ async function run(texts, respond, observer, models=['primary']) {
     safeMaxTokens:100,MAX_BATCH_ITEMS:2,DEFAULT_CONCURRENCY:2,
     console:{log(){},warn(){},error(){}},
     // Fixture retries do not wait or contact any external endpoint.
+    AbortSignal, clearTimeout,
     setTimeout:fn=>{fn();return 0;}
   };
   const batch=vm.runInNewContext(body+'\ngetEmbeddingsBatch',context);

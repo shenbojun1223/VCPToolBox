@@ -1,4 +1,4 @@
-const { UpstreamError, assertResponseOk, throwIfAborted } = require('../upstreamErrors.js');
+const { UpstreamError, assertResponseOk, throwIfAborted, isClaudeBridgeModel } = require('../upstreamErrors.js');
 // modules/handlers/streamHandler.js
 const { StringDecoder } = require('string_decoder');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
@@ -74,6 +74,21 @@ class StreamHandler {
     );
     const reasoningTag = normalizeReasoningTag(reasoningToContentTag);
     const id = originalBody.requestId || originalBody.messageId;
+
+    const waitForHandoff = async () => {
+      console.log(`[Handoff] WAITING: requestId=${id}. 工具回执已发送；因 ready 暂缓下一轮上游 AI 请求，等待 Interrupt 或 cancel（最多2秒），尚未向 AI 派发。`);
+      try {
+        await this.context.handoffGate.wait();
+      } catch (error) {
+        if (error.name === 'AbortError') {
+          console.log(`[Handoff] STOPPED before dispatch: requestId=${id}. ready 等待期间收到中止信号，本轮工具结果未触发下一次上游 AI 请求。`);
+        }
+        throw error;
+      }
+      if (!abortController.signal.aborted && !res.writableEnded && !res.destroyed) {
+        console.log(`[Handoff] RESUMING: requestId=${id}. 预约已取消或等待超时，恢复下一轮上游 AI 请求派发。`);
+      }
+    };
 
     // Keep the client connection alive across the entire VCP request, including
     // tool execution and the wait for a continuation response from upstream.
@@ -203,7 +218,7 @@ class StreamHandler {
     };
 
     // 辅助函数：处理 AI 响应流 (优化版：直通转发 + 后台解析 + chunk 空闲超时保护)
-    const processAIResponseStreamHelper = async (aiResponse, isInitialCall) => {
+    const readAIResponseStream = async (aiResponse, isInitialCall) => {
       await assertResponseOk(aiResponse, { phase: isInitialCall ? 'initial' : 'tool_continuation' }, abortController.signal);
       return new Promise((resolve, reject) => {
         const decoder = new StringDecoder('utf8');
@@ -212,12 +227,14 @@ class StreamHandler {
         let sseLineBuffer = '';
         let streamAborted = false;
         let chunkIdleTimer = null;
-        const CHUNK_IDLE_TIMEOUT = 90000; // 90 秒无新 chunk 则判定上游流冻结
+        const configuredIdleTimeout = Number(process.env.STREAM_CHUNK_IDLE_TIMEOUT_MS);
+        const CHUNK_IDLE_TIMEOUT = Number.isFinite(configuredIdleTimeout) && configuredIdleTimeout > 0 ? configuredIdleTimeout : 90000; // 默认 90 秒（可通过 STREAM_CHUNK_IDLE_TIMEOUT_MS 配置）
         let message = { content: '', reasoning_content: '' };
         let clientReasoningBlockOpen = false;
         let clientReasoningEndsWithNewline = false;
 
         let finishReason = null;
+        let malformedFunctionCall = false;
         let sawDone = false;
         let invalidPayload = false;
         let streamError = null;
@@ -229,6 +246,8 @@ class StreamHandler {
           message,
           finishReason,
           streamError,
+          malformedFunctionCall,
+          streamAborted,
           completed: !outputGuard.halt && !streamAborted && !invalidPayload && aiResponse.ok &&
             collectedContentThisTurn.trim().length > 0 &&
             (finishReason === 'stop' || (!finishReason && sawDone))
@@ -237,6 +256,12 @@ class StreamHandler {
           if (parsedData?.error) {
             invalidPayload = true;
             streamError = parsedData.error;
+          }
+          const choice = parsedData?.choices?.[0];
+          if ([choice?.native_finish_reason, choice?.finish_reason]
+            .some(reason => typeof reason === 'string' && reason.toLowerCase() === 'malformed_function_call')) {
+            malformedFunctionCall = true;
+            invalidPayload = true;
           }
           const reason = parsedData?.choices?.[0]?.finish_reason;
           if (reason) finishReason = reason;
@@ -396,6 +421,8 @@ class StreamHandler {
               }
             }
 
+            // Failed terminal payloads must not end the frontend listener before recovery.
+            if (malformedFunctionCall) continue;
             // 转发时才将 reasoning 字段改写成标签化正文；内部处理仍使用原始 parsedData。
             if (!res.writableEnded && !res.destroyed) {
               try {
@@ -453,7 +480,7 @@ class StreamHandler {
               try {
                 if (isDoneLine) {
                   writeClientReasoningCloseChunk();
-                } else if (parsedData) {
+                } else if (parsedData && !malformedFunctionCall) {
                   const transformedData = reasoningToContentEnabled
                     ? transformParsedDataForClient(parsedData)
                     : JSON.parse(JSON.stringify(parsedData));
@@ -462,7 +489,7 @@ class StreamHandler {
                   }
                   res.write(`data: ${JSON.stringify(transformedData)}\n`);
                 } else {
-                  res.write(sseLineBuffer + '\n');
+                  if (!malformedFunctionCall) res.write(sseLineBuffer + '\n');
                 }
               } catch (e) { }
             }
@@ -489,6 +516,58 @@ class StreamHandler {
         if (abortController?.signal.aborted) { abortHandler(); return; }
         aiResponse.body.on('data', onData);
       });
+    };
+
+    // Recovery belongs to one upstream turn. Never replay guarded or bridge output.
+    const processAIResponseStreamHelper = async (aiResponse, isInitialCall) => {
+      let data = await readAIResponseStream(aiResponse, isInitialCall);
+      if (!data.malformedFunctionCall || data.halt) return data;
+      if (abortController.signal.aborted || data.streamAborted || res.writableEnded || res.destroyed) return data;
+
+      if (!data.content.trim() && !data.message.reasoning_content && !isClaudeBridgeModel(originalBody.model)) {
+        currentMessagesForLoop.push({
+          role: 'user',
+          content: '[系统提示]你的上一个回复在思维链里输出了call导致报错，不要在思维链里输出call啦，正常回复用户的回复吧！'
+        });
+        if (this.context.handoffGate?.isReady()) await waitForHandoff();
+        throwIfAborted(abortController.signal);
+        if (res.writableEnded || res.destroyed) return { ...data, content: '', executionText: '', completed: false };
+        // The request-wide heartbeat stays active; do not replay preprocessors.
+        const response = await fetchWithRetry(`${apiUrl}/v1/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+            ...openCodeGoSessionHeader,
+            Accept: 'text/event-stream'
+          },
+          body: JSON.stringify(projectToolBatchForUpstream({
+            ...originalBody, messages: currentMessagesForLoop, stream: true
+          })),
+          signal: abortController.signal
+        }, {
+          retries: 1, delay: apiRetryDelay, debugMode: DEBUG_MODE,
+          connectionTimeout: apiConnectionTimeoutMs, phase: 'tool_continuation'
+        });
+        await assertResponseOk(response, { phase: 'tool_continuation' }, abortController.signal);
+        if (res.writableEnded || res.destroyed) {
+          response.body?.destroy();
+          return { ...data, content: '', executionText: '', completed: false };
+        }
+        data = await readAIResponseStream(response, false);
+        if (!data.malformedFunctionCall) return data;
+      }
+
+      if (!abortController.signal.aborted && !res.writableEnded && !res.destroyed) {
+        res.write(`data: ${JSON.stringify({
+          object: 'chat.completion.chunk', model: originalBody.model,
+          choices: [{ index: 0, delta: {
+            content: '\n[ERROR] 上游生成失败：MALFORMED_FUNCTION_CALL。恢复未成功或已有输出；本轮工具未执行。\n'
+          }, finish_reason: null }]
+        })}\n\n`);
+      }
+      // Only the outer handler owns terminal output; failed text never reaches tools.
+      return { ...data, content: '', executionText: '', finishReason: null, completed: false };
     };
 
     // --- 初始 AI 调用 ---
@@ -641,6 +720,7 @@ class StreamHandler {
           } catch (e) { }
         }
 
+        if (this.context.handoffGate?.isReady()) await waitForHandoff();
         throwIfAborted(abortController.signal);
         if (res.writableEnded || res.destroyed) { rollKeeper.reset(); return; }
         const nextAiAPIResponse = await fetchWithRetry(
@@ -851,6 +931,10 @@ class StreamHandler {
         rollKeeper.reset();
         return;
       }
+
+      if (this.context.handoffGate?.isReady()) await waitForHandoff();
+      throwIfAborted(abortController.signal);
+      if (res.writableEnded || res.destroyed) { rollKeeper.reset(); return; }
 
       const nextAiAPIResponse = await fetchWithRetry(
         `${apiUrl}/v1/chat/completions`,

@@ -40,6 +40,7 @@ function hasReasoningOnlySignal(message, choice) {
     'reasoning_content',
     'reasoning',
     'reasoning_details',
+    'thought',
     'thoughts',
     'thinking',
     'reasoning_text'

@@ -27,6 +27,8 @@ function load(relative, mocks = {}, globals = {}) {
         'modules/sourcePrivacyPolicy.js',
         'modules/vcpLoop/historySanitizer.js',
         'modules/vcpLoop/modelOutputGuard.js',
+        'modules/nativeToolIsolation.js',
+        'modules/vcpLoop/handoffGate.js',
         'modules/toolResultBatch.js'
       ]);
       if (id.startsWith('./') || id.startsWith('../')) {
@@ -560,3 +562,93 @@ for (const status of [502, 504]) {
     success.body.destroy();
   });
 }
+
+function transientTokenResponse(text, status = 401) {
+  return {
+    status, ok: false, headers: { get: () => null },
+    body: Readable.from([Buffer.from(text)]),
+    clone() { assert.fail('retry classification must not clone a body'); },
+    text() { assert.fail('retry classification must use bounded readErrorBody'); }
+  };
+}
+
+for (const text of ['Invalid token: synthetic-private-token', JSON.stringify({
+  error: { message: 'Transient TOKEN issue: synthetic-private-token' }
+})]) {
+  test('bounded unknown token-401 can recover without consuming successful body', async () => {
+    let calls = 0;
+    const retries = [], success = response(200);
+    const fetch = fetcher(async () => ++calls === 1 ? transientTokenResponse(text) : success);
+    const result = await fetch('https://synthetic.invalid', { body: JSON.stringify({ model: 'hydrogen' }) }, {
+      retries: 3, delay: 0, onRetry: (_attempt, fields) => retries.push(fields)
+    });
+    assert.strictEqual(result, success);
+    assert.equal(calls, 2);
+    assert.equal(retries.length, 1);
+    assert.equal(retries[0].status, 401);
+    assert.equal(retries[0].code, 'unknown');
+    assert.doesNotMatch(JSON.stringify(retries), /synthetic-private-token/);
+    assert.equal(success.body.readableEnded, false);
+    success.body.destroy();
+  });
+}
+
+test('token-401 retries exhaust at configured bound without retaining private body', async () => {
+  let calls = 0, retries = 0;
+  const fetch = fetcher(async () => {
+    calls++;
+    return transientTokenResponse('Invalid token: synthetic-private-token');
+  });
+  await assert.rejects(fetch('https://synthetic.invalid', {}, {
+    retries: 2, delay: 0, onRetry() { retries++; }
+  }), error => {
+    assert.equal(error.status, 401);
+    assert.equal(error.attempt, 2);
+    assert.equal(error.retryableTokenFailure, true);
+    assert.equal(Object.keys(error).includes('retryableTokenFailure'), false);
+    assert.doesNotMatch(JSON.stringify(error), /synthetic-private-token/);
+    return true;
+  });
+  assert.equal(calls, 2);
+  assert.equal(retries, 1);
+});
+
+for (const [label, text, model] of [
+  ['ordinary 401', 'Unauthorized: synthetic-private-data', 'hydrogen'],
+  ['explicit invalid API key', JSON.stringify({ error: { code: 'invalid_api_key', message: 'Invalid token' } }), 'hydrogen'],
+  ['bridge error', JSON.stringify({ error: { type: 'bridge_error', code: 'busy', message: 'Invalid token' } }), 'hydrogen'],
+  ['ClaudeBridge model', 'Invalid token', 'claude-vcp-sonnet-high'],
+  ['oversized body', 'token' + 'x'.repeat(20000), 'hydrogen']
+]) {
+  test(label + ' never becomes a token-401 replay', async () => {
+    let calls = 0;
+    const fetch = fetcher(async () => { calls++; return transientTokenResponse(text); });
+    await assert.rejects(fetch('https://synthetic.invalid', {
+      body: JSON.stringify({ model })
+    }, { retries: 3, delay: 0, onRetry() { assert.fail('unexpected replay'); } }), {
+      status: 401, attempt: 1
+    });
+    assert.equal(calls, 1);
+  });
+}
+
+test('aborted token-401 classification preserves cancellation and does not replay', async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  let readStarted = false;
+  const body = new Readable({ read() {
+    if (readStarted) return;
+    readStarted = true;
+    this.push(Buffer.from('token'));
+    setImmediate(() => controller.abort());
+  } });
+  const fetch = fetcher(async () => {
+    calls++;
+    return { status: 401, ok: false, headers: { get: () => null }, body };
+  });
+  await assert.rejects(fetch('https://synthetic.invalid', { signal: controller.signal }, {
+    retries: 3, delay: 0, onRetry() { assert.fail('cancelled replay'); }
+  }), { name: 'AbortError', status: 401, attempt: 1 });
+  assert.equal(calls, 1);
+  assert.equal(body.destroyed, true);
+});

@@ -2,6 +2,8 @@
 const fsSync = require('fs');
 const fs = fsSync.promises;
 const path = require('path');
+const { resultPath } = require('./asyncResultStore');
+const { assertSafePath } = require('./safeFilePath');
 
 const warnedMissingVarTarKeys = new Set();
 let cachedExampleVarTarKeys = null;
@@ -240,7 +242,16 @@ function findLastRealUserMessage(messages, options = {}) {
     return { index: -1, rawContent: '', sanitizedContent: '' };
 }
 
+function throwIfContextAborted(context) {
+    if (context?.signal?.aborted) {
+        const abortErr = new Error('Message preprocessing aborted');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+    }
+}
+
 async function resolveAllVariables(text, model, role, context, processingStack = new Set()) {
+    throwIfContextAborted(context);
     if (text == null) return '';
     let processedText = String(text);
 
@@ -283,7 +294,7 @@ async function resolveAllVariables(text, model, role, context, processingStack =
                 if (processingStack.has(alias)) {
                     console.error(`[AgentManager] Circular dependency detected! Stack: [${[...processingStack].join(' -> ')} -> ${alias}]`);
                     const errorMessage = `[Error: Circular agent reference detected for '${alias}']`;
-                    processedText = processedText.replaceAll(`{{${alias}}}`, errorMessage).replaceAll(`{{agent:${alias}}}`, errorMessage);
+                    processedText = processedText.replaceAll(`{{${alias}}}`, () => errorMessage).replaceAll(`{{agent:${alias}}}`, () => errorMessage);
                     continue;
                 }
 
@@ -293,10 +304,9 @@ async function resolveAllVariables(text, model, role, context, processingStack =
                 const resolvedAgentContent = await resolveAllVariables(agentContent, model, role, context, processingStack);
                 processingStack.delete(alias);
 
-                // 替换两种可能的Agent占位符格式
-                processedText = processedText.replaceAll(`{{${alias}}}`, resolvedAgentContent);
-                processedText = processedText.replaceAll(`{{agent:${alias}}}`, resolvedAgentContent);
-
+                // 替换两种可能的Agent占位符格式（使用函数替换防止 $` / $$ 展开）
+                processedText = processedText.replaceAll(`{{${alias}}}`, () => resolvedAgentContent);
+                processedText = processedText.replaceAll(`{{agent:${alias}}}`, () => resolvedAgentContent);
                 // 标记此 Agent 已被展开，后续消息中的任何 Agent 占位符都将被忽略
                 context.expandedAgentName = alias;
             }
@@ -321,19 +331,24 @@ async function resolveAllVariables(text, model, role, context, processingStack =
                 if (processingStack.has(stackKey)) {
                     const errorMessage = `[Error: Circular toolbox reference detected for '${alias}']`;
                     processedText = processedText
-                        .replaceAll(`{{${alias}}}`, errorMessage)
-                        .replaceAll(`{{toolbox:${alias}}}`, errorMessage);
+                        .replaceAll(`{{${alias}}}`, () => errorMessage)
+                        .replaceAll(`{{toolbox:${alias}}}`, () => errorMessage);
                     continue;
                 }
 
+                throwIfContextAborted(context);
                 processingStack.add(stackKey);
-                const foldObj = await toolboxManager.getFoldObject(alias);
-                const expandedText = await resolveDynamicFoldProtocol(
-                    foldObj,
-                    context,
-                    `{{${alias}}}`
-                );
-                processingStack.delete(stackKey);
+                let expandedText;
+                try {
+                    const foldObj = await toolboxManager.getFoldObject(alias);
+                    expandedText = await resolveDynamicFoldProtocol(
+                        foldObj,
+                        context,
+                        `{{${alias}}}`
+                    );
+                } finally {
+                    processingStack.delete(stackKey);
+                }
 
                 processedText = replaceFirstAliasPlaceholder(processedText, alias, expandedText, 'toolbox');
 
@@ -506,7 +521,8 @@ async function resolveDynamicFoldProtocol(foldObj, context, placeholderKey) {
                 }
             }
 
-            return await ragPlugin.getSingleEmbeddingCached(text);
+            throwIfContextAborted(context);
+            return await ragPlugin.getSingleEmbeddingCached(text, { signal: context?.signal });
         };
 
         const [uVec, aVec] = await Promise.all([
@@ -527,13 +543,14 @@ async function resolveDynamicFoldProtocol(foldObj, context, placeholderKey) {
             if (vectorCache.has(key)) return vectorCache.get(key);
 
             let descVector = null;
+            throwIfContextAborted(context);
             if (ragPlugin.vectorDBManager && typeof ragPlugin.vectorDBManager.getPluginDescriptionVector === 'function') {
                 descVector = await ragPlugin.vectorDBManager.getPluginDescriptionVector(
                     key,
-                    ragPlugin.getSingleEmbeddingCached.bind(ragPlugin)
+                    descText => ragPlugin.getSingleEmbeddingCached(descText, { signal: context?.signal })
                 );
             } else {
-                descVector = await ragPlugin.getSingleEmbeddingCached(key);
+                descVector = await ragPlugin.getSingleEmbeddingCached(key, { signal: context?.signal });
             }
             vectorCache.set(key, descVector);
             return descVector;
@@ -659,6 +676,7 @@ async function resolveDynamicFoldProtocol(foldObj, context, placeholderKey) {
                         description: item.entry.description,
                         content: item.entry.content
                     })),
+                    signal: context?.signal,
                     debug: Boolean(context.DEBUG_MODE),
                     placeholderKey
                 });
@@ -680,6 +698,10 @@ async function resolveDynamicFoldProtocol(foldObj, context, placeholderKey) {
                     console.log(`[DynamicFold] ${placeholderKey} Jev 二次过滤未生效: ${decision.reason}`);
                 }
             } catch (e) {
+                if (e?.name === 'AbortError' || context?.signal?.aborted) {
+                    throwIfContextAborted(context);
+                    throw e;
+                }
                 droppedEntryIndices.clear();
                 if (context.DEBUG_MODE) {
                     console.log(`[DynamicFold] ${placeholderKey} Jev 二次过滤异常，保留 embedding 结果: ${e && e.message}`);
@@ -703,6 +725,10 @@ async function resolveDynamicFoldProtocol(foldObj, context, placeholderKey) {
 
         return combinedContent;
     } catch (e) {
+        if (e?.name === 'AbortError' || context?.signal?.aborted) {
+            throwIfContextAborted(context);
+            throw e;
+        }
         console.error(`[DynamicFold] 处理动态折叠时发生异常 (${placeholderKey}):`, e.message);
         return fallbackBlock.content;
     }
@@ -724,9 +750,8 @@ function applySingleDetectorRule(text, rule) {
         }
     }
 
-    return text.replaceAll(rule.detector, rule.output);
+    return text.replaceAll(rule.detector, () => rule.output);
 }
-
 function applyDetectorRules(text, role, context = {}) {
     const { detectors = [], superDetectors = [] } = context;
     if (text == null) return '';
@@ -903,11 +928,10 @@ async function replaceOtherVariables(text, model, role, context) {
                 }
             }
 
-            // 对当前文本中所有匹配的占位符进行替换
+            // 对当前文本中所有匹配的占位符进行替换（使用函数替换防止 $` / $$ 展开）
             const placeholderRegExp = new RegExp(placeholder.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'g');
-            processedText = processedText.replace(placeholderRegExp, replacementText);
+            processedText = processedText.replace(placeholderRegExp, () => replacementText);
         }
-
         // === {{SarPromptAll}} 批量模型匹配注入 ===
         if (processedText.includes('{{SarPromptAll}}')) {
             const allPrompts = sarPromptManager.getAllPrompts();
@@ -934,7 +958,7 @@ async function replaceOtherVariables(text, model, role, context) {
             }
 
             const sarAllText = matchedContents.join('\n');
-            processedText = processedText.replace(/\{\{SarPromptAll\}\}/g, sarAllText);
+            processedText = processedText.replace(/\{\{SarPromptAll\}\}/g, () => sarAllText);
         }
     }
 
@@ -948,13 +972,14 @@ async function replaceOtherVariables(text, model, role, context) {
                         const fileContent = await tvsManager.getContent(value);
                         // 检查内容是否表示错误
                         if (fileContent.startsWith('[变量文件') || fileContent.startsWith('[处理变量文件')) {
-                            processedText = processedText.replaceAll(placeholder, fileContent);
+                            processedText = processedText.replaceAll(placeholder, () => fileContent);
                         } else {
                             const resolvedContent = await replaceOtherVariables(fileContent, model, role, context);
-                            processedText = processedText.replaceAll(placeholder, resolvedContent);
+                            processedText = processedText.replaceAll(placeholder, () => resolvedContent);
                         }
                     } else {
-                        processedText = processedText.replaceAll(placeholder, value || `[未配置 ${envKey}]`);
+                        const fallbackVal = value || `[未配置 ${envKey}]`;
+                        processedText = processedText.replaceAll(placeholder, () => fallbackVal);
                     }
                 }
             }
@@ -1092,11 +1117,13 @@ async function replaceOtherVariables(text, model, role, context) {
         }
 
         if (process.env.PORT) {
-            processedText = processedText.replaceAll('{{Port}}', process.env.PORT);
+            const portVal = String(process.env.PORT);
+            processedText = processedText.replaceAll('{{Port}}', () => portVal);
         }
         const effectiveImageKey = pluginManager.getResolvedPluginConfigValue('ImageServer', 'Image_Key');
         if (processedText && typeof processedText === 'string' && effectiveImageKey) {
-            processedText = processedText.replaceAll('{{Image_Key}}', effectiveImageKey);
+            const keyVal = String(effectiveImageKey);
+            processedText = processedText.replaceAll('{{Image_Key}}', () => keyVal);
         } else if (processedText && typeof processedText === 'string' && processedText.includes('{{Image_Key}}')) {
             if (DEBUG_MODE) console.warn('[replaceOtherVariables] {{Image_Key}} placeholder found in text, but ImageServer plugin or its Image_Key is not resolved. Placeholder will not be replaced.');
         }
@@ -1119,8 +1146,9 @@ async function replaceOtherVariables(text, model, role, context) {
 
         promises.push(
             (async () => {
-                const resultFilePath = path.join(VCP_ASYNC_RESULTS_DIR, `${pluginName}-${requestId}.json`);
                 try {
+                    const resultFilePath = resultPath(VCP_ASYNC_RESULTS_DIR, pluginName, requestId);
+                    await assertSafePath(VCP_ASYNC_RESULTS_DIR, resultFilePath);
                     const fileContent = await fs.readFile(resultFilePath, 'utf-8');
                     const callbackData = JSON.parse(fileContent);
                     let replacementText = `[任务 ${pluginName} (ID: ${requestId}) 已完成]`;
@@ -1131,13 +1159,15 @@ async function replaceOtherVariables(text, model, role, context) {
                     } else if (callbackData && callbackData.status === 'Failed') {
                         replacementText = `任务 ${pluginName} (ID: ${requestId}) 处理失败。原因: ${callbackData.reason || JSON.stringify(callbackData.data || callbackData.error || callbackData)}`;
                     }
-                    tempAsyncProcessedText = tempAsyncProcessedText.replace(placeholder, replacementText);
+                    tempAsyncProcessedText = tempAsyncProcessedText.replace(placeholder, () => replacementText);
                 } catch (error) {
                     if (error.code === 'ENOENT') {
-                        tempAsyncProcessedText = tempAsyncProcessedText.replace(placeholder, `[任务 ${pluginName} (ID: ${requestId}) 结果待更新...]`);
+                        const pendingMsg = `[任务 ${pluginName} (ID: ${requestId}) 结果待更新...]`;
+                        tempAsyncProcessedText = tempAsyncProcessedText.replace(placeholder, () => pendingMsg);
                     } else {
                         console.error(`[replaceOtherVariables] Error processing async placeholder ${placeholder}:`, error);
-                        tempAsyncProcessedText = tempAsyncProcessedText.replace(placeholder, `[获取任务 ${pluginName} (ID: ${requestId}) 结果时出错]`);
+                        const errMsg = `[获取任务 ${pluginName} (ID: ${requestId}) 结果时出错]`;
+                        tempAsyncProcessedText = tempAsyncProcessedText.replace(placeholder, () => errMsg);
                     }
                 }
             })()
@@ -1170,9 +1200,10 @@ async function replacePriorityVariables(text, context, role) {
         const emojiName = emojiMatch[1];
         const emojiList = cachedEmojiLists.get(emojiName);
         const promptEmojiList = formatEmojiListForPrompt(emojiList);
+        const emojiReplacement = promptEmojiList || `[${emojiName}列表不可用]`;
         processedText = processedText.replaceAll(
             placeholder,
-            promptEmojiList || `[${emojiName}列表不可用]`
+            () => emojiReplacement
         );
     }
 
