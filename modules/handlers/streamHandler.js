@@ -2,7 +2,8 @@ const { UpstreamError, assertResponseOk, throwIfAborted, isClaudeBridgeModel } =
 // modules/handlers/streamHandler.js
 const { StringDecoder } = require('string_decoder');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
-const { ModelOutputGuard, NOTICE: modelProtocolNotice } = require('../vcpLoop/modelOutputGuard');
+const { ModelOutputGuard, inspectModelOutput, NOTICE: modelProtocolNotice } = require('../vcpLoop/modelOutputGuard');
+const { matchesNativeToolIsolation } = require('../nativeToolIsolation');
 const { formatToolResultBatch, projectToolBatchForUpstream } = require('../toolResultBatch.js');
 const {
   extractReasoningText,
@@ -123,7 +124,7 @@ class StreamHandler {
     let protocolHalt = null;
     let currentExecutionText = '';
 
-    const finalUpstreamFinishReason = () => validUpstreamTurns ? 'stop'
+    const finalUpstreamFinishReason = () => validUpstreamTurns ? (['tool_calls','function_call'].includes(lastUpstreamFinishReason) ? lastUpstreamFinishReason : 'stop')
       : (lastUpstreamFinishReason && lastUpstreamFinishReason !== 'stop' ? lastUpstreamFinishReason : null);
 
     const formatStreamUpstreamErrorNotice = (errObj) => {
@@ -219,7 +220,10 @@ class StreamHandler {
 
     // 辅助函数：处理 AI 响应流 (优化版：直通转发 + 后台解析 + chunk 空闲超时保护)
     const readAIResponseStream = async (aiResponse, isInitialCall) => {
-      await assertResponseOk(aiResponse, { phase: isInitialCall ? 'initial' : 'tool_continuation' }, abortController.signal);
+      // On a healthy response attach listeners in this turn: a peer can close immediately after its last frame.
+      if (!aiResponse.ok || abortController.signal.aborted) {
+        await assertResponseOk(aiResponse, { phase: isInitialCall ? 'initial' : 'tool_continuation' }, abortController.signal);
+      }
       return new Promise((resolve, reject) => {
         const decoder = new StringDecoder('utf8');
         let collectedContentThisTurn = '';
@@ -239,21 +243,18 @@ class StreamHandler {
         let invalidPayload = false;
         let streamError = null;
         let upstreamEnded = false;
+        let nativeKind = null, hasPayloadError = false, toolTailTimer = null, settled = false;
         const result = () => ({
-          content: collectedContentThisTurn,
-          executionText: outputGuard.executionText(),
-          halt: outputGuard.halt,
-          message,
-          finishReason,
-          streamError,
-          malformedFunctionCall,
-          streamAborted,
+          content: collectedContentThisTurn, executionText: outputGuard.executionText(), halt: outputGuard.halt,
+          message, finishReason: nativeKind && (!finishReason || finishReason === 'stop') ? nativeKind : finishReason,
+          streamError, malformedFunctionCall, streamAborted, hasPayloadError,
           completed: !outputGuard.halt && !streamAborted && !invalidPayload && aiResponse.ok &&
-            collectedContentThisTurn.trim().length > 0 &&
-            (finishReason === 'stop' || (!finishReason && sawDone))
+            ((collectedContentThisTurn.trim().length > 0 && (finishReason === 'stop' || (!finishReason && sawDone))) ||
+             (nativeKind && (['stop','tool_calls','function_call'].includes(finishReason) || (!finishReason && sawDone)))) === true
         });
         const observePayload = (parsedData) => {
           if (parsedData?.error) {
+            hasPayloadError = true;
             invalidPayload = true;
             streamError = parsedData.error;
           }
@@ -263,8 +264,21 @@ class StreamHandler {
             malformedFunctionCall = true;
             invalidPayload = true;
           }
-          const reason = parsedData?.choices?.[0]?.finish_reason;
-          if (reason) finishReason = reason;
+          const isolated = matchesNativeToolIsolation(originalBody?.model) || matchesNativeToolIsolation(parsedData?.model || originalBody?.model);
+          for (const item of parsedData?.choices || []) {
+            for (const field of [item.delta, item.message]) {
+              if (!field) continue;
+              if (isolated) { delete field.tool_calls; delete field.function_call; }
+              else if (item === choice) {
+                if (field.tool_calls?.length) nativeKind = 'tool_calls';
+                else if (field.function_call) nativeKind = 'function_call';
+              }
+            }
+            if (isolated) for (const key of ['finish_reason','native_finish_reason']) {
+              if (['tool_calls','function_call'].includes(item[key])) item[key] = null;
+            }
+          }
+          if (choice?.finish_reason) finishReason = choice.finish_reason;
         };
 
         const collectAndGuardPayload = (payload) => {
@@ -278,6 +292,13 @@ class StreamHandler {
           const clientPayload = JSON.parse(JSON.stringify(payload));
           if (clientPayload.choices?.[0]?.delta) {
             clientPayload.choices[0].delta.content = safeText;
+          }
+          if (visible || extractReasoningText(delta)) {
+            clearTimeout(toolTailTimer);
+            toolTailTimer = null;
+            if (!vcpToolUseForbidden && !outputGuard.halt && visible && message.content.trimEnd().endsWith('>>>')) {
+              toolTailTimer = setTimeout(() => takeTail(), 15000);
+            }
           }
           return clientPayload;
         };
@@ -358,6 +379,7 @@ class StreamHandler {
           if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
           chunkIdleTimer = setTimeout(() => {
             if (streamAborted) return;
+            if (takeTail()) return;
             console.warn(`[Stream IdleTimeout] No upstream chunk received for ${CHUNK_IDLE_TIMEOUT / 1000}s. Assuming stream stalled. Forcing end.`);
             failStream('upstream_timeout');
           }, CHUNK_IDLE_TIMEOUT);
@@ -365,6 +387,8 @@ class StreamHandler {
         resetChunkIdleTimer(); // 启动首次空闲计时
 
         const cleanupStream = () => {
+          settled = true;
+          clearTimeout(toolTailTimer);
           clearTimeout(chunkIdleTimer);
           abortController?.signal.removeEventListener('abort', abortHandler);
           aiResponse.body.removeListener('data', onData);
@@ -386,11 +410,39 @@ class StreamHandler {
           reject(new UpstreamError({ status: aiResponse.status, code,
             phase: isInitialCall ? 'initial' : 'tool_continuation' }));
         };
+        const takeTail = () => {
+          if (settled || streamAborted || hasPayloadError || outputGuard.halt || !aiResponse.ok ||
+              abortController.signal.aborted || res.destroyed || res.writableEnded || vcpToolUseForbidden ||
+              sseLineBuffer.trim() || decoder.lastNeed ||
+              (finishReason && !malformedFunctionCall && !['stop','tool_calls','function_call'].includes(finishReason))) return false;
+          if (!ToolCallParser.endsWithCompleteToolRequest?.(message.content)) return false;
+          const safe = inspectModelOutput(message.content);
+          if (safe.halt || !ToolCallParser.endsWithCompleteToolRequest?.(safe.executionText)) return false;
+          const tail = outputGuard.finish();
+          collectedContentThisTurn += tail;
+          try {
+            writeClientReasoningCloseChunk();
+            if (tail) res.write('data: ' + JSON.stringify({object:'chat.completion.chunk', model:originalBody.model,
+              choices:[{index:0,delta:{content:tail},finish_reason:null}]}) + '\n\n');
+          } catch {
+            failStream('aborted');
+            return true;
+          }
+          cleanupStream();
+          if (!aiResponse.body.destroyed) {
+            const ignore = () => {};
+            aiResponse.body.on('error', ignore);
+            aiResponse.body.once('close', () => aiResponse.body.removeListener('error', ignore));
+            aiResponse.body.destroy();
+          }
+          resolve({...result(), completed:true, malformedFunctionCall:false, finishReason:'stop'});
+          return true;
+        };
         const abortHandler = () => failStream('aborted');
         const onClose = () => {
-          if (!aiResponse.body.readableEnded && !streamAborted) failStream('stream_error');
+          if (!aiResponse.body.readableEnded && !streamAborted && !takeTail()) failStream('stream_error');
         };
-        const onError = () => failStream(abortController?.signal.aborted ? 'aborted' : 'stream_error');
+        const onError = () => { if (!takeTail()) failStream(abortController.signal.aborted ? 'aborted' : 'stream_error'); };
 
         const onData = chunk => {
           if (streamAborted) return;
@@ -417,7 +469,7 @@ class StreamHandler {
                   parsedData = JSON.parse(jsonData);
                   observePayload(parsedData);
                   parsedData = collectAndGuardPayload(parsedData);
-                } catch (e) { invalidPayload = true; }
+                } catch (e) { invalidPayload = hasPayloadError = true; parsedData = null; }
               }
             }
 
@@ -472,7 +524,7 @@ class StreamHandler {
                   parsedData = JSON.parse(jsonData);
                   observePayload(parsedData);
                   parsedData = collectAndGuardPayload(parsedData);
-                } catch (e) { invalidPayload = true; }
+                } catch (e) { invalidPayload = hasPayloadError = true; parsedData = null; }
               }
             }
 
@@ -495,6 +547,7 @@ class StreamHandler {
             }
           }
 
+          if (!finishReason && !sawDone && takeTail()) return;
           const tail = outputGuard.finish();
           collectedContentThisTurn += tail;
           writeClientReasoningCloseChunk();
@@ -521,10 +574,14 @@ class StreamHandler {
     // Recovery belongs to one upstream turn. Never replay guarded or bridge output.
     const processAIResponseStreamHelper = async (aiResponse, isInitialCall) => {
       let data = await readAIResponseStream(aiResponse, isInitialCall);
+      const recoverBody = value => value.malformedFunctionCall && !value.halt && !value.streamAborted &&
+        !value.hasPayloadError && !vcpToolUseForbidden && !abortController.signal.aborted &&
+        !res.destroyed && !res.writableEnded && ToolCallParser.parse(value.executionText).length > 0;
+      if (recoverBody(data)) return {...data, completed:true, malformedFunctionCall:false, finishReason:'stop'};
       if (!data.malformedFunctionCall || data.halt) return data;
       if (abortController.signal.aborted || data.streamAborted || res.writableEnded || res.destroyed) return data;
 
-      if (!data.content.trim() && !data.message.reasoning_content && !isClaudeBridgeModel(originalBody.model)) {
+      if (!data.hasPayloadError && !data.content.trim() && !data.message.reasoning_content && !isClaudeBridgeModel(originalBody.model)) {
         currentMessagesForLoop.push({
           role: 'user',
           content: '[系统提示]你的上一个回复在思维链里输出了call导致报错，不要在思维链里输出call啦，正常回复用户的回复吧！'
@@ -555,6 +612,7 @@ class StreamHandler {
           return { ...data, content: '', executionText: '', completed: false };
         }
         data = await readAIResponseStream(response, false);
+        if (recoverBody(data)) return {...data, completed:true, malformedFunctionCall:false, finishReason:'stop'};
         if (!data.malformedFunctionCall) return data;
       }
 

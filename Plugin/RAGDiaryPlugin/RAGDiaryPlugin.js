@@ -3228,7 +3228,8 @@ class RAGDiaryPlugin {
             virtualIndex: isVirtualIndex || undefined,
             modifiers: modifiers,
             k: finalK,
-            engine: useRiverMemo ? 'RiverMemo' : (tagWeight !== null ? 'TagMemo' : 'KNN'),
+            engine: useRiverMemo ? 'RiverMemo V5' : '双曲 ANN',
+            retrievalEngine: 'warped_ann',
             bm25: useBM25 ? bm25Mode : undefined,
             bm25Weight: useBM25 ? bm25Weight : undefined,
             timeRatio: useTime ? timeRatio : undefined
@@ -3544,7 +3545,11 @@ class RAGDiaryPlugin {
                 contextDiaryPrefixes
             );
             riverMemoAlreadyRanked = true;
+            metadata.retrievalEngine = nativeResult.diagnostics?.degraded ? 'warped_ann' : 'rivermemo_v5';
+            metadata.engine = metadata.retrievalEngine === 'warped_ann' ? '双曲 ANN' : 'RiverMemo V5';
             riverMemoInfoForBroadcast = {
+                version: 'rivermemo_v5',
+                retrievalEngine: metadata.retrievalEngine,
                 artifactSig: nativeResult.artifactSig || null,
                 queryId: nativeResult.queryId || null,
                 omega: Number(nativeResult.omega?.omega) || 0,
@@ -3742,6 +3747,8 @@ class RAGDiaryPlugin {
                 });
                 candidates = [...riverResult.results, ...timeOnlyCandidates];
                 riverMemoInfoForBroadcast = riverResult.meta;
+                metadata.retrievalEngine = 'rivermemo_v5';
+                metadata.engine = 'RiverMemo V5';
             } else {
                 candidates = timeOnlyCandidates;
             }
@@ -4549,7 +4556,7 @@ class RAGDiaryPlugin {
 
         console.log(
             `[RAGDiaryPlugin] 🌟 Associate [${canUseNativeRiverMemo
-                ? 'RiverMemo Topology V3 Rust/Rayon'
+                ? 'RiverMemo V5 · 黎曼双曲 Rust/Rayon'
                 : 'Legacy KNN/TagMemo'}]: ` +
             `${seedChunks.length} 种子 × ${selectedDiaries.length} 索引（联合搜索）` +
             `→ ${coOccurrenceMap.size} 候选 → ${associateResults.length} 共现命中 ` +

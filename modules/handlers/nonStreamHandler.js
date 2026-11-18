@@ -5,6 +5,7 @@ const { emitVcpToolForbiddenReceipt } = require('../vcpToolForbiddenReceipt.js')
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
 const { inspectModelOutput, NOTICE: modelProtocolNotice } = require('../vcpLoop/modelOutputGuard');
 const { formatToolResultBatch, projectToolBatchForUpstream } = require('../toolResultBatch.js');
+const { matchesNativeToolIsolation } = require('../nativeToolIsolation.js');
 const {
   buildClientVisibleContent,
   removeReasoningFields,
@@ -71,11 +72,23 @@ function parseNonStreamResponse(rawResponseText) {
   }
 }
 
-function isCompleteNonStreamResponse(readResult) {
+function hasNativeToolCallPayload(message) {
+  return (
+    (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) ||
+    Boolean(message?.function_call && typeof message.function_call === 'object')
+  );
+}
+
+function isCompleteNonStreamResponse(readResult, stripNativeTools = false) {
   const { parsedJson, message, choice } = parseNonStreamResponse(readResult.text);
-  return readResult.response.ok && !readResult.semanticRetryExhausted &&
-    !!parsedJson && !parsedJson.error && !!message &&
-    hasVisibleContent(message.content) && choice?.finish_reason === 'stop';
+  if (!readResult.response.ok || readResult.semanticRetryExhausted || !parsedJson || parsedJson.error || !message) {
+    return false;
+  }
+  if (!stripNativeTools && hasNativeToolCallPayload(message) &&
+      ['tool_calls', 'function_call', 'stop'].includes(choice?.finish_reason)) {
+    return true;
+  }
+  return hasVisibleContent(message.content) && choice?.finish_reason === 'stop';
 }
 
 function isReasoningOnlyNonStreamResponse(rawResponseText) {
@@ -284,8 +297,9 @@ class NonStreamHandler {
     firstAiAPIResponse = firstReadResult.response;
     const aiResponseText = firstReadResult.text;
     let chatLogs = [];
+    const stripInitialNativeTools = matchesNativeToolIsolation(originalBody?.model);
     let oneRingAssistantTurnParts = [];
-    let validUpstreamTurns = isCompleteNonStreamResponse(firstReadResult);
+    let validUpstreamTurns = isCompleteNonStreamResponse(firstReadResult, stripInitialNativeTools);
     let completed = false;
     let protocolHalt = null;
     let currentInspection = null;
@@ -720,16 +734,33 @@ class NonStreamHandler {
     let finalJsonResponse;
     try {
       finalJsonResponse = JSON.parse(aiResponseText);
-      if (!finalJsonResponse.choices?.[0]?.message) {
+      const stripTools = matchesNativeToolIsolation(finalJsonResponse?.model || originalBody?.model);
+      const choice0 = finalJsonResponse.choices?.[0];
+      const msg0 = choice0?.message;
+      const preserveNativeToolTurn = !stripTools && !protocolHalt && !loopEndedAtStuck &&
+        !hasPendingToolCallsAtLimit && recursionDepth === 0 && hasNativeToolCallPayload(msg0);
+
+      if (!msg0) {
         finalJsonResponse.choices = [{ message: { content: finalContentForClient } }];
+        finalJsonResponse.choices[0].finish_reason = finalFinishReason;
       } else {
-        finalJsonResponse.choices[0].message.content = finalContentForClient;
+        if (!preserveNativeToolTurn) {
+          delete msg0.tool_calls;
+          delete msg0.function_call;
+        }
+        if (!preserveNativeToolTurn || finalContentForClient.length > 0 || msg0.content !== null) {
+          msg0.content = finalContentForClient;
+        }
         if (reasoningToContentEnabled) {
-          removeReasoningFields(finalJsonResponse.choices[0].message);
-          removeReasoningFields(finalJsonResponse.choices[0]);
+          removeReasoningFields(msg0);
+          removeReasoningFields(choice0);
+        }
+        if (!preserveNativeToolTurn) {
+          choice0.finish_reason = finalFinishReason;
+        } else if (!['tool_calls', 'function_call'].includes(choice0.finish_reason)) {
+          choice0.finish_reason = msg0.function_call && !msg0.tool_calls ? 'function_call' : 'tool_calls';
         }
       }
-      finalJsonResponse.choices[0].finish_reason = finalFinishReason;
     } catch (e) {
       finalJsonResponse = {
         choices: [{ index: 0, message: { role: 'assistant', content: finalContentForClient }, finish_reason: finalFinishReason }]
