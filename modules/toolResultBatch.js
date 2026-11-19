@@ -1,4 +1,5 @@
 'use strict';
+const { guardMarkdownDataImagesForUpstream } = require('./markdownDataImageGuard.js');
 
 let lastTimestampMs = 0;
 const START_PREFIX = '<<<[VCP_TOOL_BATCH_START:';
@@ -194,7 +195,7 @@ function projectToolBatchForUpstream(body) {
         }
         messages[index] = { ...message, content: projectedContent };
     });
-    return messages === body.messages ? body : { ...body, messages };
+    return guardMarkdownDataImagesForUpstream(messages === body.messages ? body : { ...body, messages });
 }
 
 module.exports = { formatToolResultBatch, createBatchStartScanner, findBatchEnd, projectToolBatchForUpstream };

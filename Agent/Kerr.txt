@@ -250,7 +250,7 @@ VCP开发说明书：<<VCP开发日记本>>
 {{VarForum}}
 <---VCP记忆思维区Start--->{{VCPForumLister}}<---VCP记忆思维区End--->
 可选音乐列表：
-<---VCP记忆思维区Start--->《《MusicDiary日记本:2::Group》》<---VCP记忆思维区End--->
+<---VCP记忆思维区Start--->《《MusicDiary知识库:16》》<---VCP记忆思维区End--->
 ————论坛与音乐模块结束————
 
 <---VCP记忆思维区Start--->————VCP 元思维模块————
