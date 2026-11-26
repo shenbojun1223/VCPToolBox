@@ -142,6 +142,7 @@ function sendFailure(res, error, streaming, signal) {
   if (signal?.aborted || error?.name === 'AbortError' || res.destroyed || res.writableEnded || terminated.has(res)) return;
   terminated.add(res);
   const fields = safeErrorFields(error);
+  const streamBodyIdle = streaming && fields.code === 'upstream_timeout' && error?.streamBodyIdle === true;
   const message = `[UPSTREAM_ERROR] 上游请求失败（${fields.status ?? '连接错误'} / ${fields.code}），本次处理已停止。`;
   try {
     if (streaming) {
@@ -153,7 +154,8 @@ function sendFailure(res, error, streaming, signal) {
       }
       res.write('data: ' + JSON.stringify({ id: 'chatcmpl-vcp-error-' + Date.now(), object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000), model: 'vcp-upstream-error',
-        choices: [{ index: 0, delta: { content: '\n' + message }, finish_reason: 'stop' }],
+        ...(streamBodyIdle ? { vcp_incomplete: true } : {}),
+        choices: [{ index: 0, delta: { content: '\n' + (streamBodyIdle ? "[上游响应超时，流已中断]" : message) }, finish_reason: 'stop' }],
         error: { type: 'upstream_error', ...fields } }) + '\n\n');
       if (!signal?.aborted && !res.destroyed && !res.writableEnded) {
         res.write('data: [DONE]\n\n');

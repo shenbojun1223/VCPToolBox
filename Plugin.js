@@ -1796,6 +1796,63 @@ class PluginManager extends EventEmitter {
             let timeoutTriggered = false;
             const isAsyncPlugin = plugin.pluginType === 'asynchronous';
             const responseParser = isAsyncPlugin ? new IncrementalJsonObjectParser() : null;
+
+            // 线性 O(N) 括号深度平衡扫描器：支持嵌套对象、格式化换行与前置杂音日志，零正则回溯
+            const extractFirstStatusJsonObject = (text) => {
+                if (!text || typeof text !== 'string') return null;
+                const len = text.length;
+                let searchFrom = 0;
+                while (searchFrom < len) {
+                    const startIdx = text.indexOf('{', searchFrom);
+                    if (startIdx === -1) return null;
+                    let depth = 0;
+                    let inString = false;
+                    let escape = false;
+                    let endIdx = -1;
+                    for (let i = startIdx; i < len; i++) {
+                        const ch = text.charCodeAt(i);
+                        if (inString) {
+                            if (escape) {
+                                escape = false;
+                            } else if (ch === 92) { // '\\'
+                                escape = true;
+                            } else if (ch === 34) { // '"'
+                                inString = false;
+                            }
+                            continue;
+                        }
+                        if (ch === 34) { // '"'
+                            inString = true;
+                        } else if (ch === 123) { // '{'
+                            depth++;
+                        } else if (ch === 125) { // '}'
+                            depth--;
+                            if (depth === 0) {
+                                endIdx = i;
+                                break;
+                            }
+                        }
+                    }
+                    if (endIdx === -1) {
+                        // 当前顶层 '{' 尚未闭合，等待后续 chunk 或尝试下一个 '{'（防止前置日志含孤立 '{'）
+                        const nextBrace = text.indexOf('{', startIdx + 1);
+                        if (nextBrace === -1) return null;
+                        searchFrom = startIdx + 1;
+                        continue;
+                    }
+                    const candidate = text.slice(startIdx, endIdx + 1);
+                    try {
+                        const parsed = JSON.parse(candidate);
+                        if (parsed && typeof parsed === 'object' && (parsed.status === 'success' || parsed.status === 'error')) {
+                            return parsed;
+                        }
+                    } catch {
+                        // 非合法 JSON，继续从下一个 '{' 扫描
+                    }
+                    searchFrom = startIdx + 1;
+                }
+                return null;
+            };
             const isArcheryNoReply = isAsyncPlugin && executionOptions?.archeryNoReply === true;
             const noReplyGraceMs = Number.isFinite(Number(executionOptions?.archeryNoReplyGraceMs))
                 ? Math.max(0, Number(executionOptions.archeryNoReplyGraceMs))
@@ -2007,7 +2064,13 @@ class PluginManager extends EventEmitter {
                 const finalStdout = getFinalStdout();
                 const finalStderr = getFinalStderr();
                 try {
-                    const parsedOutput = JSON.parse(finalStdout.trim());
+                    let parsedOutput;
+                    try {
+                        parsedOutput = JSON.parse(finalStdout.trim());
+                    } catch (directParseError) {
+                        parsedOutput = extractFirstStatusJsonObject(finalStdout);
+                        if (!parsedOutput) throw directParseError;
+                    }
                     if (parsedOutput && (parsedOutput.status === "success" || parsedOutput.status === "error")) {
                         if (code !== 0 && parsedOutput.status === "success" && this.debugMode) {
                             console.warn(`[PluginManager executePlugin Internal] Plugin "${pluginName}" exited with code ${code} but reported success in JSON. Trusting JSON.`);
@@ -2199,7 +2262,7 @@ class PluginManager extends EventEmitter {
 
             const toolName = incomingManifest.name;
             const existing = this.plugins.get(toolName);
-            if (existing && !existing.isDistributed) {
+            if (existing && existing.isDistributed !== true) {
                 if (this.debugMode) {
                     console.warn(`[PluginManager] Distributed tool '${toolName}' from ${serverId} conflicts with a local tool. Skipping provider.`);
                 }

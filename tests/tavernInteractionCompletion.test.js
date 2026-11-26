@@ -174,6 +174,70 @@ test('流式：未闭合工具请求不得被当作正常完成', async () => {
   assert.equal(events.at(-1).choices[0].finish_reason, null);
 });
 
+test('流式：空闲超时保留原提示，标记中断并只发送一次 DONE', async t => {
+  const key = 'STREAM_CHUNK_IDLE_TIMEOUT_MS';
+  const previous = process.env[key];
+  process.env[key] = '30';
+  t.after(() => {
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+  });
+
+  const body = new PassThrough();
+  const res = response();
+  const chunks = [];
+  const write = res.write;
+  res.write = (chunk, callback) => {
+    chunks.push(chunk);
+    return write(chunk, callback);
+  };
+
+  const { sendFailure } = require('../modules/upstreamErrors');
+  const ctx = context();
+  res.headersSent = true;
+  const pending = new StreamHandler(ctx).handle({}, res, { ok: true, body });
+  body.write('data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n');
+  await assert.rejects(pending, failure => {
+    assert.equal(failure.code, 'upstream_timeout');
+    assert.equal(failure.streamBodyIdle, true);
+    assert.equal(res.writableEnded, false);
+    sendFailure(res, failure, true, ctx.abortController.signal);
+    sendFailure(res, failure, true, ctx.abortController.signal);
+    return true;
+  });
+  assert.equal(res.writableEnded, true);
+  const frames = chunks.join('').split('\n').filter(line => line.startsWith('data: ')).map(line => line.slice(6));
+  assert.equal(frames.at(-1), '[DONE]');
+  assert.equal(frames.filter(frame => frame === '[DONE]').length, 1);
+  const payloads = frames.slice(0, -1).map(frame => JSON.parse(frame));
+  const textFrames = payloads.slice(0, -1);
+  assert.equal(textFrames.map(frame => frame.choices[0].delta.content).join(''), 'partial');
+  assert.ok(textFrames.every(frame => frame.vcp_incomplete === undefined && frame.choices[0].finish_reason == null));
+  assert.equal(payloads.at(-1).vcp_incomplete, true);
+  assert.equal(payloads.at(-1).error.code, 'upstream_timeout');
+  assert.deepEqual(payloads.at(-1).choices, [{
+    index: 0,
+    delta: { content: '\n[上游响应超时，流已中断]' },
+    finish_reason: 'stop'
+  }]);
+});
+
+test('流式：正常完成不带中断标记且只发送一次 DONE', async () => {
+  const res = response();
+  const chunks = [];
+  const write = res.write;
+  res.write = (chunk, callback) => {
+    chunks.push(chunk);
+    return write(chunk, callback);
+  };
+  const result = await new StreamHandler(context()).handle({}, res, streamResponse('hello'));
+  assert.equal(result.completed, true);
+  assert.equal(res.writableEnded, true);
+  const output = chunks.join('');
+  assert.doesNotMatch(output, /vcp_incomplete/);
+  assert.equal(output.split('\n').filter(line => line === 'data: [DONE]').length, 1);
+});
+
 test('流式：提前 close 和中止不提交', async () => {
   for (const abort of [false, true]) {
     const ctx = context();

@@ -26,6 +26,13 @@ function fixture(model = 'gemini-4-hydrogen') {
     };
 }
 
+const previousIsolationPolicy = process.env.NativeToolIsolationModels;
+test.before(() => { process.env.NativeToolIsolationModels = 'hydrogen'; });
+test.after(() => {
+    if (previousIsolationPolicy === undefined) delete process.env.NativeToolIsolationModels;
+    else process.env.NativeToolIsolationModels = previousIsolationPolicy;
+});
+
 test('case-insensitive substring keywords, commas, whitespace and explicit disable', () => {
     assert.equal(matchesNativeToolIsolation('GOOGLE/GEMINI-HYDROGEN', ' hydrogen, ,future '), true);
     assert.equal(matchesNativeToolIsolation('gemini-future', 'hydrogen，Future'), true);
@@ -63,11 +70,11 @@ test('unmatched/disabled models and malformed request bodies pass through', () =
         { model: 'hydrogen' });
 });
 
-test('environment defaults to hydrogen, supports multiple keywords and explicit empty', () => {
+test('default passthrough, explicit isolation keywords and explicit empty', () => {
     const previous = process.env.NativeToolIsolationModels;
     try {
         delete process.env.NativeToolIsolationModels;
-        assert.equal(isolateNativeToolsForUpstream(fixture()).tools, undefined);
+        assert.deepEqual(isolateNativeToolsForUpstream(fixture()).tools, fixture().tools);
         process.env.NativeToolIsolationModels = '';
         assert.equal(isolateNativeToolsForUpstream(fixture()).tools.length, 1);
         process.env.NativeToolIsolationModels = 'future,hydrogen';

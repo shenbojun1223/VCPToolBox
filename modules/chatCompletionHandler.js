@@ -3,9 +3,11 @@ const { UpstreamError, responseError, assertResponseOk, abortableDelay, abortErr
 const messageProcessor = require('./messageProcessor.js');
 const vcpInfoHandler = require('../vcpInfoHandler.js');
 const contextManager = require('./contextManager.js');
+const contextBudget = require('./contextBudget.js');
 const roleDivider = require('./roleDivider.js');
 const { projectToolBatchForUpstream } = require('./toolResultBatch.js');
-const { isolateNativeToolsForUpstream, isolateNativeToolRequestOptions } = require('./nativeToolIsolation.js');
+const { withNativeToolDebug } = require('./nativeToolDebug.js');
+
 const { createHandoffGate } = require('./vcpLoop/handoffGate.js');
 const fs = require('fs').promises;
 const path = require('path');
@@ -163,6 +165,8 @@ function createSingleAttemptBudget() {
     }
   };
 }
+const { isolateNativeToolsForUpstream, isolateNativeToolRequestOptions } = require('./nativeToolIsolation.js');
+const { withStreamUsage } = require('./streamUsageOption.js');
 
 // 多模态配置真相源（JSON 优先 + 热更新），用于在请求时动态拉取 MultiModalForceTranslateModels
 let multiModalConfigStore = null;
@@ -585,12 +589,32 @@ function readDispatchedModel(options) {
   }
 }
 
+// Timeline diagnostics are local-only and independent of request replay/interrupt IDs.
+function createTimelineTrace(req, res) {
+  const id = req.headers['x-vcp-timeline-trace'];
+  const loopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket?.remoteAddress);
+  if (!loopback || req.body?.stream !== false || typeof id !== 'string'
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) return null;
+
+  const started = performance.now();
+  const emit = (stage, fields) => console.info('[VCPTimeLineTrace]', JSON.stringify({
+    id, stage, elapsedMs: Math.round(performance.now() - started), ...fields
+  }));
+  let sequence = 0;
+  res.once('finish', () => emit('toolbox_response_finished', { status: res.statusCode }));
+  res.once('close', () => {
+    if (!res.writableFinished) emit('toolbox_response_closed_early');
+  });
+  emit('toolbox_handler_entered');
+  return { emit, nextAttempt: () => ++sequence, responses: new WeakMap() };
+}
+
 // A helper function to handle fetch with retries for specific status codes
 // connectionTimeout: 连接超时安全网，防止上游 API 静默挂起导致永久等待（仅覆盖到收到响应头为止）
 async function fetchWithRetry(
   url,
   options,
-  { retries = 3, delay = 1000, debugMode = false, onRetry = null, onRequestSent = null, onResponseHeaders = null, connectionTimeout = 900000, modelFallbackCandidates = null, phase = 'initial', onModelDispatched = null, attemptBudget = null, redirect = null } = {},
+  { retries = 3, delay = 1000, debugMode = false, onRetry = null, onRequestSent = null, onResponseHeaders = null, connectionTimeout = 900000, modelFallbackCandidates = null, phase = 'initial', onModelDispatched = null, attemptBudget = null, redirect = null, timelineTrace = null } = {},
 ) {
   const { default: fetch } = await import('node-fetch');
   const maxAttempts = Math.max(
@@ -616,6 +640,7 @@ async function fetchWithRetry(
     let failure;
     let response;
     let attemptModel = null;
+    let traceAttempt;
     // Only the actual fetch is in the network-error catch. HTTP failures and
     // observational callbacks must never be reclassified as network failures.
     try {
@@ -623,10 +648,20 @@ async function fetchWithRetry(
         applyModelFallbackForAttempt(options, modelFallbackCandidates, i, debugMode)
       );
       attemptModel = readDispatchedModel(attemptOptions);
+      traceAttempt = timelineTrace?.nextAttempt();
+      timelineTrace?.emit('upstream_fetch_started', { attempt: traceAttempt });
       try { onRequestSent?.(); } catch (_) { /* observational */ }
       // Only the opt-in single-attempt wrapper pins redirect to "error".
       response = await fetch(url, { ...attemptOptions, agent: getFetchAgent, signal: attemptController.signal, ...(redirect ? { redirect } : {}) });
-    } catch (_) {
+      if (attemptModel && Array.isArray(modelFallbackCandidates) && modelFallbackCandidates.length > 0) {
+        try { Object.defineProperty(response, 'vcpAttemptModel', { value: attemptModel, configurable: true }); } catch (_) {}
+      }
+    } catch (error) {
+      if (timelineTrace) {
+        const code = error?.code;
+        const errorCode = typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : undefined;
+        timelineTrace.emit(didTimeout ? 'upstream_headers_wait_timeout' : externalSignal?.aborted ? 'upstream_fetch_cancelled' : 'upstream_fetch_failed', { attempt: traceAttempt, errorCode });
+      }
       failure = externalSignal?.aborted ? abortError({ phase, attempt: i + 1 })
         : new UpstreamError({ code: didTimeout ? 'upstream_timeout' : 'network_error', phase, attempt: i + 1 });
     } finally {
@@ -634,6 +669,10 @@ async function fetchWithRetry(
       externalSignal?.removeEventListener('abort', forwardAbort);
     }
     if (response) {
+      if (timelineTrace) {
+        timelineTrace.responses.set(response, traceAttempt);
+        timelineTrace.emit('upstream_headers_received', { attempt: traceAttempt, status: response.status });
+      }
       try { onResponseHeaders?.(response.status); } catch (_) { /* observational */ }
       if (response.ok) {
         if (externalSignal?.aborted) {
@@ -647,7 +686,14 @@ async function fetchWithRetry(
         }
         return response; // Success body belongs exclusively to the handler.
       }
-      failure = await responseError(response, { phase, attempt: i + 1 }, { signal: externalSignal });
+      timelineTrace?.emit('upstream_retry_body_read_started', { attempt: traceAttempt });
+      try {
+        failure = await responseError(response, { phase, attempt: i + 1 }, { signal: externalSignal });
+        timelineTrace?.emit('upstream_retry_body_read_finished', { attempt: traceAttempt });
+      } catch (error) {
+        timelineTrace?.emit('upstream_retry_body_read_failed', { attempt: traceAttempt });
+        throw error;
+      }
     }
     if (failure.name === 'AbortError') throw failure;
     const retryable = failure.status === null || [500, 502, 503, 504, 429].includes(failure.status) ||
@@ -665,6 +711,8 @@ function stripMarkdownCodeFencesForRagRefresh(text) {
   if (typeof text !== 'string') return '';
   return text.replace(/```[\s\S]*?```/g, '');
 }
+
+// 上游请求的统一出口：流式请求默认请求真实用量，渠道不支持时自动去掉重发。
 
 // 安全解析 RAG metadata：必须是合法 JSON 对象，否则跳过（不抛错污染用户请求）
 function safeParseRagBlockMetadata(rawMetadata, debugMode = false) {
@@ -794,6 +842,7 @@ class ChatCompletionHandler {
   }
 
   async handle(req, res, forceShowVCP = false) {
+    const timelineTrace = createTimelineTrace(req, res);
     const {
       apiUrl,
       apiKey,
@@ -942,6 +991,7 @@ class ChatCompletionHandler {
         attemptBudget: singleAttemptBudget,
         redirect: 'error'
       });
+    const requestFetchWithUsage = withStreamUsage(requestFetchWithRetry);
 
     const vcpchatExtensions = originalBody && typeof originalBody === 'object'
       ? originalBody.vcpchatExtensions
@@ -1008,11 +1058,13 @@ class ChatCompletionHandler {
       if (isOriginalRequestStreaming && !res.headersSent) {
         res.setHeader('x-vcp-tool-loop-handoff', '1');
       }
+      const initialRequestNow = Date.now();
       activeRequests.set(id, {
         req,
         res,
         abortController,
-        timestamp: Date.now(),
+        timestamp: initialRequestNow,
+        lastActivityAt: initialRequestNow,
         aborted: false, // 修复 Bug #4: 添加中止标志
         abortReason: null,
         handoffGate
@@ -1068,26 +1120,17 @@ class ChatCompletionHandler {
     }
 
     // --- 上下文控制 (Context Control) ---
-    // 1. 拦截 contextTokenLimit 参数
+    // 1. 拦截 contextTokenLimit 参数：它是 VCP 自己的预算参数，不发给上游。
+    //    裁剪和预算检查都放在所有展开完成之后（见下方「出站前预算」），
+    //    因为展开前的消息体积和真正发给模型的体积可以差出很多。
     const contextTokenLimit = originalBody.contextTokenLimit;
     if (contextTokenLimit !== undefined) {
       if (DEBUG_MODE) console.log(`[ContextControl] 检测到 contextTokenLimit: ${contextTokenLimit}`);
-      // 2. 从发送给后端的 body 中移除该参数
       delete originalBody.contextTokenLimit;
-
-      // 3. 执行上下文修剪
-      if (originalBody.messages && Array.isArray(originalBody.messages)) {
-        const originalCount = originalBody.messages.length;
-        originalBody.messages = await contextManager.pruneMessagesSmart(
-          originalBody.messages,
-          contextTokenLimit,
-          DEBUG_MODE
-        );
-        if (DEBUG_MODE && originalBody.messages.length < originalCount) {
-          console.log(`[ContextControl] 上下文已修剪: ${originalCount} -> ${originalBody.messages.length} 条消息`);
-        }
-      }
     }
+    const inboundBudgetEstimate = contextBudget.guardMode() !== 'off' && contextBudget.effectiveLimit(contextTokenLimit)
+      ? contextBudget.estimateBodyTokens(originalBody)
+      : 0;
 
     try {
       if (originalBody.model) {
@@ -1460,17 +1503,47 @@ class ChatCompletionHandler {
         if (DEBUG_MODE) await writeDebugLog('LogAfterFinalRoleDivider', processedMessages);
       }
 
-      // 前端的展示姓名不是上游参与者标识（中文姓名还可能触发上游 name 格式校验）。
-      // 必须在所有预处理器/原消息恢复完成后清理，避免 OneRing 恢复视图时重新带回；
-      // 此时来源识别与时间戳绑定已完成，正文中的 OneRing 来源通知保持不变。
-      // 不清理 function/tool 消息：旧式 function 协议依赖 name 匹配调用结果。
-      for (const message of processedMessages) {
-        if (message && ['system', 'developer', 'user', 'assistant'].includes(message.role)) {
-          delete message.name;
+      // --- 出站前预算：压缩与裁剪 ---
+      // 所有展开和拆分都已完成，这里量到的才是模型真正收到的体积。
+      // 预算 = 请求里的 contextTokenLimit 与服务端硬上限取小；非法值（负数、非数字）视为没有。
+      const budgetGuard = contextBudget.createBudgetGuard({
+        limit: contextTokenLimit,
+        model: originalBody.model,
+        requestId: req.body.requestId || req.body.messageId || null
+      });
+      const pruningEnabled = contextManager.isPruningEnabled();
+      if (budgetGuard.enforcing && Array.isArray(processedMessages)) {
+        // 第一步（仅 enforce）：超预算时先把历史里较早的工具结果压成摘要（当前轮不动）。它们通常占了
+        // 绝大部分体积，压掉之后多数请求就不需要删消息、也不需要拒绝了。
+        // observe / off 不改写任何消息内容，即使服务端开了裁剪也一样。
+        const draftBody = () => ({ ...originalBody, messages: processedMessages });
+        const isOverBudget = () => budgetGuard.estimate(draftBody()) > budgetGuard.limit;
+        if (isOverBudget()) {
+          const slimmedMessages = copyArrayMetadata(processedMessages, processedMessages.slice());
+          const beforeSlim = budgetGuard.estimate(draftBody());
+          const slimmedCount = contextBudget.slimToFit(slimmedMessages, undefined,
+            () => budgetGuard.estimate({ ...originalBody, messages: slimmedMessages }) > budgetGuard.limit);
+          if (slimmedCount > 0) {
+            processedMessages = slimmedMessages;
+            console.warn(`[ContextBudget] 超预算，已压缩历史中 ${slimmedCount} 条消息里的工具结果: ${beforeSlim} -> ${budgetGuard.estimate(draftBody())} / ${budgetGuard.limit}`);
+          }
+        }
+      }
+      // 第二步：裁剪（需服务端开启）。
+      if (budgetGuard.limit !== null && pruningEnabled && Array.isArray(processedMessages)) {
+        const messagesBeforePrune = processedMessages;
+        const prunedMessages = await contextManager.pruneMessagesSmart(
+          processedMessages,
+          budgetGuard.messageBudget(originalBody),
+          DEBUG_MODE
+        );
+        if (prunedMessages !== messagesBeforePrune) {
+          processedMessages = copyArrayMetadata(messagesBeforePrune, prunedMessages);
+          if (DEBUG_MODE) console.log(`[ContextControl] 上下文已修剪: ${messagesBeforePrune.length} -> ${processedMessages.length} 条消息`);
         }
       }
 
-      // 经过改造后，processedMessages 已经是最终版本，无需再调用 replaceOtherVariables
+      // ToolLoop 从这份上下文起步；显示名仅在模型出站投影中剥离。
       originalBody.messages = processedMessages;
 
       let oneRingResponseMeta = null;
@@ -1496,6 +1569,9 @@ class ChatCompletionHandler {
       });
 
       const willStreamResponse = isOriginalRequestStreaming;
+      const nativeToolBody = vcpToolUseForbidden ? originalBody : withNativeToolDebug(originalBody);
+      const ownsNativeVcpTools = nativeToolBody !== originalBody;
+      originalBody = nativeToolBody;
       const finalUpstreamBody = projectToolBatchForUpstream({ ...originalBody, stream: willStreamResponse });
 
       let budgetTokenCount;
@@ -1517,12 +1593,28 @@ class ChatCompletionHandler {
         finalUpstreamBody.messages, vcpchatExtensions, budgetTokenCount
       );
 
+      const outboundBudgetBody = isolateNativeToolsForUpstream(finalUpstreamBody);
+      // --- 出站前预算：检查 ---
+      const budgetCheck = budgetGuard.check(outboundBudgetBody, 'outbound');
+      if (budgetGuard.active && (budgetCheck.over || DEBUG_MODE)) {
+        console.log(`[ContextBudget] 展开前估算 ${budgetGuard.scale(inboundBudgetEstimate)}，展开后估算 ${budgetCheck.estimated}，上限 ${budgetCheck.limit}`);
+      }
+      if (budgetCheck.over && budgetGuard.enforcing) {
+        const budgetBreakdown = budgetGuard.breakdown(outboundBudgetBody);
+        throw Object.assign(new Error(contextBudget.exceededMessage(budgetCheck, 'outbound', budgetBreakdown)), {
+          name: 'ContextBudgetExceededError',
+          budget: { stage: 'outbound', estimated: budgetCheck.estimated, limit: budgetCheck.limit, breakdown: budgetBreakdown }
+        });
+      }
+      budgetGuard.noteRequest(outboundBudgetBody);
+
+
       throwIfRequestAborted();
       await writeDebugLog('LogOutputAfterProcessing', isolateNativeToolsForUpstream(finalUpstreamBody));
 
       if (requestDiagnostic) requestDiagnostic.stage('preprocess_end');
 
-      let firstAiAPIResponse = await requestFetchWithRetry(
+      let firstAiAPIResponse = await requestFetchWithUsage(
         `${apiUrl}/v1/chat/completions`,
         {
           method: 'POST',
@@ -1545,6 +1637,7 @@ class ChatCompletionHandler {
           // Observation only: the model the ACCEPTED attempt really serialised (after
           // semantic routing and after any model-fallback rewrite). It adds no attempt.
           onModelDispatched: model => { dispatchedBackendModel = typeof model === 'string' ? model : null; },
+          timelineTrace,
           onRetry: async (attempt, errorInfo) => {
             if (!res.headersSent && isOriginalRequestStreaming) {
               if (DEBUG_MODE)
@@ -1598,17 +1691,30 @@ class ChatCompletionHandler {
         res.setHeader('x-vcp-tool-loop-handoff', '1');
         res.flushHeaders?.();
       }
+      let lastActivityTouchMs = 0;
+      const touchRequestActivity = () => {
+        if (!id) return;
+        const now = Date.now();
+        if (now - lastActivityTouchMs < 1000) return;
+        lastActivityTouchMs = now;
+        const reqEntry = activeRequests.get(id);
+        if (reqEntry) reqEntry.lastActivityAt = now;
+      };
+
       const context = {
         ...this.config,
         handoffGate,
+        touchRequestActivity,
         toolExecutor: this.toolExecutor,
+        ownsNativeVcpTools,
         ToolCallParser,
         abortController,
         originalBody,
         clientIp,
         forceShowVCP,
         _refreshRagBlocksIfNeeded,
-        fetchWithRetry: requestFetchWithRetry,
+        fetchWithRetry: requestFetchWithUsage,
+        timelineTrace,
         isToolResultError,
         formatToolResult,
         vcpToolUseForbidden,
@@ -1616,6 +1722,7 @@ class ChatCompletionHandler {
         apiConnectionTimeoutMs,
         semanticModelFallbackCandidates,
         oneRingResponseMeta,
+        budgetGuard,
         shouldProcessMedia,
         shouldProcessMediaPlus,
         isTextOnlyForceTranslateModel,
@@ -1657,6 +1764,37 @@ class ChatCompletionHandler {
         // 这里仅停止后续处理，避免与中止链路竞态写入。
         if (DEBUG_MODE) console.log('[Abort] Request processing stopped.');
         return; // Stop processing and allow the 'finally' block to clean up.
+      }
+      if (error.name === 'ContextBudgetExceededError') {
+        // 预算检查拦下的请求：没有发往上游，明确告诉客户端原因和数字。
+        if (!res.headersSent) {
+          if (isOriginalRequestStreaming) {
+            res.status(200);
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            try {
+              res.write(`data: ${JSON.stringify({
+                id: `chatcmpl-VCP-context-budget-${Date.now()}`,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: originalBody.model || 'unknown',
+                vcp_incomplete: true,
+                vcp_context_budget: error.budget,
+                choices: [{ index: 0, delta: { content: `[ERROR] ${error.message}` }, finish_reason: 'stop' }],
+              })}\n\n`);
+              res.write('data: [DONE]\n\n', () => res.end());
+            } catch (writeError) {
+              if (!res.writableEnded && !res.destroyed) { try { res.end(); } catch (_) {} }
+            }
+          } else {
+            res.status(400).json({
+              error: { message: error.message, type: 'invalid_request_error', code: 'context_length_exceeded' },
+              vcp_context_budget: error.budget
+            });
+          }
+        }
+        return;
       }
       const failure = error instanceof UpstreamError ? error : new UpstreamError({ code: 'internal_error' });
       if (requestDiagnostic?.upstreamError && error instanceof UpstreamError) {

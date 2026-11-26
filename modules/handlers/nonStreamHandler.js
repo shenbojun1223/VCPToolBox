@@ -1,11 +1,16 @@
+const { matchesNativeToolIsolation } = require('../nativeToolIsolation.js');
 const { UpstreamError, assertResponseOk, abortableDelay, abortError, throwIfAborted, isClaudeBridgeModel } = require('../upstreamErrors.js');
 // modules/handlers/nonStreamHandler.js
 // AICW 内层禁工具消费回执（opt-in）：仅在请求携带本机控制头时写入保留响应头。
 const { emitVcpToolForbiddenReceipt } = require('../vcpToolForbiddenReceipt.js');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
 const { inspectModelOutput, NOTICE: modelProtocolNotice } = require('../vcpLoop/modelOutputGuard');
-const { formatToolResultBatch, projectToolBatchForUpstream } = require('../toolResultBatch.js');
-const { matchesNativeToolIsolation } = require('../nativeToolIsolation.js');
+const contextBudget = require('../contextBudget.js');
+const finalContextStore = require('../finalContextStore.js');
+const roleDivider = require('../roleDivider.js');
+const { formatToolResultBatch, projectToolBatchForUpstream, buildToolPayloadMessage } = require('../toolResultBatch.js');
+const { NATIVE_CALL_ID, normalizeNativeVcpCalls, buildBoundedNativeReceipts } = require('../nativeToolLoop');
+
 const {
   buildClientVisibleContent,
   removeReasoningFields,
@@ -79,12 +84,12 @@ function hasNativeToolCallPayload(message) {
   );
 }
 
-function isCompleteNonStreamResponse(readResult, stripNativeTools = false) {
+function isCompleteNonStreamResponse(readResult) {
   const { parsedJson, message, choice } = parseNonStreamResponse(readResult.text);
   if (!readResult.response.ok || readResult.semanticRetryExhausted || !parsedJson || parsedJson.error || !message) {
     return false;
   }
-  if (!stripNativeTools && hasNativeToolCallPayload(message) &&
+  if (hasNativeToolCallPayload(message) &&
       ['tool_calls', 'function_call', 'stop'].includes(choice?.finish_reason)) {
     return true;
   }
@@ -104,7 +109,8 @@ async function readNonStreamResponseWithSemanticRetry({
   delay = 1000,
   debugMode = false,
   signal,
-  label = 'non_stream'
+  label = 'non_stream',
+  timelineTrace
 }) {
   const maxAttempts = Math.max(Number.isFinite(Number(retries)) && Number(retries) > 0 ? Math.floor(Number(retries)) : 1, 1);
   let response = initialResponse;
@@ -118,13 +124,19 @@ async function readNonStreamResponseWithSemanticRetry({
     }
 
     await assertResponseOk(response, { phase: label === 'initial' ? 'initial' : 'tool_continuation' }, signal);
+    const upstreamAttempt = timelineTrace?.responses.get(response);
+    timelineTrace?.emit('upstream_body_read_started', { attempt: upstreamAttempt });
     let arrayBuffer;
     const abortRead = () => response.body?.destroy(abortError());
     signal?.addEventListener('abort', abortRead, { once: true });
     try {
       throwIfAborted(signal);
       arrayBuffer = await response.arrayBuffer();
-    } catch (_) {
+      timelineTrace?.emit('upstream_body_read_finished', { attempt: upstreamAttempt });
+    } catch (error) {
+      const code = error?.code;
+      const errorCode = typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : undefined;
+      timelineTrace?.emit('upstream_body_read_failed', { attempt: upstreamAttempt, errorCode });
       response.body?.destroy();
       throw new UpstreamError({ status: response.status,
         code: signal?.aborted ? 'aborted' : 'stream_error',
@@ -193,7 +205,7 @@ class NonStreamHandler {
       apiRetryDelay,
       RAGMemoRefresh,
       enableRoleDivider,
-
+      touchRequestActivity,
       toolExecutor,
       ToolCallParser,
       abortController,
@@ -201,6 +213,8 @@ class NonStreamHandler {
       clientIp,
       _refreshRagBlocksIfNeeded,
       fetchWithRetry,
+      budgetGuard,
+      timelineTrace,
       vcpToolUseForbidden,
       vcpToolForbiddenReceipt,
       apiConnectionTimeoutMs,
@@ -282,7 +296,7 @@ class NonStreamHandler {
         body: JSON.stringify(projectToolBatchForUpstream(body)),
         signal: abortController.signal,
       },
-      { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates, phase: label === 'initial' ? 'initial' : 'tool_continuation' }
+      { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates, timelineTrace, phase: label === 'initial' ? 'initial' : 'tool_continuation' }
     );
 
     const firstReadResult = await readNonStreamResponseWithSemanticRetry({
@@ -292,14 +306,52 @@ class NonStreamHandler {
       delay: apiRetryDelay,
       debugMode: DEBUG_MODE,
       signal: abortController.signal,
-      label: 'initial'
+      label: 'initial',
+      timelineTrace
     });
     firstAiAPIResponse = firstReadResult.response;
     const aiResponseText = firstReadResult.text;
+    const noteUpstreamUsage = (responseText, isInitial = false) => {
+      try {
+        const usage = JSON.parse(responseText)?.usage;
+        if (isInitial) finalContextStore.recordUpstreamUsage(originalBody.requestId || originalBody.messageId, usage);
+        budgetGuard?.noteUsage(usage, isInitial ? firstAiAPIResponse?.vcpAttemptModel : undefined);
+      } catch (_) { /* 非 JSON 响应没有 usage，面板保留本地估算 */ }
+    };
+    noteUpstreamUsage(aiResponseText, true);
+
+    /**
+     * 工具循环每次再发上游之前的预算检查。超预算时先压缩本轮之前的工具结果，
+     * 仍然超则返回说明文字（调用方把它交给客户端并退出循环）；可以发送时返回 null。
+     */
+    const checkLoopBudget = (messages) => {
+      if (!budgetGuard?.active) return null;
+      const build = () => projectToolBatchForUpstream({ ...originalBody, messages, stream: false });
+      let body = build();
+      let check = budgetGuard.check(body, 'tool_loop', { silent: budgetGuard.enforcing });
+      if (check.over && budgetGuard.enforcing) {
+        let roundStartIndex = messages.length;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i]?.role === 'assistant') { roundStartIndex = i; break; }
+        }
+        const slimmed = contextBudget.slimToFit(messages, roundStartIndex, () => budgetGuard.check(build(), 'tool_loop', { silent: true }).over);
+        if (slimmed > 0) {
+          body = build();
+          const before = check.estimated;
+          check = budgetGuard.check(body, 'tool_loop', { silent: true });
+          console.warn(`[ContextBudget] 工具循环超预算，已压缩 ${slimmed} 条较早的工具结果: ${before} -> ${check.estimated} / ${check.limit}`);
+        }
+      }
+      if (check.over && budgetGuard.enforcing) {
+        console.warn(`[ContextBudget] 工具循环已停止: estimated=${check.estimated} limit=${check.limit}`);
+        return `\n\n> [!WARNING]\n> ${contextBudget.exceededMessage(check, 'tool_loop', budgetGuard.breakdown(body))}\n`;
+      }
+      budgetGuard.noteRequest(body);
+      return null;
+    };
     let chatLogs = [];
-    const stripInitialNativeTools = matchesNativeToolIsolation(originalBody?.model);
     let oneRingAssistantTurnParts = [];
-    let validUpstreamTurns = isCompleteNonStreamResponse(firstReadResult, stripInitialNativeTools);
+    let validUpstreamTurns = isCompleteNonStreamResponse(firstReadResult);
     let completed = false;
     let protocolHalt = null;
     let currentInspection = null;
@@ -353,14 +405,17 @@ class NonStreamHandler {
     // 实际执行了几个内层工具）。未 opt-in 时这两个变量只被写入、不会被读用。
     let toolParseSkippedThisRequest = false;
     let toolExecutionsThisRequest = 0;
+    let currentParsedResponse = initParsedResponse;
+    let nativeTerminalResponse = null;
     let currentMessagesForNonStreamLoop = originalBody.messages ? JSON.parse(JSON.stringify(originalBody.messages)) : [];
 
     do {
-      // 检查中止信号
+      // 检查中止信号并刷新非流式多轮工具循环活性时间戳
       if (abortController && abortController.signal.aborted) {
         if (DEBUG_MODE) console.log('[VCP NonStream Loop] Abort detected, exiting loop.');
         break;
       }
+      touchRequestActivity?.();
 
       if (protocolHalt) {
         conversationHistoryForClient.push(modelProtocolNotice);
@@ -376,30 +431,62 @@ class NonStreamHandler {
       let anyToolProcessedInCurrentIteration = false;
       conversationHistoryForClient.push(currentAIContentForClient);
 
-      // Overlay: 记录本轮真实采用的分支（回执只能申报真实发生的分支）。
       toolParseSkippedThisRequest = vcpToolUseForbidden === true;
-      const toolCalls = vcpToolUseForbidden ? [] : ToolCallParser.parse(currentExecutionText);
+      const nativeMessage = currentParsedResponse.message;
+      let nativeCalls = null;
+      let ownedCalls = null;
+      if (validUpstreamTurns && !protocolHalt && hasNativeToolCallPayload(nativeMessage)) {
+        const isolateTurn = matchesNativeToolIsolation(originalBody?.model) ||
+          matchesNativeToolIsolation(currentParsedResponse.parsedJson?.model);
+        if (isolateTurn) { completed = false; break; }
+        if (!this.context.ownsNativeVcpTools) {
+          nativeTerminalResponse = currentParsedResponse.parsedJson;
+          completed = true;
+          break;
+        }
+        nativeCalls = nativeMessage.tool_calls;
+        ownedCalls = !vcpToolUseForbidden && !nativeMessage.function_call && normalizeNativeVcpCalls(nativeCalls);
+        if (!ownedCalls) {
+          conversationHistoryForClient.push('\n[VCP 原生工具调用格式无效，本批未执行。]\n');
+          completed = false;
+          break;
+        }
+      }
+      const toolCalls = (vcpToolUseForbidden || protocolHalt || !validUpstreamTurns) ? [] : (ownedCalls ?? ToolCallParser.parse(currentExecutionText));
+      const makeAssistantMessage = () => {
+        if (!ownedCalls) return { role: 'assistant', content: currentAIContentForLoop };
+        const { content, reasoning_content, reasoning_details } = nativeMessage;
+        return {
+          role: 'assistant',
+          content: content ?? null,
+          tool_calls: nativeCalls,
+          ...(reasoning_content != null ? { reasoning_content } : {}),
+          ...(reasoning_details != null ? { reasoning_details } : {})
+        };
+      };
 
       if (toolCalls.length > 0) {
+        const expandedCalls = await (toolExecutor.expandCalls?.(toolCalls) ?? toolCalls);
+        if (abortController?.signal.aborted || res.destroyed || res.writableEnded) break;
         anyToolProcessedInCurrentIteration = true;
-        toolExecutionsThisRequest += toolCalls.length;
-        const { normal: normalCalls, archery: archeryCalls } = ToolCallParser.separate(toolCalls);
-        const archeryErrorContents = [];
+        toolExecutionsThisRequest += expandedCalls.length;
+        const { normal: normalCalls, archery: archeryCalls } = ToolCallParser.separate(expandedCalls);
+        const archeryReceiptGroups = [];
         const archeryStatusSummaryItems = [];
         const visibleToolResults = [];
 
         // 执行 Archery 调用
-        const archeryLogs = await Promise.all(archeryCalls.map(async toolCall => {
+        const archeryLogs = await Promise.all(archeryCalls.map(async (toolCall, index) => {
           try {
             const result = await toolExecutor.execute(toolCall, clientIp, currentMessagesForNonStreamLoop);
             const isError = !result.success || (result.raw && this.context.isToolResultError(result.raw));
 
             if (isError) {
               archeryStatusSummaryItems.push(`${toolCall.name} 调用失败${result.recordId ? ` (记录ID: ${result.recordId})` : ''}`);
-              archeryErrorContents.push({
+              archeryReceiptGroups[index] = { name: toolCall.name, callId: toolCall[NATIVE_CALL_ID], parts: [{
                 type: 'text',
                 text: `[异步工具 "${toolCall.name}" 返回了错误，请注意]:\n${result.content[0].text}`
-              });
+              }] };
               const forceThisOne = !shouldShowVCP && toolCall.markHistory;
               if ((shouldShowVCP || forceThisOne) && (isError || forceThisOne)) {
                 const vcpText = vcpInfoHandler.streamVcpInfo(null, originalBody.model, toolCall.name, result.success ? 'success' : 'error', result.raw || result.error, abortController);
@@ -407,7 +494,7 @@ class NonStreamHandler {
               }
             } else if (result.approvalFeedbackContent?.length) {
               // 用户明确输入的审核留言优先于 archery 静默；业务成功状态保持不变。
-              archeryErrorContents.push(...result.approvalFeedbackContent);
+              archeryReceiptGroups[index] = { name: toolCall.name, callId: toolCall[NATIVE_CALL_ID], parts: result.approvalFeedbackContent };
             }
             return { tool: toolCall, result: result.content };
           } catch (e) {
@@ -415,21 +502,28 @@ class NonStreamHandler {
             return { tool: toolCall, result: [{ type: 'text', text: String(e.message) }] };
           }
         }));
+        const archeryGroups = archeryReceiptGroups.filter(Boolean);
+        const archeryErrorContents = archeryGroups.flatMap(group => group.parts);
 
         // 处理纯 Archery 的错误或用户审核留言。
         if (normalCalls.length === 0 && archeryErrorContents.length > 0) {
-          currentMessagesForNonStreamLoop.push({ role: 'assistant', content: currentAIContentForLoop });
+          currentMessagesForNonStreamLoop.push(makeAssistantMessage());
           // Keep the response at its original position for upstream signature replay.
-          if (rollInjection && rollInjection.kind && rollInjection.content) {
+          if (!ownedCalls && rollInjection && rollInjection.kind && rollInjection.content) {
             currentMessagesForNonStreamLoop.push({ role: 'system', content: rollInjection.content });
           }
 
-          const errorPayload = `<!-- VCP_TOOL_PAYLOAD -->\n${JSON.stringify(archeryErrorContents)}`;
-          const { truncateToolPayload: truncateErrPayload } = require('../vcpLoop/toolPayloadTruncator.js');
-          currentMessagesForNonStreamLoop.push({ role: 'user', content: truncateErrPayload(errorPayload, {
-            toolNames: archeryCalls.map(call => call.name),
-            exempt: archeryCalls.some(call => call.markHistory)
-          }) });
+          if (ownedCalls) {
+            currentMessagesForNonStreamLoop.push(...buildBoundedNativeReceipts(nativeCalls, archeryGroups, archeryCalls));
+            if (rollInjection?.kind && rollInjection.content) currentMessagesForNonStreamLoop.push({ role: 'system', content: rollInjection.content });
+          } else {
+            const { content: errorPayload } = await buildToolPayloadMessage(archeryGroups);
+            const { truncateToolPayload: truncateErrPayload } = require('../vcpLoop/toolPayloadTruncator.js');
+            currentMessagesForNonStreamLoop.push({ role: 'user', content: truncateErrPayload(errorPayload, {
+              toolNames: archeryCalls.map(call => call.name),
+              exempt: archeryCalls.some(call => call.markHistory)
+            }) });
+          }
 
           if (archeryStatusSummaryItems.length > 0) {
             visibleToolResults.push(`\n[本轮工具调用摘要:]\n${archeryStatusSummaryItems.join('；')}。\n[本轮工具调用摘要结束]\n`);
@@ -438,6 +532,11 @@ class NonStreamHandler {
 
           throwIfAborted(abortController.signal);
           if (res.writableEnded || res.destroyed) { rollKeeper.reset(); return; }
+          const archeryBudgetNotice = checkLoopBudget(currentMessagesForNonStreamLoop);
+          if (archeryBudgetNotice) {
+            conversationHistoryForClient.push(archeryBudgetNotice);
+            break;
+          }
           const recursionBody = { ...originalBody, messages: currentMessagesForNonStreamLoop, stream: false };
           const recursionReadResult = await readNonStreamResponseWithSemanticRetry({
             fetchResponse: () => fetchNonStreamCompletion(recursionBody, `archery_error_depth_${recursionDepth}`),
@@ -445,14 +544,17 @@ class NonStreamHandler {
             delay: apiRetryDelay,
             debugMode: DEBUG_MODE,
             signal: abortController.signal,
-            label: `archery_error_depth_${recursionDepth}`
+            label: `archery_error_depth_${recursionDepth}`,
+            timelineTrace
           });
           const recursionAiResponse = recursionReadResult.response;
 
           if (recursionAiResponse.ok) {
             validUpstreamTurns = validUpstreamTurns && isCompleteNonStreamResponse(recursionReadResult);
             const recursionText = recursionReadResult.text;
+            noteUpstreamUsage(recursionText);
             const recursionParsedResponse = extractedResponse(recursionText);
+            currentParsedResponse = recursionParsedResponse;
             const recursionMessage = recursionParsedResponse.message;
             if (recursionMessage) {
               currentAIContentForLoop = extractVisibleContent(recursionMessage);
@@ -485,13 +587,23 @@ class NonStreamHandler {
 
         // 执行普通调用
         // Model-generated text stays assistant; only the executor adds result messages.
-        currentMessagesForNonStreamLoop.push({ role: 'assistant', content: currentAIContentForLoop });
+        currentMessagesForNonStreamLoop.push(makeAssistantMessage());
         // Keep the response at its original position for upstream signature replay.
-        if (rollInjection && rollInjection.kind && rollInjection.content) {
+        if (!ownedCalls && rollInjection && rollInjection.kind && rollInjection.content) {
           currentMessagesForNonStreamLoop.push({ role: 'system', content: rollInjection.content });
         }
 
-        const toolResults = await toolExecutor.executeAll(normalCalls, clientIp, currentMessagesForNonStreamLoop);
+        const nonStreamActivityTimer = setInterval(() => {
+          touchRequestActivity?.();
+        }, 5000);
+        nonStreamActivityTimer.unref?.();
+        let toolResults;
+        try {
+          toolResults = await toolExecutor.executeAll(normalCalls, clientIp, currentMessagesForNonStreamLoop);
+        } finally {
+          clearInterval(nonStreamActivityTimer);
+          touchRequestActivity?.();
+        }
         for (let i = 0; i < normalCalls.length; i++) {
           // 结构化判错：success=false 或 raw 明确报错都算失败，不靠工具回执文本猜成败。
           const recordedResult = toolResults[i];
@@ -512,8 +624,6 @@ class NonStreamHandler {
           }
           return logs;
         })();
-        const combinedToolResultsForAI = toolResults.map(r => r.content).flat();
-        if (archeryErrorContents.length > 0) combinedToolResultsForAI.push(...archeryErrorContents);
 
         // VCP 信息展示 - 批量包裹为单个 USER 角色
         const toolStatusSummaryItems = [...archeryStatusSummaryItems];
@@ -550,7 +660,7 @@ class NonStreamHandler {
         }
         conversationHistoryForClient.push(formatToolResultBatch(visibleToolResults, enableRoleDivider));
 
-        const toolResultsTextForRAG = JSON.stringify(combinedToolResultsForAI, (k, v) =>
+        const toolResultsTextForRAG = JSON.stringify([...toolResults.flatMap(result => result.content), ...archeryErrorContents], (k, v) =>
           (k === 'url' || k === 'image_url') && typeof v === 'string' && v.startsWith('data:') ? "[Omitted]" : v
         );
 
@@ -581,25 +691,27 @@ class NonStreamHandler {
           }
         }
 
-        const hasImage = combinedToolResultsForAI.some(item => item.type === 'image_url');
-        const translatedToolResultsForAI = hasImage
-          ? await maybeTranslateToolPayloadMedia([
-            { type: 'text', text: `<!-- VCP_TOOL_PAYLOAD -->\nResults:` },
-            ...combinedToolResultsForAI
-          ])
-          : null;
-        const finalToolPayloadForAI = hasImage
-          ? translatedToolResultsForAI
-          : `<!-- VCP_TOOL_PAYLOAD -->\n${toolResultsTextForRAG}`;
-
-        // 超大回执循环内截断：完整原文异步落盘 DebugLog/toolPayloads，ink:mark_history 豁免
-        const { truncateToolPayload } = require('../vcpLoop/toolPayloadTruncator.js');
-        const payloadForLoop = truncateToolPayload(finalToolPayloadForAI, {
-          toolNames: normalCalls.map(call => call.name),
-          exempt: normalCalls.some(call => call.markHistory)
-        });
-        currentMessagesForNonStreamLoop.push({ role: 'user', content: payloadForLoop });
-
+        const modelResultGroups = [
+          ...toolResults.map((result, index) => ({
+            name: normalCalls[index]?.name,
+            callId: normalCalls[index]?.[NATIVE_CALL_ID],
+            parts: result.contentForAI ?? result.content
+          })),
+          ...archeryGroups
+        ];
+        let payloadForLoop;
+        if (ownedCalls) {
+          const receipts = buildBoundedNativeReceipts(nativeCalls, modelResultGroups, [...normalCalls, ...archeryCalls]);
+          currentMessagesForNonStreamLoop.push(...receipts);
+          if (rollInjection?.kind && rollInjection.content) currentMessagesForNonStreamLoop.push({ role: 'system', content: rollInjection.content });
+          payloadForLoop = receipts.at(-1)?.content ?? '';
+        } else {
+          const { content } = await buildToolPayloadMessage(modelResultGroups, maybeTranslateToolPayloadMedia);
+          const { truncateToolPayload } = require('../vcpLoop/toolPayloadTruncator.js');
+          const calls = [...normalCalls, ...archeryCalls];
+          payloadForLoop = truncateToolPayload(content, { toolNames: calls.map(call => call.name), exempt: calls.some(call => call.markHistory) });
+          currentMessagesForNonStreamLoop.push({ role: 'user', content: payloadForLoop });
+        }
         // 🌟 GravityStub V2：组装期语义引力场可逆投影（纯内存切片，零磁盘污染）
         // GRAVITY_SAFETY_BEGIN
         let messagesForUpstream = currentMessagesForNonStreamLoop;
@@ -622,6 +734,11 @@ class NonStreamHandler {
           break;
         }
 
+        const loopBudgetNotice = checkLoopBudget(messagesForUpstream);
+        if (loopBudgetNotice) {
+          conversationHistoryForClient.push(loopBudgetNotice);
+          break;
+        }
         const recursionBody = { ...originalBody, messages: messagesForUpstream, stream: false };
         const recursionReadResult = await readNonStreamResponseWithSemanticRetry({
           fetchResponse: () => fetchNonStreamCompletion(recursionBody, `tool_loop_depth_${recursionDepth}`),
@@ -629,7 +746,8 @@ class NonStreamHandler {
           delay: apiRetryDelay,
           debugMode: DEBUG_MODE,
           signal: abortController.signal,
-          label: `tool_loop_depth_${recursionDepth}`
+          label: `tool_loop_depth_${recursionDepth}`,
+          timelineTrace
         });
         const recursionAiResponse = recursionReadResult.response;
 
@@ -637,7 +755,9 @@ class NonStreamHandler {
 
         validUpstreamTurns = validUpstreamTurns && isCompleteNonStreamResponse(recursionReadResult);
         const recursionText = recursionReadResult.text;
+        noteUpstreamUsage(recursionText);
         const recursionParsedResponse = extractedResponse(recursionText);
+        currentParsedResponse = recursionParsedResponse;
         const recursionMessage = recursionParsedResponse.message;
         if (recursionMessage) {
           // Display separators belong only to client output, never replayed model text.
@@ -733,12 +853,12 @@ class NonStreamHandler {
     const finalFinishReason = hasPendingToolCallsAtLimit ? 'length' : 'stop';
     let finalJsonResponse;
     try {
-      finalJsonResponse = JSON.parse(aiResponseText);
-      const stripTools = matchesNativeToolIsolation(finalJsonResponse?.model || originalBody?.model);
+      finalJsonResponse = nativeTerminalResponse || JSON.parse(aiResponseText);
+      const stripTools = matchesNativeToolIsolation(originalBody?.model) || matchesNativeToolIsolation(finalJsonResponse?.model);
+
       const choice0 = finalJsonResponse.choices?.[0];
       const msg0 = choice0?.message;
-      const preserveNativeToolTurn = !stripTools && !protocolHalt && !loopEndedAtStuck &&
-        !hasPendingToolCallsAtLimit && recursionDepth === 0 && hasNativeToolCallPayload(msg0);
+      const preserveNativeToolTurn = !stripTools && !protocolHalt && !loopEndedAtStuck && !hasPendingToolCallsAtLimit && nativeTerminalResponse !== null;
 
       if (!msg0) {
         finalJsonResponse.choices = [{ message: { content: finalContentForClient } }];
@@ -748,7 +868,7 @@ class NonStreamHandler {
           delete msg0.tool_calls;
           delete msg0.function_call;
         }
-        if (!preserveNativeToolTurn || finalContentForClient.length > 0 || msg0.content !== null) {
+        if (!preserveNativeToolTurn || finalContentForClient.trim().length > 0 || msg0.content !== null) {
           msg0.content = finalContentForClient;
         }
         if (reasoningToContentEnabled) {

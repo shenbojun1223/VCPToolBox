@@ -1,5 +1,6 @@
 'use strict';
 const { guardMarkdownDataImagesForUpstream } = require('./markdownDataImageGuard.js');
+const { projectNativeToolResultMedia } = require('./nativeToolResultMedia.js');
 
 let lastTimestampMs = 0;
 const START_PREFIX = '<<<[VCP_TOOL_BATCH_START:';
@@ -164,7 +165,9 @@ function projectBatchWrapperText(text, role) {
     return output.join('');
 }
 
-/** Request-only copy on change; preserve media, tool arguments and array metadata. */
+const DISPLAY_NAME_ROLES = new Set(['system', 'developer', 'user', 'assistant']);
+
+/** Request-only projection. Preserve native tool/function names and internal history. */
 function projectToolBatchForUpstream(body) {
     if (!body || !Array.isArray(body.messages)) return body;
     let messages = body.messages;
@@ -177,14 +180,14 @@ function projectToolBatchForUpstream(body) {
         } else if (Array.isArray(content)) {
             // Cross-part wrappers are ambiguous and remain untouched.
             const texts = content.filter(part => part?.type === 'text' && typeof part.text === 'string');
-            if (texts.length !== 1) return;
-            const projected = projectBatchWrapperText(texts[0].text, message.role);
-            if (projected !== texts[0].text) {
+            const projected = texts.length === 1 ? projectBatchWrapperText(texts[0].text, message.role) : undefined;
+            if (texts.length === 1 && projected !== texts[0].text) {
                 projectedContent = content.map(part =>
                     part === texts[0] ? { ...part, text: projected } : part);
             }
         }
-        if (projectedContent === content) return;
+        const stripName = DISPLAY_NAME_ROLES.has(message.role) && Object.hasOwn(message, 'name');
+        if (!stripName && projectedContent === content) return;
         if (messages === body.messages) {
             messages = body.messages.slice();
             // Preserve OneRing's non-enumerable metadata without freezing new indices.
@@ -193,9 +196,46 @@ function projectToolBatchForUpstream(body) {
                 Object.defineProperty(messages, key, Object.getOwnPropertyDescriptor(body.messages, key));
             }
         }
-        messages[index] = { ...message, content: projectedContent };
+        const next = projectedContent === content ? { ...message } : { ...message, content: projectedContent };
+        if (stripName) delete next.name;
+        messages[index] = next;
     });
-    return guardMarkdownDataImagesForUpstream(messages === body.messages ? body : { ...body, messages });
+    const projected = projectNativeToolResultMedia(
+        guardMarkdownDataImagesForUpstream(messages === body.messages ? body : { ...body, messages })
+    );
+    // Both media projections may rebuild the array. Retain request-local, non-index metadata.
+    if (projected.messages !== messages) {
+        for (const key of Reflect.ownKeys(messages)) {
+            if (typeof key === 'string' && /^(?:length|0|[1-9]\d*)$/.test(key)) continue;
+            if (!Object.hasOwn(projected.messages, key)) {
+                Object.defineProperty(projected.messages, key, Object.getOwnPropertyDescriptor(messages, key));
+            }
+        }
+    }
+    return projected;
 }
 
-module.exports = { formatToolResultBatch, createBatchStartScanner, findBatchEnd, projectToolBatchForUpstream };
+async function buildToolPayloadMessage(groups, translateMedia) {
+    const header = '<!-- VCP_TOOL_PAYLOAD -->\nResults:';
+    const footer = '<!-- VCP_TOOL_PAYLOAD_END -->';
+    const label = (group, index) => `[${index + 1}] ${String(group.name || '工具').replace(/[\r\n]+/g, ' ')}`;
+    const plainText = groups.every(group =>
+        group.parts.every(part => part?.type === 'text' && typeof part.text === 'string'));
+    if (plainText) {
+        const sections = groups.map((group, index) => {
+            const text = group.parts.map(part => part.text).join('\n\n');
+            return groups.length > 1 ? `${label(group, index)}\n${text}` : text;
+        });
+        const text = sections.join('\n\n');
+        const separator = groups.length > 1 ? '\n' : ' ';
+        return { role: 'user', content: `${header}${text ? separator + text : ''}\n${footer}` };
+    }
+    const parts = [{ type: 'text', text: header }, ...groups.flatMap((group, index) =>
+        groups.length > 1 ? [{ type: 'text', text: label(group, index) }, ...group.parts] : group.parts)];
+    const translated = translateMedia ? await translateMedia(parts) : parts;
+    return { role: 'user', content: [...translated, { type: 'text', text: footer }] };
+}
+
+module.exports = {
+    formatToolResultBatch, createBatchStartScanner, findBatchEnd, projectToolBatchForUpstream, buildToolPayloadMessage
+};

@@ -6,7 +6,7 @@ const REQUEST_FIELDS = [
 ];
 const MESSAGE_FIELDS = ['tool_calls', 'function_call', 'functionCall', 'toolCalls'];
 
-function matchesNativeToolIsolation(model, keywords = process.env.NativeToolIsolationModels ?? 'hydrogen') {
+function matchesNativeToolIsolation(model, keywords = process.env.NativeToolIsolationModels ?? '') {
     if (typeof model !== 'string') return false;
     const name = model.toLowerCase();
     return String(keywords).split(/[,，]/)
